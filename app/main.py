@@ -198,7 +198,8 @@ def downloads():
       <meta charset="utf-8" />
       <title>Downloads</title>
       <style>
-        body {{ font-family: system-ui, sans-serif; padding: 24px; }}
+        body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
+        .logo {{ display: block; width: 20%; height: 20%; margin-bottom: 20px; }}
         table {{ border-collapse: collapse; width: 100%; }}
         th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
         th {{ text-align: left; background: #fafafa; }}
@@ -208,6 +209,7 @@ def downloads():
       </style>
     </head>
     <body>
+      <img src="/logo.png" alt="FFAPI Logo" class="logo">
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
@@ -246,7 +248,8 @@ def logs():
       <meta charset="utf-8" />
       <title>FFmpeg Logs</title>
       <style>
-        body {{ font-family: system-ui, sans-serif; padding: 24px; }}
+        body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
+        .logo {{ display: block; width: 20%; height: 20%; margin-bottom: 20px; }}
         table {{ border-collapse: collapse; width: 100%; }}
         th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
         th {{ text-align: left; background: #fafafa; }}
@@ -256,6 +259,7 @@ def logs():
       </style>
     </head>
     <body>
+      <img src="/logo.png" alt="FFAPI Logo" class="logo">
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
@@ -337,6 +341,7 @@ def ffmpeg_info(auto_refresh: int = 0):
       {refresh_meta}
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
+        .logo {{ display: block; width: 20%; height: 20%; margin-bottom: 20px; }}
         pre {{ background: #f5f5f5; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; line-height: 1.4; }}
         h3 {{ margin-top: 30px; margin-bottom: 10px; }}
         nav {{ margin-bottom: 20px; }}
@@ -378,6 +383,7 @@ def ffmpeg_info(auto_refresh: int = 0):
       </style>
     </head>
     <body>
+      <img src="/logo.png" alt="FFAPI Logo" class="logo">
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
@@ -652,6 +658,7 @@ Example:<br>
       <title>API Documentation</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
+        .logo {{ display: block; width: 20%; height: 20%; margin-bottom: 20px; }}
         h2 {{ margin-bottom: 10px; }}
         h4 {{ margin-top: 30px; margin-bottom: 15px; color: #333; border-bottom: 2px solid #0066cc; padding-bottom: 5px; }}
         nav {{ margin-bottom: 20px; }}
@@ -730,6 +737,7 @@ Example:<br>
       </style>
     </head>
     <body>
+      <img src="/logo.png" alt="FFAPI Logo" class="logo">
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
