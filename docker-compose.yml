@@ -1,0 +1,15 @@
+
+services:
+  ffapi:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PUBLIC_BASE_URL: "http://localhost:3000"
+      PUBLIC_DIR: "/data/public"
+      WORK_DIR: "/data/work"
+      RETENTION_DAYS: "7"
+    volumes:
+      - ./public:/data/public
+      - ./work:/data/work
+    restart: unless-stopped
