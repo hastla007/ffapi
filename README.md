@@ -12,7 +12,8 @@
 - `/downloads` - Browse generated files (HTML)
 - `/logs` - Browse FFmpeg logs (HTML)
 - `/logs/view?path=...` - View individual log file
-- `/ffmpeg` - Display FFmpeg version and capabilities (HTML)
+- `/ffmpeg` - Display FFmpeg version and container logs (HTML)
+- `/documentation` - Complete API documentation (HTML)
 - `/files/*` - Static file serving
 - `/image/to-mp4-loop` - Convert image to looping video
 - `/compose/from-binaries` - Compose video from uploaded files
@@ -31,37 +32,42 @@ docker compose up -d
 # Browse files: http://localhost:3000/downloads
 # Browse logs: http://localhost:3000/logs
 # FFmpeg & container info: http://localhost:3000/ffmpeg
+# API documentation: http://localhost:3000/documentation
 ```
 
-The `/ffmpeg` page shows:
-- Application logs (last 1000 lines - same as `docker logs`)
-  - **Auto-refresh**: Click "Auto 5s", "Auto 10s", or "Auto 30s" for automatic updates
-  - Shows file size and last modified time to confirm logs are updating
-  - Manual refresh button available
-- FFmpeg version and build information
-- Available formats, codecs, and encoders
-
-### Viewing Logs
-
-**Via Browser:**
-```
-http://localhost:3000/ffmpeg?auto_refresh=10
-```
-This will auto-refresh every 10 seconds to show live updates.
-
-**Via Docker CLI:**
-```bash
-docker logs ffapi -f  # Follow logs in real-time
-```
-
-**Via Log File:**
-```bash
-cat ./logs/application.log  # All logs are also saved here
-```
+**Page descriptions:**
+- `/downloads` - Browse and download generated video files
+- `/logs` - View FFmpeg operation logs
+- `/ffmpeg` - Monitor container with live logs and FFmpeg version info (supports auto-refresh)
+- `/documentation` - Complete API reference with all endpoints and parameters
 
 Outputs persist in `./public` (mounted to `/data/public`).  
 Temporary work files live in `./work` (`/data/work`).  
 FFmpeg logs persist in `./logs` (`/data/logs`).
+
+### API Operations
+
+For complete API documentation with all parameters and examples, visit `/documentation` endpoint.
+
+**Image Processing:**
+- `/image/to-mp4-loop` - Convert image to looping video
+
+**Video Composition:**
+- `/compose/from-binaries` - Compose from uploaded files
+- `/compose/from-urls` - Compose from URLs  
+- `/compose/from-tracks` - Compose from track definitions
+
+**Video Concatenation:**
+- `/video/concat-from-urls` - Concatenate clips
+- `/video/concat` - Concat alias
+
+**Custom Commands:**
+- `/v1/run-ffmpeg-command` - Run custom FFmpeg command
+
+**Media Inspection:**
+- `/probe/from-urls` - Inspect media from URL
+- `/probe/from-binary` - Inspect uploaded file
+- `/probe/public` - Inspect public file
 
 ### Environment Variables
 - `PUBLIC_BASE_URL` - Base URL for file links (e.g., http://10.120.2.5:3000)
