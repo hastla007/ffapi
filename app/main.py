@@ -555,7 +555,13 @@ Example:<br>
         nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
         nav a:hover {{ text-decoration: underline; }}
         .section {{ margin-bottom: 40px; }}
-        .logs {{ max-height: 600px; overflow-y: auto; background: #1e1e1e; color: #d4d4d4; }}
+        .logs {{ 
+          height: 600px; 
+          overflow-y: scroll; 
+          background: #1e1e1e; 
+          color: #d4d4d4; 
+          overflow-x: auto;
+        }}
         .controls {{ margin-bottom: 15px; }}
         .btn {{ 
           background: #0066cc; 
@@ -666,7 +672,7 @@ Example:<br>
         <div class="info">
           Page loaded: {current_time} | {log_info}
         </div>
-        <pre class="logs">{app_logs}</pre>
+        <pre class="logs" id="logContainer">{app_logs}</pre>
       </div>
       
       <div class="section">
@@ -679,6 +685,15 @@ Example:<br>
         <pre>{version_output}</pre>
       </div>
     </body>
+    <script>
+      // Auto-scroll logs to bottom on page load
+      window.addEventListener('DOMContentLoaded', function() {{
+        var logContainer = document.getElementById('logContainer');
+        if (logContainer) {{
+          logContainer.scrollTop = logContainer.scrollHeight;
+        }}
+      }});
+    </script>
     </html>
     """
     return HTMLResponse(html)
