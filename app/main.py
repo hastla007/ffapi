@@ -1,5 +1,4 @@
-
-import os, io, shlex, json, subprocess, random, string, shutil
+import os, io, shlex, json, subprocess, random, string, shutil, time
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -34,15 +33,35 @@ def _rand(n=8):
 
 
 def cleanup_old_public(days: int = RETENTION_DAYS):
+    """Delete files older than specified days based on actual file modification time."""
     if days <= 0:
         return
-    cutoff = datetime.utcnow().date() - timedelta(days=days)
+    cutoff_timestamp = time.time() - (days * 86400)  # days * seconds_per_day
+    
     for child in PUBLIC_DIR.iterdir():
         if child.is_dir():
+            # Check all files in this directory
+            files_to_delete = []
+            for file_path in child.iterdir():
+                if file_path.is_file():
+                    try:
+                        file_mtime = file_path.stat().st_mtime
+                        if file_mtime < cutoff_timestamp:
+                            files_to_delete.append(file_path)
+                    except Exception:
+                        pass
+            
+            # Delete old files
+            for fp in files_to_delete:
+                try:
+                    fp.unlink()
+                except Exception:
+                    pass
+            
+            # Remove directory if empty
             try:
-                d = datetime.strptime(child.name, "%Y%m%d").date()
-                if d < cutoff:
-                    shutil.rmtree(child, ignore_errors=True)
+                if not any(child.iterdir()):
+                    child.rmdir()
             except Exception:
                 pass
 
