@@ -5,12 +5,14 @@
 - All `TemporaryDirectory(...)` calls use `dir=$WORK_DIR` (default `/data/work`) so temps are on the same volume.
 - **Fixed retention**: Files are deleted based on actual file age (modification time), not folder name. Files persist through restarts until truly RETENTION_DAYS old.
 - **Persistent FFmpeg logs**: All FFmpeg operations save logs to `/data/logs` for debugging.
+- **Application logging**: Container logs (stdout/stderr) are saved to `/data/logs/application.log` and viewable at `/ffmpeg` endpoint.
 
 ### Endpoints
 - `/health` - Health check
 - `/downloads` - Browse generated files (HTML)
 - `/logs` - Browse FFmpeg logs (HTML)
 - `/logs/view?path=...` - View individual log file
+- `/ffmpeg` - Display FFmpeg version and capabilities (HTML)
 - `/files/*` - Static file serving
 - `/image/to-mp4-loop` - Convert image to looping video
 - `/compose/from-binaries` - Compose video from uploaded files
@@ -28,7 +30,13 @@
 docker compose up -d
 # Browse files: http://localhost:3000/downloads
 # Browse logs: http://localhost:3000/logs
+# FFmpeg & container info: http://localhost:3000/ffmpeg
 ```
+
+The `/ffmpeg` page shows:
+- Application logs (last 500 lines - same as `docker logs`)
+- FFmpeg version and build information
+- Available formats, codecs, and encoders
 
 Outputs persist in `./public` (mounted to `/data/public`).  
 Temporary work files live in `./work` (`/data/work`).  
