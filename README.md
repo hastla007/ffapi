@@ -34,9 +34,30 @@ docker compose up -d
 ```
 
 The `/ffmpeg` page shows:
-- Application logs (last 500 lines - same as `docker logs`)
+- Application logs (last 1000 lines - same as `docker logs`)
+  - **Auto-refresh**: Click "Auto 5s", "Auto 10s", or "Auto 30s" for automatic updates
+  - Shows file size and last modified time to confirm logs are updating
+  - Manual refresh button available
 - FFmpeg version and build information
 - Available formats, codecs, and encoders
+
+### Viewing Logs
+
+**Via Browser:**
+```
+http://localhost:3000/ffmpeg?auto_refresh=10
+```
+This will auto-refresh every 10 seconds to show live updates.
+
+**Via Docker CLI:**
+```bash
+docker logs ffapi -f  # Follow logs in real-time
+```
+
+**Via Log File:**
+```bash
+cat ./logs/application.log  # All logs are also saved here
+```
 
 Outputs persist in `./public` (mounted to `/data/public`).  
 Temporary work files live in `./work` (`/data/work`).  
