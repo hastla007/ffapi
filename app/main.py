@@ -24,11 +24,37 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR = Path(os.getenv("LOGS_DIR", "/data/logs")).resolve()
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Application log file (captures stdout/stderr)
+APP_LOG_FILE = LOGS_DIR / "application.log"
+
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # e.g. "http://10.120.2.5:3000"
 
 # Mount static /files
 app.mount("/files", StaticFiles(directory=str(PUBLIC_DIR)), name="files")
+
+
+# Setup logging to file
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(str(APP_LOG_FILE)),
+        logging.StreamHandler()  # Still output to console for docker logs
+    ]
+)
+logger = logging.getLogger("ffapi")
+
+# Log startup
+logger.info("="*60)
+logger.info("FFAPI Ultimate starting...")
+logger.info(f"PUBLIC_DIR: {PUBLIC_DIR}")
+logger.info(f"WORK_DIR: {WORK_DIR}")
+logger.info(f"LOGS_DIR: {LOGS_DIR}")
+logger.info(f"RETENTION_DAYS: {RETENTION_DAYS}")
+logger.info(f"PUBLIC_BASE_URL: {PUBLIC_BASE_URL or 'Not set'}")
+logger.info("="*60)
 
 
 def _rand(n=8):
@@ -42,6 +68,7 @@ def cleanup_old_public(days: int = RETENTION_DAYS):
         return
     cutoff_timestamp = time.time() - (days * 86400)  # days * seconds_per_day
     
+    deleted_count = 0
     for child in PUBLIC_DIR.iterdir():
         if child.is_dir():
             # Check all files in this directory
@@ -59,6 +86,7 @@ def cleanup_old_public(days: int = RETENTION_DAYS):
             for fp in files_to_delete:
                 try:
                     fp.unlink()
+                    deleted_count += 1
                 except Exception:
                     pass
             
@@ -68,6 +96,9 @@ def cleanup_old_public(days: int = RETENTION_DAYS):
                     child.rmdir()
             except Exception:
                 pass
+    
+    if deleted_count > 0:
+        logger.info(f"Cleanup: deleted {deleted_count} files older than {days} days")
 
 
 def publish_file(src: Path, ext: str) -> Dict[str, str]:
@@ -82,6 +113,8 @@ def publish_file(src: Path, ext: str) -> Dict[str, str]:
 
     # Cross-device safe move
     shutil.move(str(src), str(dst))
+    
+    logger.info(f"Published file: {name} ({dst.stat().st_size / (1024*1024):.2f} MB)")
 
     rel = f"/files/{day}/{name}"
     url = f"{PUBLIC_BASE_URL.rstrip('/')}{rel}" if PUBLIC_BASE_URL else rel
@@ -141,6 +174,7 @@ def downloads():
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
+        <a href="/ffmpeg">FFmpeg Info</a>
       </nav>
       <h2>Generated Files</h2>
       <table>
@@ -187,6 +221,7 @@ def logs():
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
+        <a href="/ffmpeg">FFmpeg Info</a>
       </nav>
       <h2>FFmpeg Logs</h2>
       <table>
@@ -210,8 +245,107 @@ def view_log(path: str):
     return target.read_text(encoding="utf-8", errors="ignore")
 
 
+@app.get("/ffmpeg", response_class=HTMLResponse)
+def ffmpeg_info():
+    """Display FFmpeg version and capabilities."""
+    # Get version
+    version_proc = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+    version_output = version_proc.stdout if version_proc.returncode == 0 else "Error getting version"
+    
+    # Get formats
+    formats_proc = subprocess.run(["ffmpeg", "-formats"], capture_output=True, text=True)
+    formats_output = formats_proc.stdout if formats_proc.returncode == 0 else "Error getting formats"
+    
+    # Get codecs
+    codecs_proc = subprocess.run(["ffmpeg", "-codecs"], capture_output=True, text=True)
+    codecs_output = codecs_proc.stdout if codecs_proc.returncode == 0 else "Error getting codecs"
+    
+    # Get encoders
+    encoders_proc = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
+    encoders_output = encoders_proc.stdout if encoders_proc.returncode == 0 else "Error getting encoders"
+    
+    # Get application logs (last 500 lines)
+    app_logs = ""
+    if APP_LOG_FILE.exists():
+        try:
+            with APP_LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+                # Get last 500 lines
+                app_logs = "".join(lines[-500:]) if lines else "No logs yet"
+        except Exception as e:
+            app_logs = f"Error reading logs: {e}"
+    else:
+        app_logs = "Log file not created yet"
+    
+    html = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>FFmpeg Info</title>
+      <style>
+        body {{ font-family: system-ui, sans-serif; padding: 24px; }}
+        pre {{ background: #f5f5f5; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; line-height: 1.4; }}
+        h3 {{ margin-top: 30px; margin-bottom: 10px; }}
+        nav {{ margin-bottom: 20px; }}
+        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        nav a:hover {{ text-decoration: underline; }}
+        .section {{ margin-bottom: 40px; }}
+        .logs {{ max-height: 600px; overflow-y: auto; background: #1e1e1e; color: #d4d4d4; }}
+        .refresh-btn {{ 
+          background: #0066cc; 
+          color: white; 
+          padding: 8px 16px; 
+          border: none; 
+          border-radius: 4px; 
+          cursor: pointer;
+          margin-bottom: 10px;
+        }}
+        .refresh-btn:hover {{ background: #0052a3; }}
+      </style>
+    </head>
+    <body>
+      <nav>
+        <a href="/downloads">Downloads</a>
+        <a href="/logs">Logs</a>
+        <a href="/ffmpeg">FFmpeg Info</a>
+      </nav>
+      <h2>FFmpeg & Container Information</h2>
+      
+      <div class="section">
+        <h3>Application Logs (Docker Container Output - Last 500 lines)</h3>
+        <button class="refresh-btn" onclick="location.reload()">Refresh Logs</button>
+        <pre class="logs">{app_logs}</pre>
+      </div>
+      
+      <div class="section">
+        <h3>FFmpeg Version & Build</h3>
+        <pre>{version_output}</pre>
+      </div>
+      
+      <div class="section">
+        <h3>Available Formats</h3>
+        <pre>{formats_output}</pre>
+      </div>
+      
+      <div class="section">
+        <h3>Available Codecs</h3>
+        <pre>{codecs_output}</pre>
+      </div>
+      
+      <div class="section">
+        <h3>Available Encoders</h3>
+        <pre>{encoders_output}</pre>
+      </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+
 @app.get("/health")
 def health():
+    logger.info("Health check requested")
     return {"ok": True}
 
 
@@ -282,6 +416,7 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None)
 # ---------- routes ----------
 @app.post("/image/to-mp4-loop")
 async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as_json: bool = False):
+    logger.info(f"Starting image-to-mp4-loop: {file.filename}, duration={duration}s")
     if file.content_type not in {"image/png", "image/jpeg"}:
         raise HTTPException(status_code=400, detail="Only PNG/JPEG are supported.")
     if not (1 <= duration <= 3600):
@@ -307,8 +442,10 @@ async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as
             code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
         save_log(log, "image-to-mp4")
         if code != 0 or not out_path.exists():
+            logger.error(f"image-to-mp4-loop failed for {file.filename}")
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
         pub = publish_file(out_path, ".mp4")
+        logger.info(f"image-to-mp4-loop completed: {pub['rel']}")
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -328,6 +465,7 @@ async def compose_from_binaries(
     bgm_volume: float = 0.3,
     as_json: bool = False,
 ):
+    logger.info(f"Starting compose-from-binaries: video={video.filename}, audio={audio.filename if audio else None}, bgm={bgm.filename if bgm else None}")
     with TemporaryDirectory(prefix="compose_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         v_path = work / "video.mp4"
@@ -375,9 +513,11 @@ async def compose_from_binaries(
             code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
         save_log(log, "compose-binaries")
         if code != 0 or not out_path.exists():
+            logger.error("compose-from-binaries failed")
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": cmd, "log": log.read_text()})
 
         pub = publish_file(out_path, ".mp4")
+        logger.info(f"compose-from-binaries completed: {pub['rel']}")
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -387,6 +527,7 @@ async def compose_from_binaries(
 
 @app.post("/video/concat-from-urls")
 def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
+    logger.info(f"Starting concat: {len(job.clips)} clips, {job.width}x{job.height}@{job.fps}fps")
     with TemporaryDirectory(prefix="concat_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         norm = []
@@ -421,8 +562,10 @@ def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             code2 = subprocess.run(cmd2, stdout=lf, stderr=lf).returncode
         save_log(log2, "concat-final")
         if code2 != 0 or not out_path.exists():
+            logger.error("concat failed at final stage")
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed_concat", "log": log2.read_text()})
         pub = publish_file(out_path, ".mp4")
+        logger.info(f"concat completed: {len(job.clips)} clips -> {pub['rel']}")
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
