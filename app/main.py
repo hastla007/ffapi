@@ -20,6 +20,10 @@ PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
 WORK_DIR = Path(os.getenv("WORK_DIR", "/data/work")).resolve()
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
+# Logs directory for persistent ffmpeg logs
+LOGS_DIR = Path(os.getenv("LOGS_DIR", "/data/logs")).resolve()
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # e.g. "http://10.120.2.5:3000"
 
@@ -84,6 +88,21 @@ def publish_file(src: Path, ext: str) -> Dict[str, str]:
     return {"dst": str(dst), "url": url, "rel": rel}
 
 
+def save_log(log_path: Path, operation: str) -> None:
+    """Save ffmpeg log to persistent logs directory."""
+    if not log_path.exists():
+        return
+    day = datetime.utcnow().strftime("%Y%m%d")
+    folder = LOGS_DIR / day
+    folder.mkdir(parents=True, exist_ok=True)
+    name = datetime.utcnow().strftime("%Y%m%d_%H%M%S_") + _rand() + f"_{operation}.log"
+    dst = folder / name
+    try:
+        shutil.copy2(str(log_path), str(dst))
+    except Exception:
+        pass
+
+
 # ---------- pages ----------
 @app.get("/", include_in_schema=False)
 def root():
@@ -114,9 +133,15 @@ def downloads():
         th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
         th {{ text-align: left; background: #fafafa; }}
         a {{ text-decoration: none; }}
+        nav {{ margin-bottom: 20px; }}
+        nav a {{ margin-right: 15px; color: #0066cc; }}
       </style>
     </head>
     <body>
+      <nav>
+        <a href="/downloads">Downloads</a>
+        <a href="/logs">Logs</a>
+      </nav>
       <h2>Generated Files</h2>
       <table>
         <thead><tr><th>Date</th><th>File</th><th>Size</th></tr></thead>
@@ -126,6 +151,63 @@ def downloads():
     </html>
     """
     return HTMLResponse(html)
+
+
+@app.get("/logs", response_class=HTMLResponse)
+def logs():
+    rows = []
+    for day in sorted(LOGS_DIR.iterdir(), reverse=True):
+        if not day.is_dir():
+            continue
+        for f in sorted(day.iterdir(), reverse=True):
+            if not f.is_file():
+                continue
+            size_kb = f.stat().st_size / 1024
+            # Extract operation name from filename
+            parts = f.name.split("_")
+            operation = parts[-1].replace(".log", "") if len(parts) > 3 else "unknown"
+            rows.append(f"<tr><td>{day.name}</td><td>{f.name}</td><td>{operation}</td><td>{size_kb:.1f} KB</td><td><a href='/logs/view?path={day.name}/{f.name}' target='_blank'>View</a></td></tr>")
+    html = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>FFmpeg Logs</title>
+      <style>
+        body {{ font-family: system-ui, sans-serif; padding: 24px; }}
+        table {{ border-collapse: collapse; width: 100%; }}
+        th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
+        th {{ text-align: left; background: #fafafa; }}
+        a {{ text-decoration: none; color: #0066cc; }}
+        nav {{ margin-bottom: 20px; }}
+        nav a {{ margin-right: 15px; }}
+      </style>
+    </head>
+    <body>
+      <nav>
+        <a href="/downloads">Downloads</a>
+        <a href="/logs">Logs</a>
+      </nav>
+      <h2>FFmpeg Logs</h2>
+      <table>
+        <thead><tr><th>Date</th><th>Filename</th><th>Operation</th><th>Size</th><th>Action</th></tr></thead>
+        <tbody>{"".join(rows) if rows else "<tr><td colspan='5'>No logs yet</td></tr>"} </tbody>
+      </table>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+
+@app.get("/logs/view", response_class=PlainTextResponse)
+def view_log(path: str):
+    """View individual log file content."""
+    target = (LOGS_DIR / path).resolve()
+    if LOGS_DIR not in target.parents and target != LOGS_DIR:
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Log not found")
+    return target.read_text(encoding="utf-8", errors="ignore")
 
 
 @app.get("/health")
@@ -223,6 +305,7 @@ async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as
         log = work / "ffmpeg.log"
         with log.open("wb") as lf:
             code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+        save_log(log, "image-to-mp4")
         if code != 0 or not out_path.exists():
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
         pub = publish_file(out_path, ".mp4")
@@ -290,6 +373,7 @@ async def compose_from_binaries(
         log = work / "ffmpeg.log"
         with log.open("wb") as lf:
             code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+        save_log(log, "compose-binaries")
         if code != 0 or not out_path.exists():
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": cmd, "log": log.read_text()})
 
@@ -322,6 +406,7 @@ def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             log = work / f"norm_{i:03d}.log"
             with log.open("wb") as lf:
                 code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+            save_log(log, f"concat-norm-{i}")
             if code != 0 or not out.exists():
                 return JSONResponse(status_code=500, content={"error": "ffmpeg_failed_on_clip", "clip": str(url), "log": log.read_text()})
             norm.append(out)
@@ -334,6 +419,7 @@ def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
         log2 = work / "concat.log"
         with log2.open("wb") as lf:
             code2 = subprocess.run(cmd2, stdout=lf, stderr=lf).returncode
+        save_log(log2, "concat-final")
         if code2 != 0 or not out_path.exists():
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed_concat", "log": log2.read_text()})
         pub = publish_file(out_path, ".mp4")
@@ -409,6 +495,7 @@ def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
         cmd += maps + [str(out_path)]
         with log_path.open("wb") as logf:
             code = subprocess.run(cmd, stdout=logf, stderr=logf).returncode
+        save_log(log_path, "compose-urls")
         if code != 0 or not out_path.exists():
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": cmd, "log": log_path.read_text()})
 
@@ -470,6 +557,7 @@ def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
         log = work / "ffmpeg.log"
         with log.open("wb") as lf:
             code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+        save_log(log, "compose-tracks")
         out_path = work / "output.mp4"
         if code != 0 or not out_path.exists():
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
@@ -511,6 +599,7 @@ def run_rendi(job: RendiJob):
         with log.open("wb") as lf:
             run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args
             code = subprocess.run(run_args, stdout=lf, stderr=lf).returncode
+        save_log(log, "rendi-command")
         if code != 0:
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": run_args, "log": log.read_text()})
 
