@@ -293,18 +293,6 @@ def ffmpeg_info(auto_refresh: int = 0):
     version_proc = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
     version_output = version_proc.stdout if version_proc.returncode == 0 else "Error getting version"
     
-    # Get formats
-    formats_proc = subprocess.run(["ffmpeg", "-formats"], capture_output=True, text=True)
-    formats_output = formats_proc.stdout if formats_proc.returncode == 0 else "Error getting formats"
-    
-    # Get codecs
-    codecs_proc = subprocess.run(["ffmpeg", "-codecs"], capture_output=True, text=True)
-    codecs_output = codecs_proc.stdout if codecs_proc.returncode == 0 else "Error getting codecs"
-    
-    # Get encoders
-    encoders_proc = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
-    encoders_output = encoders_proc.stdout if encoders_proc.returncode == 0 else "Error getting encoders"
-    
     # Force flush all handlers before reading
     for handler in logging.getLogger().handlers:
         handler.flush()
@@ -338,17 +326,231 @@ def ffmpeg_info(auto_refresh: int = 0):
     # Current time
     current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     
+    # API Endpoints Documentation
+    api_docs = """
+<h4>UI & Info</h4>
+<div class="endpoint">
+  <div class="method">GET</div>
+  <div class="path">/</div>
+  <div class="desc">Redirects to /downloads</div>
+</div>
+
+<div class="endpoint">
+  <div class="method">GET</div>
+  <div class="path">/downloads</div>
+  <div class="desc">Browse generated files (HTML page)</div>
+</div>
+
+<div class="endpoint">
+  <div class="method">GET</div>
+  <div class="path">/logs</div>
+  <div class="desc">Browse FFmpeg operation logs (HTML page)</div>
+</div>
+
+<div class="endpoint">
+  <div class="method">GET</div>
+  <div class="path">/logs/view?path={date}/{filename}</div>
+  <div class="desc">View individual log file content</div>
+  <div class="params">
+    <span class="param">path</span> - Relative path to log file (e.g., 20241008/20241008_143022_12345678_compose-urls.log)
+  </div>
+</div>
+
+<div class="endpoint">
+  <div class="method">GET</div>
+  <div class="path">/ffmpeg?auto_refresh={seconds}</div>
+  <div class="desc">This page - FFmpeg info and container logs</div>
+  <div class="params">
+    <span class="param">auto_refresh</span> - Auto-refresh interval in seconds (0-60, default: 0)
+  </div>
+</div>
+
+<div class="endpoint">
+  <div class="method">GET</div>
+  <div class="path">/health</div>
+  <div class="desc">Health check endpoint</div>
+  <div class="response">Returns: {"ok": true}</div>
+</div>
+
+<div class="endpoint">
+  <div class="method">GET</div>
+  <div class="path">/files/{date}/{filename}</div>
+  <div class="desc">Static file serving - download generated files</div>
+</div>
+
+<h4>Image Processing</h4>
+<div class="endpoint">
+  <div class="method">POST</div>
+  <div class="path">/image/to-mp4-loop</div>
+  <div class="desc">Convert static image to looping video</div>
+  <div class="params">
+    <span class="param">file</span> - Image file (PNG/JPEG) [multipart/form-data]<br>
+    <span class="param">duration</span> - Duration in seconds (1-3600, default: 30)<br>
+    <span class="param">as_json</span> - Return JSON instead of file (default: false)
+  </div>
+  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+</div>
+
+<h4>Video Composition</h4>
+<div class="endpoint">
+  <div class="method">POST</div>
+  <div class="path">/compose/from-binaries</div>
+  <div class="desc">Compose video from uploaded files</div>
+  <div class="params">
+    <span class="param">video</span> - Video file [multipart/form-data]<br>
+    <span class="param">audio</span> - Audio file (optional) [multipart/form-data]<br>
+    <span class="param">bgm</span> - Background music file (optional) [multipart/form-data]<br>
+    <span class="param">duration_ms</span> - Duration in milliseconds (1-3600000, default: 30000)<br>
+    <span class="param">width</span> - Output width in pixels (default: 1920)<br>
+    <span class="param">height</span> - Output height in pixels (default: 1080)<br>
+    <span class="param">fps</span> - Output frames per second (default: 30)<br>
+    <span class="param">bgm_volume</span> - BGM volume multiplier (default: 0.3)<br>
+    <span class="param">as_json</span> - Return JSON instead of file (default: false)
+  </div>
+  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+</div>
+
+<div class="endpoint">
+  <div class="method">POST</div>
+  <div class="path">/compose/from-urls</div>
+  <div class="desc">Compose video from URLs</div>
+  <div class="params">
+    <span class="param">video_url</span> - Video URL (required)<br>
+    <span class="param">audio_url</span> - Audio URL (optional)<br>
+    <span class="param">bgm_url</span> - Background music URL (optional)<br>
+    <span class="param">duration_ms</span> - Duration in milliseconds (1-3600000, default: 30000)<br>
+    <span class="param">width</span> - Output width in pixels (default: 1920)<br>
+    <span class="param">height</span> - Output height in pixels (default: 1080)<br>
+    <span class="param">fps</span> - Output frames per second (default: 30)<br>
+    <span class="param">bgm_volume</span> - BGM volume multiplier (default: 0.3)<br>
+    <span class="param">headers</span> - HTTP headers for authenticated requests (optional)<br>
+    <span class="param">as_json</span> - Return JSON instead of file (default: false)
+  </div>
+  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+</div>
+
+<div class="endpoint">
+  <div class="method">POST</div>
+  <div class="path">/compose/from-tracks</div>
+  <div class="desc">Compose video from track definitions</div>
+  <div class="params">
+    <span class="param">tracks</span> - Array of track objects with keyframes<br>
+    <span class="param">width</span> - Output width in pixels (default: 1920)<br>
+    <span class="param">height</span> - Output height in pixels (default: 1080)<br>
+    <span class="param">fps</span> - Output frames per second (default: 30)<br>
+    <span class="param">as_json</span> - Return JSON instead of file (default: false)
+  </div>
+  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+</div>
+
+<h4>Video Concatenation</h4>
+<div class="endpoint">
+  <div class="method">POST</div>
+  <div class="path">/video/concat-from-urls</div>
+  <div class="desc">Concatenate multiple video clips from URLs</div>
+  <div class="params">
+    <span class="param">clips</span> - Array of video URLs<br>
+    <span class="param">width</span> - Output width in pixels (default: 1920)<br>
+    <span class="param">height</span> - Output height in pixels (default: 1080)<br>
+    <span class="param">fps</span> - Output frames per second (default: 30)<br>
+    <span class="param">as_json</span> - Return JSON instead of file (default: false)
+  </div>
+  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+</div>
+
+<div class="endpoint">
+  <div class="method">POST</div>
+  <div class="path">/video/concat</div>
+  <div class="desc">Concatenate videos (alias endpoint, accepts 'clips' or 'urls')</div>
+  <div class="params">
+    <span class="param">clips</span> - Array of video URLs (preferred)<br>
+    <span class="param">urls</span> - Array of video URLs (alternative)<br>
+    <span class="param">width</span> - Output width in pixels (default: 1920)<br>
+    <span class="param">height</span> - Output height in pixels (default: 1080)<br>
+    <span class="param">fps</span> - Output frames per second (default: 30)<br>
+    <span class="param">as_json</span> - Return JSON instead of file (default: false)
+  </div>
+  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+</div>
+
+<h4>Custom FFmpeg Commands</h4>
+<div class="endpoint">
+  <div class="method">POST</div>
+  <div class="path">/v1/run-ffmpeg-command</div>
+  <div class="desc">Run custom FFmpeg command with template variables</div>
+  <div class="params">
+    <span class="param">input_files</span> - Object mapping variable names to URLs<br>
+    <span class="param">output_files</span> - Object mapping variable names to filenames<br>
+    <span class="param">ffmpeg_command</span> - FFmpeg command with {{variable}} placeholders
+  </div>
+  <div class="response">Returns: {"ok": true, "outputs": {"key": "url", ...}}</div>
+  <div class="example">
+Example:<br>
+{<br>
+  "input_files": {"video": "https://example.com/vid.mp4"},<br>
+  "output_files": {"out": "result.mp4"},<br>
+  "ffmpeg_command": "-i {{video}} -vf scale=1280:720 {{out}}"<br>
+}
+  </div>
+</div>
+
+<h4>FFprobe (Media Inspection)</h4>
+<div class="endpoint">
+  <div class="method">POST</div>
+  <div class="path">/probe/from-urls</div>
+  <div class="desc">Inspect media file from URL using ffprobe</div>
+  <div class="params">
+    <span class="param">url</span> - Media file URL<br>
+    <span class="param">headers</span> - HTTP headers for authenticated requests (optional)<br>
+    <span class="param">show_format</span> - Show format info (default: true)<br>
+    <span class="param">show_streams</span> - Show stream info (default: true)<br>
+    <span class="param">show_chapters</span> - Show chapters (default: false)<br>
+    <span class="param">show_programs</span> - Show programs (default: false)<br>
+    <span class="param">show_packets</span> - Show packets (default: false)<br>
+    <span class="param">count_frames</span> - Count frames (default: false)<br>
+    <span class="param">count_packets</span> - Count packets (default: false)<br>
+    <span class="param">probe_size</span> - Probe size (optional)<br>
+    <span class="param">analyze_duration</span> - Analyze duration (optional)<br>
+    <span class="param">select_streams</span> - Select specific streams (optional)
+  </div>
+  <div class="response">Returns: JSON with media information</div>
+</div>
+
+<div class="endpoint">
+  <div class="method">POST</div>
+  <div class="path">/probe/from-binary</div>
+  <div class="desc">Inspect uploaded media file using ffprobe</div>
+  <div class="params">
+    <span class="param">file</span> - Media file [multipart/form-data]<br>
+    <span class="param">(same options as /probe/from-urls)</span>
+  </div>
+  <div class="response">Returns: JSON with media information</div>
+</div>
+
+<div class="endpoint">
+  <div class="method">GET</div>
+  <div class="path">/probe/public?rel={path}</div>
+  <div class="desc">Inspect file from public directory using ffprobe</div>
+  <div class="params">
+    <span class="param">rel</span> - Relative path within PUBLIC_DIR<br>
+    <span class="param">(same options as /probe/from-urls)</span>
+  </div>
+  <div class="response">Returns: JSON with media information</div>
+</div>
+"""
+    
     html = f"""
     <!doctype html>
     <html>
     <head>
       <meta charset="utf-8" />
-      <title>FFmpeg Info</title>
+      <title>FFmpeg Info & API</title>
       {refresh_meta}
       <style>
-        body {{ font-family: system-ui, sans-serif; padding: 24px; }}
+        body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
         pre {{ background: #f5f5f5; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; line-height: 1.4; }}
         h3 {{ margin-top: 30px; margin-bottom: 10px; }}
+        h4 {{ margin-top: 25px; margin-bottom: 15px; color: #333; border-bottom: 2px solid #0066cc; padding-bottom: 5px; }}
         nav {{ margin-bottom: 20px; }}
         nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
         nav a:hover {{ text-decoration: underline; }}
@@ -379,6 +581,68 @@ def ffmpeg_info(auto_refresh: int = 0):
           font-size: 13px;
         }}
         .status.active {{ background: #d4edda; color: #155724; }}
+        
+        .endpoint {{
+          background: #f9f9f9;
+          border-left: 4px solid #0066cc;
+          padding: 12px 15px;
+          margin-bottom: 12px;
+          border-radius: 4px;
+        }}
+        .method {{
+          display: inline-block;
+          background: #0066cc;
+          color: white;
+          padding: 3px 10px;
+          border-radius: 3px;
+          font-weight: bold;
+          font-size: 12px;
+          margin-right: 10px;
+        }}
+        .method.get {{ background: #28a745; }}
+        .method.post {{ background: #007bff; }}
+        .path {{
+          display: inline-block;
+          font-family: 'Courier New', monospace;
+          font-size: 14px;
+          font-weight: bold;
+          color: #333;
+        }}
+        .desc {{
+          margin-top: 8px;
+          color: #555;
+          font-size: 14px;
+        }}
+        .params {{
+          margin-top: 8px;
+          padding: 10px;
+          background: #fff;
+          border-radius: 3px;
+          font-size: 13px;
+          line-height: 1.6;
+        }}
+        .param {{
+          font-family: 'Courier New', monospace;
+          color: #0066cc;
+          font-weight: bold;
+        }}
+        .response {{
+          margin-top: 8px;
+          padding: 8px;
+          background: #e8f5e9;
+          border-radius: 3px;
+          font-size: 13px;
+          font-family: 'Courier New', monospace;
+        }}
+        .example {{
+          margin-top: 8px;
+          padding: 10px;
+          background: #fff3cd;
+          border-radius: 3px;
+          font-size: 12px;
+          font-family: 'Courier New', monospace;
+          white-space: pre;
+        }}
       </style>
     </head>
     <body>
@@ -406,23 +670,13 @@ def ffmpeg_info(auto_refresh: int = 0):
       </div>
       
       <div class="section">
+        <h3>API Endpoints</h3>
+        {api_docs}
+      </div>
+      
+      <div class="section">
         <h3>FFmpeg Version & Build</h3>
         <pre>{version_output}</pre>
-      </div>
-      
-      <div class="section">
-        <h3>Available Formats</h3>
-        <pre>{formats_output}</pre>
-      </div>
-      
-      <div class="section">
-        <h3>Available Codecs</h3>
-        <pre>{codecs_output}</pre>
-      </div>
-      
-      <div class="section">
-        <h3>Available Encoders</h3>
-        <pre>{encoders_output}</pre>
       </div>
     </body>
     </html>
