@@ -1,5 +1,5 @@
 
-<img src="https://github.com/hastla007/ffapi/blob/main/logo-ffapi.png?raw=true" alt="ffapi Logo" width="50%" height="50%" >
+<img src="https://github.com/hastla007/ffapi/blob/main/logo-ffapi.png?raw=true" alt="ffapi Logo" width="20%" height="20%" >
 
 
 # FFAPI Ultimate
