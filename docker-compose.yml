@@ -1,4 +1,3 @@
-
 services:
   ffapi:
     build: .
@@ -13,3 +12,18 @@ services:
       - ./public:/data/public
       - ./work:/data/work
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '4'      # Max 4 CPU cores
+          memory: 4G     # Max 4GB RAM
+        reservations:
+          cpus: '0.5'    # Reserve at least 0.5 cores
+          memory: 512M   # Reserve at least 512MB
+    # Health check configuration
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/health').read()"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
