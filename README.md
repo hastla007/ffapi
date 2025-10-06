@@ -1,22 +1,48 @@
+# FFAPI Ultimate
 
-# FFAPI Ultimate (fixed: cross-device move + WORK_DIR)
-
-### Key changes
+### Key features
 - `publish_file()` uses `shutil.move()` (works across devices / Docker volumes / Windows).
 - All `TemporaryDirectory(...)` calls use `dir=$WORK_DIR` (default `/data/work`) so temps are on the same volume.
+- **Fixed retention**: Files are deleted based on actual file age (modification time), not folder name. Files persist through restarts until truly RETENTION_DAYS old.
+- **Persistent FFmpeg logs**: All FFmpeg operations save logs to `/data/logs` for debugging.
 
 ### Endpoints
-Same as before: /health, /downloads, /files, /image/to-mp4-loop, /compose/*, /video/concat*, /v1/run-ffmpeg-command, /probe/*
+- `/health` - Health check
+- `/downloads` - Browse generated files (HTML)
+- `/logs` - Browse FFmpeg logs (HTML)
+- `/logs/view?path=...` - View individual log file
+- `/files/*` - Static file serving
+- `/image/to-mp4-loop` - Convert image to looping video
+- `/compose/from-binaries` - Compose video from uploaded files
+- `/compose/from-urls` - Compose video from URLs
+- `/compose/from-tracks` - Compose from track definitions
+- `/video/concat-from-urls` - Concatenate videos
+- `/video/concat` - Concat alias (accepts `clips` or `urls`)
+- `/v1/run-ffmpeg-command` - Run custom FFmpeg command
+- `/probe/from-urls` - FFprobe on URL
+- `/probe/from-binary` - FFprobe on uploaded file
+- `/probe/public` - FFprobe on public file
 
 ### Run with Docker
 ```bash
 docker compose up -d
-# http://localhost:3000/downloads
+# Browse files: http://localhost:3000/downloads
+# Browse logs: http://localhost:3000/logs
 ```
-Outputs persist in `./public` (mounted to `/data/public`). Temporary work files live in `./work` (`/data/work`).
 
-### Env
-- PUBLIC_BASE_URL  (e.g., http://10.120.2.5:3000)
-- PUBLIC_DIR       (/data/public)
-- WORK_DIR         (/data/work)
-- RETENTION_DAYS   (default 7)
+Outputs persist in `./public` (mounted to `/data/public`).  
+Temporary work files live in `./work` (`/data/work`).  
+FFmpeg logs persist in `./logs` (`/data/logs`).
+
+### Environment Variables
+- `PUBLIC_BASE_URL` - Base URL for file links (e.g., http://10.120.2.5:3000)
+- `PUBLIC_DIR` - Directory for output files (default: /data/public)
+- `WORK_DIR` - Directory for temporary work files (default: /data/work)
+- `LOGS_DIR` - Directory for FFmpeg logs (default: /data/logs)
+- `RETENTION_DAYS` - Days to keep files before deletion (default: 7)
+
+### Retention Logic
+Files are automatically cleaned up based on their **actual modification time**, not the folder date. This means:
+- Files survive machine restarts
+- Only truly old files are deleted
+- RETENTION_DAYS works as expected
