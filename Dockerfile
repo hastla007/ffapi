@@ -7,6 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY logo-ffapi.png ./app/logo-ffapi.png
 
 # volumes for outputs and work
 VOLUME ["/data/public", "/data/work", "/data/logs"]
