@@ -36,15 +36,35 @@ app.mount("/files", StaticFiles(directory=str(PUBLIC_DIR)), name="files")
 
 # Setup logging to file
 import logging
+import sys
+
+# Force unbuffered output
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+# Create file handler with immediate flush
+file_handler = logging.FileHandler(str(APP_LOG_FILE))
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+# Create console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+# Configure root logger to catch everything (including uvicorn)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(str(APP_LOG_FILE)),
-        logging.StreamHandler()  # Still output to console for docker logs
-    ]
+    handlers=[file_handler, console_handler]
 )
+
 logger = logging.getLogger("ffapi")
+
+# Also capture uvicorn logs
+uvicorn_logger = logging.getLogger("uvicorn")
+uvicorn_logger.addHandler(file_handler)
+uvicorn_access = logging.getLogger("uvicorn.access")
+uvicorn_access.addHandler(file_handler)
 
 # Log startup
 logger.info("="*60)
@@ -56,10 +76,25 @@ logger.info(f"RETENTION_DAYS: {RETENTION_DAYS}")
 logger.info(f"PUBLIC_BASE_URL: {PUBLIC_BASE_URL or 'Not set'}")
 logger.info("="*60)
 
+# Force flush
+file_handler.flush()
+
+# Startup event to log when server is ready
+@app.on_event("startup")
+async def startup_event():
+    logger.info("FastAPI server is ready to accept requests")
+    _flush_logs()
+
 
 def _rand(n=8):
     import random, string
     return "".join(random.choices(string.digits, k=n))
+
+
+def _flush_logs():
+    """Force flush all log handlers."""
+    for handler in logging.getLogger().handlers:
+        handler.flush()
 
 
 def cleanup_old_public(days: int = RETENTION_DAYS):
@@ -99,6 +134,7 @@ def cleanup_old_public(days: int = RETENTION_DAYS):
     
     if deleted_count > 0:
         logger.info(f"Cleanup: deleted {deleted_count} files older than {days} days")
+        _flush_logs()
 
 
 def publish_file(src: Path, ext: str) -> Dict[str, str]:
@@ -115,6 +151,7 @@ def publish_file(src: Path, ext: str) -> Dict[str, str]:
     shutil.move(str(src), str(dst))
     
     logger.info(f"Published file: {name} ({dst.stat().st_size / (1024*1024):.2f} MB)")
+    _flush_logs()
 
     rel = f"/files/{day}/{name}"
     url = f"{PUBLIC_BASE_URL.rstrip('/')}{rel}" if PUBLIC_BASE_URL else rel
@@ -246,8 +283,12 @@ def view_log(path: str):
 
 
 @app.get("/ffmpeg", response_class=HTMLResponse)
-def ffmpeg_info():
-    """Display FFmpeg version and capabilities."""
+def ffmpeg_info(auto_refresh: int = 0):
+    """Display FFmpeg version and capabilities.
+    
+    Args:
+        auto_refresh: Auto-refresh interval in seconds (0 = disabled, max 60)
+    """
     # Get version
     version_proc = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
     version_output = version_proc.stdout if version_proc.returncode == 0 else "Error getting version"
@@ -264,18 +305,38 @@ def ffmpeg_info():
     encoders_proc = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
     encoders_output = encoders_proc.stdout if encoders_proc.returncode == 0 else "Error getting encoders"
     
-    # Get application logs (last 500 lines)
+    # Force flush all handlers before reading
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    
+    # Get application logs (last 1000 lines)
     app_logs = ""
+    log_info = ""
     if APP_LOG_FILE.exists():
         try:
+            stat = APP_LOG_FILE.stat()
+            size_kb = stat.st_size / 1024
+            mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            log_info = f"Log file: {size_kb:.1f} KB, Last modified: {mtime}"
+            
             with APP_LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
                 lines = f.readlines()
-                # Get last 500 lines
-                app_logs = "".join(lines[-500:]) if lines else "No logs yet"
+                # Get last 1000 lines
+                app_logs = "".join(lines[-1000:]) if lines else "No logs yet"
         except Exception as e:
             app_logs = f"Error reading logs: {e}"
+            log_info = "Error reading log file"
     else:
         app_logs = "Log file not created yet"
+        log_info = "Waiting for first log entry..."
+    
+    # Auto-refresh setup
+    auto_refresh = max(0, min(auto_refresh, 60))  # Clamp between 0-60 seconds
+    refresh_meta = f'<meta http-equiv="refresh" content="{auto_refresh}">' if auto_refresh > 0 else ''
+    refresh_status = f"Auto-refreshing every {auto_refresh} seconds" if auto_refresh > 0 else "Auto-refresh: OFF"
+    
+    # Current time
+    current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     
     html = f"""
     <!doctype html>
@@ -283,6 +344,7 @@ def ffmpeg_info():
     <head>
       <meta charset="utf-8" />
       <title>FFmpeg Info</title>
+      {refresh_meta}
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; }}
         pre {{ background: #f5f5f5; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; line-height: 1.4; }}
@@ -292,16 +354,31 @@ def ffmpeg_info():
         nav a:hover {{ text-decoration: underline; }}
         .section {{ margin-bottom: 40px; }}
         .logs {{ max-height: 600px; overflow-y: auto; background: #1e1e1e; color: #d4d4d4; }}
-        .refresh-btn {{ 
+        .controls {{ margin-bottom: 15px; }}
+        .btn {{ 
           background: #0066cc; 
           color: white; 
           padding: 8px 16px; 
           border: none; 
           border-radius: 4px; 
           cursor: pointer;
-          margin-bottom: 10px;
+          margin-right: 10px;
+          text-decoration: none;
+          display: inline-block;
         }}
-        .refresh-btn:hover {{ background: #0052a3; }}
+        .btn:hover {{ background: #0052a3; }}
+        .btn.secondary {{ background: #666; }}
+        .btn.secondary:hover {{ background: #555; }}
+        .info {{ color: #666; font-size: 13px; margin-bottom: 10px; }}
+        .status {{ 
+          padding: 6px 12px; 
+          background: #e8f4f8; 
+          border-radius: 4px; 
+          display: inline-block;
+          margin-left: 10px;
+          font-size: 13px;
+        }}
+        .status.active {{ background: #d4edda; color: #155724; }}
       </style>
     </head>
     <body>
@@ -313,8 +390,18 @@ def ffmpeg_info():
       <h2>FFmpeg & Container Information</h2>
       
       <div class="section">
-        <h3>Application Logs (Docker Container Output - Last 500 lines)</h3>
-        <button class="refresh-btn" onclick="location.reload()">Refresh Logs</button>
+        <h3>Application Logs (Docker Container Output - Last 1000 lines)</h3>
+        <div class="controls">
+          <button class="btn" onclick="location.reload()">Manual Refresh</button>
+          <a href="/ffmpeg?auto_refresh=5" class="btn secondary">Auto 5s</a>
+          <a href="/ffmpeg?auto_refresh=10" class="btn secondary">Auto 10s</a>
+          <a href="/ffmpeg?auto_refresh=30" class="btn secondary">Auto 30s</a>
+          <a href="/ffmpeg" class="btn secondary">Stop Auto</a>
+          <span class="status {'active' if auto_refresh > 0 else ''}">{refresh_status}</span>
+        </div>
+        <div class="info">
+          Page loaded: {current_time} | {log_info}
+        </div>
         <pre class="logs">{app_logs}</pre>
       </div>
       
@@ -346,6 +433,7 @@ def ffmpeg_info():
 @app.get("/health")
 def health():
     logger.info("Health check requested")
+    _flush_logs()
     return {"ok": True}
 
 
@@ -417,6 +505,7 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None)
 @app.post("/image/to-mp4-loop")
 async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as_json: bool = False):
     logger.info(f"Starting image-to-mp4-loop: {file.filename}, duration={duration}s")
+    _flush_logs()
     if file.content_type not in {"image/png", "image/jpeg"}:
         raise HTTPException(status_code=400, detail="Only PNG/JPEG are supported.")
     if not (1 <= duration <= 3600):
@@ -446,6 +535,7 @@ async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
         pub = publish_file(out_path, ".mp4")
         logger.info(f"image-to-mp4-loop completed: {pub['rel']}")
+        _flush_logs()
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -466,6 +556,7 @@ async def compose_from_binaries(
     as_json: bool = False,
 ):
     logger.info(f"Starting compose-from-binaries: video={video.filename}, audio={audio.filename if audio else None}, bgm={bgm.filename if bgm else None}")
+    _flush_logs()
     with TemporaryDirectory(prefix="compose_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         v_path = work / "video.mp4"
@@ -518,6 +609,7 @@ async def compose_from_binaries(
 
         pub = publish_file(out_path, ".mp4")
         logger.info(f"compose-from-binaries completed: {pub['rel']}")
+        _flush_logs()
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -528,6 +620,7 @@ async def compose_from_binaries(
 @app.post("/video/concat-from-urls")
 def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
     logger.info(f"Starting concat: {len(job.clips)} clips, {job.width}x{job.height}@{job.fps}fps")
+    _flush_logs()
     with TemporaryDirectory(prefix="concat_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         norm = []
@@ -566,6 +659,7 @@ def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed_concat", "log": log2.read_text()})
         pub = publish_file(out_path, ".mp4")
         logger.info(f"concat completed: {len(job.clips)} clips -> {pub['rel']}")
+        _flush_logs()
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
