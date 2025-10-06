@@ -7,10 +7,12 @@ services:
       PUBLIC_BASE_URL: "http://localhost:3000"
       PUBLIC_DIR: "/data/public"
       WORK_DIR: "/data/work"
+      LOGS_DIR: "/data/logs"
       RETENTION_DAYS: "7"
     volumes:
       - ./public:/data/public
       - ./work:/data/work
+      - ./logs:/data/logs
     restart: unless-stopped
     deploy:
       resources:
