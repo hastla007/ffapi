@@ -7,7 +7,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
-COPY logo-ffapi.png ./app/logo-ffapi.png
+
+# Copy logo - ensure logo-ffapi.png exists in the same directory as Dockerfile
+COPY logo-ffapi.png /app/app/logo-ffapi.png
 
 # volumes for outputs and work
 VOLUME ["/data/public", "/data/work", "/data/logs"]
