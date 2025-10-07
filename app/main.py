@@ -444,18 +444,21 @@ def documentation():
   <div class="method get">GET</div>
   <div class="path">/</div>
   <div class="desc">Redirects to /downloads</div>
+  <div class="example">Example:<br>curl http://localhost:3000/</div>
 </div>
 
 <div class="endpoint">
   <div class="method get">GET</div>
   <div class="path">/downloads</div>
   <div class="desc">Browse generated files (HTML page)</div>
+  <div class="example">Example:<br>curl http://localhost:3000/downloads</div>
 </div>
 
 <div class="endpoint">
   <div class="method get">GET</div>
   <div class="path">/logs</div>
   <div class="desc">Browse FFmpeg operation logs (HTML page)</div>
+  <div class="example">Example:<br>curl http://localhost:3000/logs</div>
 </div>
 
 <div class="endpoint">
@@ -465,6 +468,7 @@ def documentation():
   <div class="params">
     <span class="param">path</span> - Relative path to log file (e.g., 20241008/20241008_143022_12345678_compose-urls.log)
   </div>
+  <div class="example">Example:<br>curl http://localhost:3000/logs/view?path=20241008/20241008_143022_12345678_compose-urls.log</div>
 </div>
 
 <div class="endpoint">
@@ -474,12 +478,14 @@ def documentation():
   <div class="params">
     <span class="param">auto_refresh</span> - Auto-refresh interval in seconds (0-60, default: 0)
   </div>
+  <div class="example">Example:<br>curl http://localhost:3000/ffmpeg?auto_refresh=10</div>
 </div>
 
 <div class="endpoint">
   <div class="method get">GET</div>
   <div class="path">/documentation</div>
   <div class="desc">This page - Complete API documentation</div>
+  <div class="example">Example:<br>curl http://localhost:3000/documentation</div>
 </div>
 
 <div class="endpoint">
@@ -487,12 +493,14 @@ def documentation():
   <div class="path">/health</div>
   <div class="desc">Health check endpoint</div>
   <div class="response">Returns: {"ok": true}</div>
+  <div class="example">Example:<br>curl http://localhost:3000/health</div>
 </div>
 
 <div class="endpoint">
   <div class="method get">GET</div>
   <div class="path">/files/{date}/{filename}</div>
   <div class="desc">Static file serving - download generated files</div>
+  <div class="example">Example:<br>curl -O http://localhost:3000/files/20241008/20241008_143022_12345678.mp4</div>
 </div>
 
 <h4>Image Processing</h4>
@@ -506,6 +514,7 @@ def documentation():
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
   <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/image/to-mp4-loop \<br>  -F "file=@image.jpg" \<br>  -F "duration=10" \<br>  -F "as_json=true"</div>
 </div>
 
 <h4>Video Composition</h4>
@@ -525,6 +534,7 @@ def documentation():
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
   <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-binaries \<br>  -F "video=@video.mp4" \<br>  -F "audio=@audio.mp3" \<br>  -F "bgm=@music.mp3" \<br>  -F "duration_ms=15000" \<br>  -F "width=1280" \<br>  -F "height=720" \<br>  -F "bgm_volume=0.2" \<br>  -F "as_json=true"</div>
 </div>
 
 <div class="endpoint">
@@ -544,6 +554,7 @@ def documentation():
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
   <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-urls \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "video_url": "https://example.com/video.mp4",<br>    "audio_url": "https://example.com/audio.mp3",<br>    "bgm_url": "https://example.com/music.mp3",<br>    "duration_ms": 20000,<br>    "width": 1280,<br>    "height": 720,<br>    "fps": 30,<br>    "bgm_volume": 0.3,<br>    "as_json": true<br>  }'</div>
 </div>
 
 <div class="endpoint">
@@ -558,6 +569,7 @@ def documentation():
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
   <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-tracks \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "tracks": [<br>      {<br>        "id": "video1",<br>        "type": "video",<br>        "keyframes": [<br>          {<br>            "url": "https://example.com/clip.mp4",<br>            "timestamp": 0,<br>            "duration": 10000<br>          }<br>        ]<br>      },<br>      {<br>        "id": "audio1",<br>        "type": "audio",<br>        "keyframes": [<br>          {<br>            "url": "https://example.com/audio.mp3",<br>            "timestamp": 0,<br>            "duration": 10000<br>          }<br>        ]<br>      }<br>    ],<br>    "width": 1920,<br>    "height": 1080,<br>    "fps": 30,<br>    "as_json": true<br>  }'</div>
 </div>
 
 <h4>Video Concatenation</h4>
@@ -573,6 +585,7 @@ def documentation():
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
   <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/video/concat-from-urls \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "clips": [<br>      "https://example.com/clip1.mp4",<br>      "https://example.com/clip2.mp4",<br>      "https://example.com/clip3.mp4"<br>    ],<br>    "width": 1920,<br>    "height": 1080,<br>    "fps": 30,<br>    "as_json": true<br>  }'</div>
 </div>
 
 <div class="endpoint">
@@ -588,6 +601,7 @@ def documentation():
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
   <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="example">Example (using 'clips'):<br>curl -X POST http://localhost:3000/video/concat \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "clips": [<br>      "https://example.com/video1.mp4",<br>      "https://example.com/video2.mp4"<br>    ],<br>    "width": 1280,<br>    "height": 720,<br>    "as_json": true<br>  }'</div>
 </div>
 
 <h4>Custom FFmpeg Commands</h4>
@@ -601,14 +615,7 @@ def documentation():
     <span class="param">ffmpeg_command</span> - FFmpeg command with {{variable}} placeholders
   </div>
   <div class="response">Returns: {"ok": true, "outputs": {"key": "url", ...}}</div>
-  <div class="example">
-Example:<br>
-{<br>
-  "input_files": {"video": "https://example.com/vid.mp4"},<br>
-  "output_files": {"out": "result.mp4"},<br>
-  "ffmpeg_command": "-i {{video}} -vf scale=1280:720 {{out}}"<br>
-}
-  </div>
+  <div class="example">Example (scale video to 720p):<br>curl -X POST http://localhost:3000/v1/run-ffmpeg-command \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "input_files": {<br>      "video": "https://example.com/input.mp4"<br>    },<br>    "output_files": {<br>      "out": "result.mp4"<br>    },<br>    "ffmpeg_command": "-i {{video}} -vf scale=1280:720 -c:a copy {{out}}"<br>  }'</div>
 </div>
 
 <h4>FFprobe (Media Inspection)</h4>
@@ -631,6 +638,7 @@ Example:<br>
     <span class="param">select_streams</span> - Select specific streams (optional)
   </div>
   <div class="response">Returns: JSON with media information</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/probe/from-urls \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "url": "https://example.com/video.mp4",<br>    "show_format": true,<br>    "show_streams": true,<br>    "count_frames": true<br>  }'</div>
 </div>
 
 <div class="endpoint">
@@ -642,6 +650,7 @@ Example:<br>
     <span class="param">(same options as /probe/from-urls)</span>
   </div>
   <div class="response">Returns: JSON with media information</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/probe/from-binary \<br>  -F "file=@video.mp4" \<br>  -F "show_format=true" \<br>  -F "show_streams=true" \<br>  -F "count_frames=true"</div>
 </div>
 
 <div class="endpoint">
@@ -653,6 +662,7 @@ Example:<br>
     <span class="param">(same options as /probe/from-urls)</span>
   </div>
   <div class="response">Returns: JSON with media information</div>
+  <div class="example">Example:<br>curl "http://localhost:3000/probe/public?rel=20241008/20241008_143022_12345678.mp4&show_format=true&show_streams=true"</div>
 </div>
 """
     
@@ -852,7 +862,12 @@ async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as
         work = Path(workdir)
         in_path = work / ("input.png" if file.content_type == "image/png" else "input.jpg")
         out_path = work / "output.mp4"
-        in_path.write_bytes(await file.read())
+        
+        # Stream file to disk in chunks (memory efficient)
+        with in_path.open('wb') as f:
+            while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                f.write(chunk)
+        
         cmd = [
             "ffmpeg", "-y",
             "-loop", "1",
@@ -902,14 +917,24 @@ async def compose_from_binaries(
         b_path = work / "bgm"
         out_path = work / "output.mp4"
 
-        v_path.write_bytes(await video.read())
+        # Stream video file to disk in chunks
+        with v_path.open('wb') as f:
+            while chunk := await video.read(1024 * 1024):  # 1MB chunks
+                f.write(chunk)
+        
         has_audio = False
         has_bgm = False
         if audio:
-            a_path.write_bytes(await audio.read())
+            # Stream audio file to disk in chunks
+            with a_path.open('wb') as f:
+                while chunk := await audio.read(1024 * 1024):
+                    f.write(chunk)
             has_audio = True
         if bgm:
-            b_path.write_bytes(await bgm.read())
+            # Stream BGM file to disk in chunks
+            with b_path.open('wb') as f:
+                while chunk := await bgm.read(1024 * 1024):
+                    f.write(chunk)
             has_bgm = True
 
         dur_s = f"{duration_ms/1000:.3f}"
@@ -1268,7 +1293,12 @@ async def probe_from_binary(
 ):
     with TemporaryDirectory(prefix="probe_", dir=str(WORK_DIR)) as workdir:
         p = Path(workdir) / (file.filename or "input.bin")
-        p.write_bytes(await file.read())
+        
+        # Stream file to disk in chunks
+        with p.open('wb') as f:
+            while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                f.write(chunk)
+        
         cmd = _ffprobe_cmd_base(show_format, show_streams, show_chapters, show_programs, show_packets,
                                 count_frames, count_packets, probe_size, analyze_duration, select_streams) + [str(p)]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
