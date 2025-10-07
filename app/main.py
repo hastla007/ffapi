@@ -835,18 +835,113 @@ ALLOWED_FORWARD_HEADERS_LOWER = {
     "cookie", "authorization", "x-n8n-api-key", "ngrok-skip-browser-warning"
 }
 
-def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None):
+def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None, max_retries: int = 3, chunk_size: int = 1024 * 1024):
+    """Download file with retry, resume, and progress tracking.
+    
+    Args:
+        url: URL to download from
+        dest: Destination file path
+        headers: Optional HTTP headers to forward
+        max_retries: Number of retry attempts (default: 3)
+        chunk_size: Download chunk size in bytes (default: 1MB)
+    """
     hdr = {}
     if headers:
         for k, v in headers.items():
             if k.lower() in ALLOWED_FORWARD_HEADERS_LOWER:
                 hdr[k] = v
-    with requests.get(url, headers=hdr, stream=True, timeout=300) as r:
-        r.raise_for_status()
-        with dest.open("wb") as f:
-            for ch in r.iter_content(8192):
-                if ch:
-                    f.write(ch)
+    
+    for attempt in range(max_retries):
+        try:
+            # Check if partial file exists from previous attempt
+            existing_size = dest.stat().st_size if dest.exists() else 0
+            
+            # Try to resume from existing position
+            if existing_size > 0:
+                hdr['Range'] = f'bytes={existing_size}-'
+                mode = 'ab'  # Append mode
+                logger.info(f"Resuming download from {existing_size/1024/1024:.1f}MB: {url}")
+            else:
+                mode = 'wb'  # Write mode (new file)
+            
+            # Dynamic timeout: 10 minutes base
+            timeout = 600
+            
+            with requests.get(url, headers=hdr, stream=True, timeout=timeout) as r:
+                r.raise_for_status()
+                
+                # Check if server supports Range requests
+                if existing_size > 0:
+                    if r.status_code == 206:
+                        # Server supports Range, we got partial content
+                        logger.info(f"✓ Server supports resume for: {url}")
+                    elif r.status_code == 200:
+                        # Server doesn't support Range, gave us full file
+                        logger.warning(f"⚠ Server doesn't support resume, downloading from start: {url}")
+                        mode = 'wb'  # Switch to overwrite mode
+                        existing_size = 0
+                        # Remove Range header for clarity
+                        if 'Range' in hdr:
+                            del hdr['Range']
+                
+                # Get total size
+                if 'content-length' in r.headers:
+                    content_length = int(r.headers['content-length'])
+                    if r.status_code == 206:
+                        # Partial content - add existing size
+                        total_size = existing_size + content_length
+                    else:
+                        # Full content
+                        total_size = content_length
+                else:
+                    total_size = 0
+                
+                # Download with progress tracking
+                downloaded = existing_size
+                last_log = downloaded
+                
+                with dest.open(mode) as f:
+                    for chunk in r.iter_content(chunk_size):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            # Log progress every 50MB
+                            if downloaded - last_log >= 50 * 1024 * 1024:
+                                if total_size:
+                                    percent = (downloaded / total_size) * 100
+                                    logger.info(f"Download progress: {percent:.0f}% ({downloaded/1024/1024:.0f}MB/{total_size/1024/1024:.0f}MB)")
+                                else:
+                                    logger.info(f"Downloaded: {downloaded/1024/1024:.0f}MB")
+                                last_log = downloaded
+                                _flush_logs()
+                
+                # Verify size if we know what to expect
+                if total_size and downloaded != total_size:
+                    raise Exception(f"Download incomplete: got {downloaded} bytes, expected {total_size}")
+                
+                logger.info(f"Download complete: {downloaded/1024/1024:.1f}MB - {url}")
+                _flush_logs()
+                return  # Success!
+                
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                logger.warning(f"Download failed (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.warning(f"Retrying in {wait_time} seconds...")
+                _flush_logs()
+                time.sleep(wait_time)
+            else:
+                # Final attempt failed
+                logger.error(f"Download failed after {max_retries} attempts: {e}")
+                _flush_logs()
+                # Clean up partial file on final failure
+                if dest.exists():
+                    try:
+                        dest.unlink()
+                    except:
+                        pass
+                raise
 
 
 # ---------- routes ----------
