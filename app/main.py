@@ -83,17 +83,6 @@ file_handler.flush()
 @app.on_event("startup")
 async def startup_event():
     logger.info("FastAPI server is ready to accept requests")
-    
-    # Check if logo exists
-    logo_path = Path(__file__).parent / "logo-ffapi.png"
-    if logo_path.exists():
-        logger.info(f"✓ Logo found at: {logo_path}")
-    else:
-        logger.warning(f"✗ Logo NOT found at: {logo_path}")
-        logger.warning("Logo will not be displayed on pages. To fix:")
-        logger.warning("1. Place logo-ffapi.png in project root (same directory as Dockerfile)")
-        logger.warning("2. Rebuild: docker compose build --no-cache")
-    
     _flush_logs()
 
 
@@ -210,7 +199,9 @@ def downloads():
       <title>Downloads</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-        .logo {{ display: block; width: 20%; height: 20%; margin-bottom: 20px; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .brand .ff {{ color: #28a745; }}
+        .brand .api {{ color: #000; }}
         table {{ border-collapse: collapse; width: 100%; }}
         th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
         th {{ text-align: left; background: #fafafa; }}
@@ -220,7 +211,7 @@ def downloads():
       </style>
     </head>
     <body>
-      <img src="/logo.png" alt="FFAPI Logo" class="logo" onerror="this.style.display='none'">
+      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
@@ -260,7 +251,9 @@ def logs():
       <title>FFmpeg Logs</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-        .logo {{ display: block; width: 20%; height: 20%; margin-bottom: 20px; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .brand .ff {{ color: #28a745; }}
+        .brand .api {{ color: #000; }}
         table {{ border-collapse: collapse; width: 100%; }}
         th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
         th {{ text-align: left; background: #fafafa; }}
@@ -270,7 +263,7 @@ def logs():
       </style>
     </head>
     <body>
-      <img src="/logo.png" alt="FFAPI Logo" class="logo" onerror="this.style.display='none'">
+      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
@@ -352,7 +345,9 @@ def ffmpeg_info(auto_refresh: int = 0):
       {refresh_meta}
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-        .logo {{ display: block; width: 20%; height: 20%; margin-bottom: 20px; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .brand .ff {{ color: #28a745; }}
+        .brand .api {{ color: #000; }}
         pre {{ background: #f5f5f5; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; line-height: 1.4; }}
         h3 {{ margin-top: 30px; margin-bottom: 10px; }}
         nav {{ margin-bottom: 20px; }}
@@ -394,7 +389,7 @@ def ffmpeg_info(auto_refresh: int = 0):
       </style>
     </head>
     <body>
-      <img src="/logo.png" alt="FFAPI Logo" class="logo" onerror="this.style.display='none'">
+      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
@@ -669,7 +664,9 @@ Example:<br>
       <title>API Documentation</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-        .logo {{ display: block; width: 20%; height: 20%; margin-bottom: 20px; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .brand .ff {{ color: #28a745; }}
+        .brand .api {{ color: #000; }}
         h2 {{ margin-bottom: 10px; }}
         h4 {{ margin-top: 30px; margin-bottom: 15px; color: #333; border-bottom: 2px solid #0066cc; padding-bottom: 5px; }}
         nav {{ margin-bottom: 20px; }}
@@ -748,7 +745,7 @@ Example:<br>
       </style>
     </head>
     <body>
-      <img src="/logo.png" alt="FFAPI Logo" class="logo" onerror="this.style.display='none'">
+      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
