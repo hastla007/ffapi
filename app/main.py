@@ -83,6 +83,17 @@ file_handler.flush()
 @app.on_event("startup")
 async def startup_event():
     logger.info("FastAPI server is ready to accept requests")
+    
+    # Check if logo exists
+    logo_path = Path(__file__).parent / "logo-ffapi.png"
+    if logo_path.exists():
+        logger.info(f"✓ Logo found at: {logo_path}")
+    else:
+        logger.warning(f"✗ Logo NOT found at: {logo_path}")
+        logger.warning("Logo will not be displayed on pages. To fix:")
+        logger.warning("1. Place logo-ffapi.png in project root (same directory as Dockerfile)")
+        logger.warning("2. Rebuild: docker compose build --no-cache")
+    
     _flush_logs()
 
 
@@ -209,7 +220,7 @@ def downloads():
       </style>
     </head>
     <body>
-      <img src="/logo.png" alt="FFAPI Logo" class="logo">
+      <img src="/logo.png" alt="FFAPI Logo" class="logo" onerror="this.style.display='none'">
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
@@ -259,7 +270,7 @@ def logs():
       </style>
     </head>
     <body>
-      <img src="/logo.png" alt="FFAPI Logo" class="logo">
+      <img src="/logo.png" alt="FFAPI Logo" class="logo" onerror="this.style.display='none'">
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
@@ -383,7 +394,7 @@ def ffmpeg_info(auto_refresh: int = 0):
       </style>
     </head>
     <body>
-      <img src="/logo.png" alt="FFAPI Logo" class="logo">
+      <img src="/logo.png" alt="FFAPI Logo" class="logo" onerror="this.style.display='none'">
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
@@ -737,7 +748,7 @@ Example:<br>
       </style>
     </head>
     <body>
-      <img src="/logo.png" alt="FFAPI Logo" class="logo">
+      <img src="/logo.png" alt="FFAPI Logo" class="logo" onerror="this.style.display='none'">
       <nav>
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
