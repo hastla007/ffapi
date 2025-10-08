@@ -1087,8 +1087,24 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                 req_hdr['Range'] = f'bytes={existing_size}-'
                 logger.info(f"Resuming download from {existing_size/1024/1024:.1f}MB: {url}")
 
-            # Dynamic timeout: 10 minutes base
+            # Estimate timeout based on size hints
             timeout = 600
+            size_hint = None
+            try:
+                head_headers = dict(req_hdr)
+                head_headers.pop('Range', None)
+                head_resp = requests.head(url, headers=head_headers, timeout=30)
+                head_resp.raise_for_status()
+                if 'content-length' in head_resp.headers:
+                    size_hint = int(head_resp.headers['content-length'])
+            except Exception:
+                size_hint = None
+
+            if size_hint is not None:
+                size_mb = size_hint / (1024 * 1024)
+                timeout = max(600, int(size_mb * 10))
+            else:
+                timeout = 3600
 
             with requests.get(url, headers=req_hdr, stream=True, timeout=timeout) as r:
                 r.raise_for_status()
@@ -1120,7 +1136,16 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                         total_size = content_length
                 else:
                     total_size = 0
-                
+
+                required_mb = MIN_FREE_SPACE_MB
+                if total_size:
+                    remaining = total_size - existing_size
+                    if remaining < 0:
+                        remaining = 0
+                    remaining_mb = (remaining + 1024 * 1024 - 1) // (1024 * 1024)
+                    required_mb = max(MIN_FREE_SPACE_MB, MIN_FREE_SPACE_MB + remaining_mb)
+                check_disk_space(dest.parent, required_mb=required_mb)
+
                 # Download with progress tracking
                 downloaded = existing_size
                 last_log = downloaded
@@ -1439,26 +1464,36 @@ def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
 def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
     video_urls: List[str] = []
     audio_urls: List[str] = []
+    primary_video_url: Optional[str] = None
     max_dur = 0
-    for t in job.tracks:
-        for k in t.keyframes:
-            if k.duration is not None:
-                max_dur = max(max_dur, int(k.duration))
-            if k.url:
-                if t.type == "video":
-                    video_urls.append(str(k.url))
-                elif t.type == "audio":
-                    audio_urls.append(str(k.url))
+    for track in job.tracks:
+        for keyframe in track.keyframes:
+            duration_value: Optional[int] = None
+            if keyframe.duration is not None:
+                duration_value = int(keyframe.duration)
+                if duration_value <= 0:
+                    raise HTTPException(status_code=400, detail="Keyframe duration must be positive")
+                max_dur = max(max_dur, duration_value)
+            if keyframe.url:
+                if track.type == "video":
+                    video_urls.append(str(keyframe.url))
+                    if duration_value and duration_value > 0:
+                        if primary_video_url is None:
+                            primary_video_url = str(keyframe.url)
+                elif track.type == "audio":
+                    audio_urls.append(str(keyframe.url))
     if not video_urls:
-        raise HTTPException(status_code=400, detail="No video URL found in tracks")
+        raise HTTPException(status_code=400, detail="No video URLs found in tracks")
+    if primary_video_url is None:
+        raise HTTPException(status_code=400, detail="No valid video keyframes found")
     if max_dur <= 0:
-        max_dur = 30000
+        raise HTTPException(status_code=400, detail="At least one keyframe must include a duration")
 
     check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="tracks_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         v_in = work / "video.mp4"
-        _download_to(video_urls[0], v_in, None)
+        _download_to(primary_video_url, v_in, None)
         a_ins: List[Path] = []
         for i, url in enumerate(audio_urls):
             p = work / f"aud_{i:03d}.bin"

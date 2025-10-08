@@ -240,6 +240,7 @@ def test_download_to_clears_range_header_when_resume_not_supported(app_module, m
     dest.write_bytes(b"abcd")
 
     headers_seen = []
+    head_calls = []
 
     class FakeResponse:
         def __init__(self, status_code: int, chunks, fail_after_first_chunk: bool):
@@ -263,23 +264,98 @@ def test_download_to_clears_range_header_when_resume_not_supported(app_module, m
                 if self._fail_after_first_chunk and index == 0:
                     raise RuntimeError("connection dropped")
 
+    class FakeHeadResponse:
+        def __init__(self, length: int):
+            self.headers = {"content-length": str(length)}
+
+        def raise_for_status(self):
+            return None
+
     responses = [
         FakeResponse(200, [b"one", b"two"], True),
         FakeResponse(200, [b"onetwo"], False),
+    ]
+    head_responses = [
+        FakeHeadResponse(6),
+        FakeHeadResponse(6),
     ]
 
     def fake_get(url, headers=None, stream=True, timeout=None):
         headers_seen.append(dict(headers or {}))
         return responses.pop(0)
 
+    def fake_head(url, headers=None, timeout=None):
+        head_calls.append(dict(headers or {}))
+        return head_responses.pop(0)
+
     monkeypatch.setattr(app_module.requests, "get", fake_get)
+    monkeypatch.setattr(app_module.requests, "head", fake_head)
 
     app_module._download_to("https://example.com/file", dest, headers={"Authorization": "token"}, max_retries=2, chunk_size=3)
 
     assert len(headers_seen) == 2
     assert "Range" in headers_seen[0]
     assert "Range" not in headers_seen[1]
+    assert len(head_calls) == 2
+    assert "Range" not in head_calls[0]
     assert dest.read_bytes() == b"onetwo"
+
+
+def test_download_to_scales_timeout_and_disk_check(app_module, monkeypatch, tmp_path):
+    dest = tmp_path / "large.bin"
+
+    total_bytes = 70 * 1024 * 1024
+    timeouts = []
+    disk_checks = []
+
+    def fake_check_disk_space(path: Path, required_mb: int = 0):
+        path.mkdir(parents=True, exist_ok=True)
+        disk_checks.append(required_mb)
+
+    class HeadResponse:
+        def __init__(self):
+            self.headers = {"content-length": str(total_bytes)}
+
+        def raise_for_status(self):
+            return None
+
+    class StreamResponse:
+        def __init__(self):
+            self.status_code = 200
+            self.headers = {"content-length": str(total_bytes)}
+            self._remaining = total_bytes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            remaining = self._remaining
+            while remaining > 0:
+                size = min(chunk_size, remaining)
+                remaining -= size
+                yield b"x" * size
+
+    def fake_head(url, headers=None, timeout=None):
+        return HeadResponse()
+
+    def fake_get(url, headers=None, stream=True, timeout=None):
+        timeouts.append(timeout)
+        return StreamResponse()
+
+    monkeypatch.setattr(app_module, "check_disk_space", fake_check_disk_space)
+    monkeypatch.setattr(app_module.requests, "head", fake_head)
+    monkeypatch.setattr(app_module.requests, "get", fake_get)
+
+    app_module._download_to("https://example.com/large.bin", dest, chunk_size=1024 * 1024)
+
+    assert timeouts == [700]
+    assert disk_checks[-1] == 70
 
 
 def test_logs_page_lists_entries(patched_app):
@@ -496,6 +572,42 @@ def test_compose_from_tracks_as_json(patched_app):
     )
     result = patched_app.compose_from_tracks(job, as_json=True)
     assert result["ok"] is True
+
+
+def test_compose_from_tracks_requires_valid_video_keyframe(patched_app):
+    job = patched_app.TracksComposeJob(
+        tracks=[
+            patched_app.Track(
+                id="video1",
+                type="video",
+                keyframes=[patched_app.Keyframe(url=None, timestamp=0, duration=5000)],
+            )
+        ],
+        width=640,
+        height=360,
+        fps=24,
+    )
+    with pytest.raises(patched_app.HTTPException) as exc:
+        patched_app.compose_from_tracks(job, as_json=True)
+    assert exc.value.status_code == 400
+
+
+def test_compose_from_tracks_rejects_non_positive_duration(patched_app):
+    job = patched_app.TracksComposeJob(
+        tracks=[
+            patched_app.Track(
+                id="video1",
+                type="video",
+                keyframes=[patched_app.Keyframe(url="https://example.com/video.mp4", timestamp=0, duration=0)],
+            )
+        ],
+        width=640,
+        height=360,
+        fps=24,
+    )
+    with pytest.raises(patched_app.HTTPException) as exc:
+        patched_app.compose_from_tracks(job, as_json=True)
+    assert exc.value.status_code == 400
 
 
 def test_video_concat_from_urls_as_json(patched_app):
