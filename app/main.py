@@ -1,14 +1,17 @@
-import os, io, shlex, json, subprocess, random, string, shutil, time
+import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Dict, List, Optional, Literal
 
+import threading
+
 import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, field_validator
 
 app = FastAPI()
 
@@ -30,20 +33,175 @@ APP_LOG_FILE = LOGS_DIR / "application.log"
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # e.g. "http://10.120.2.5:3000"
 
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "2048"))
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", str(2 * 60 * 60)))
+MIN_FREE_SPACE_MB = int(os.getenv("MIN_FREE_SPACE_MB", "1000"))
+UPLOAD_CHUNK_SIZE = 1024 * 1024
+PUBLIC_CLEANUP_INTERVAL_SECONDS = int(os.getenv("PUBLIC_CLEANUP_INTERVAL_SECONDS", "3600"))
+REQUIRE_DURATION_LIMIT = os.getenv("REQUIRE_DURATION_LIMIT", "false").lower() == "true"
+
+
+class MetricsTracker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._per_endpoint: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: {"success": 0, "failure": 0, "total_duration": 0.0}
+        )
+        self._error_counts: Counter[str] = Counter()
+        self._recent_outcomes: deque[bool] = deque(maxlen=100)
+        self._operation_history: deque[Dict[str, float]] = deque(maxlen=200)
+        self._current_requests = 0
+        self._max_queue_depth = 0
+        self._total_wait_time = 0.0
+        self._wait_samples = 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._per_endpoint.clear()
+            self._error_counts.clear()
+            self._recent_outcomes.clear()
+            self._operation_history.clear()
+            self._current_requests = 0
+            self._max_queue_depth = 0
+            self._total_wait_time = 0.0
+            self._wait_samples = 0
+
+    def request_started(self) -> None:
+        with self._lock:
+            self._current_requests += 1
+            if self._current_requests > self._max_queue_depth:
+                self._max_queue_depth = self._current_requests
+
+    def request_finished(
+        self,
+        path: str,
+        status_code: int,
+        duration: float,
+        wait_time: float,
+        error_key: Optional[str] = None,
+    ) -> None:
+        success = 200 <= status_code < 400
+        with self._lock:
+            stats = self._per_endpoint[path]
+            if success:
+                stats["success"] += 1
+            else:
+                stats["failure"] += 1
+            stats["total_duration"] += duration
+            self._recent_outcomes.append(success)
+            self._operation_history.append(
+                {
+                    "timestamp": time.time(),
+                    "path": path,
+                    "status": status_code,
+                    "duration": duration,
+                }
+            )
+            self._total_wait_time += max(wait_time, 0.0)
+            self._wait_samples += 1
+            if not success:
+                key = error_key or str(status_code)
+                self._error_counts[key] += 1
+
+    def request_completed(self) -> None:
+        with self._lock:
+            if self._current_requests > 0:
+                self._current_requests -= 1
+
+    def snapshot(self) -> Dict[str, object]:
+        with self._lock:
+            per_endpoint: Dict[str, Dict[str, object]] = {}
+            for path, stats in self._per_endpoint.items():
+                total_calls = stats["success"] + stats["failure"]
+                avg_duration = (
+                    stats["total_duration"] / total_calls if total_calls else 0.0
+                )
+                success_rate = (
+                    stats["success"] / total_calls if total_calls else 0.0
+                )
+                per_endpoint[path] = {
+                    "success": int(stats["success"]),
+                    "failure": int(stats["failure"]),
+                    "total": int(total_calls),
+                    "avg_duration_ms": avg_duration * 1000.0,
+                    "success_rate": success_rate,
+                }
+
+            total_recent = len(self._recent_outcomes)
+            recent_successes = sum(1 for outcome in self._recent_outcomes if outcome)
+            queue_avg_wait = (
+                (self._total_wait_time / self._wait_samples)
+                if self._wait_samples
+                else 0.0
+            )
+
+            return {
+                "per_endpoint": per_endpoint,
+                "errors": dict(self._error_counts),
+                "queue": {
+                    "current": self._current_requests,
+                    "max": self._max_queue_depth,
+                    "avg_wait_ms": queue_avg_wait * 1000.0,
+                },
+                "recent": {
+                    "window": total_recent,
+                    "successes": recent_successes,
+                    "failures": total_recent - recent_successes,
+                    "success_rate": (
+                        recent_successes / total_recent if total_recent else None
+                    ),
+                },
+                "history": list(self._operation_history),
+            }
+
+
+METRICS = MetricsTracker()
+
 # Mount static /files
 app.mount("/files", StaticFiles(directory=str(PUBLIC_DIR)), name="files")
+
+
+@app.middleware("http")
+async def metrics_middleware(request, call_next):
+    path = request.url.path
+    arrival = time.perf_counter()
+    METRICS.request_started()
+    processing_start = time.perf_counter()
+    wait_time = processing_start - arrival
+    try:
+        response = await call_next(request)
+        duration = time.perf_counter() - processing_start
+        METRICS.request_finished(path, response.status_code, duration, wait_time)
+        return response
+    except HTTPException as exc:
+        duration = time.perf_counter() - processing_start
+        detail = exc.detail if isinstance(exc.detail, str) else exc.__class__.__name__
+        METRICS.request_finished(path, exc.status_code, duration, wait_time, detail)
+        raise
+    except Exception as exc:
+        duration = time.perf_counter() - processing_start
+        METRICS.request_finished(path, 500, duration, wait_time, exc.__class__.__name__)
+        raise
+    finally:
+        METRICS.request_completed()
 
 
 # Setup logging to file
 import logging
 import sys
 
-# Force unbuffered output
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
+# Force unbuffered output when supported
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except (AttributeError, io.UnsupportedOperation):
+    # Some deployment targets (e.g. WSGI, Windows) don't expose reconfigure
+    pass
 
-# Create file handler with immediate flush
-file_handler = logging.FileHandler(str(APP_LOG_FILE))
+# Create file handler with line buffering to avoid manual flush storms
+file_stream = open(APP_LOG_FILE, "a", encoding="utf-8", buffering=1)
+file_handler = logging.StreamHandler(file_stream)
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 
@@ -83,6 +241,12 @@ file_handler.flush()
 @app.on_event("startup")
 async def startup_event():
     logger.info("FastAPI server is ready to accept requests")
+    try:
+        cleanup_old_public()
+    except Exception as exc:
+        logger.warning("Initial public cleanup failed: %s", exc)
+    if PUBLIC_CLEANUP_INTERVAL_SECONDS > 0:
+        asyncio.create_task(_periodic_public_cleanup())
     _flush_logs()
 
 
@@ -96,6 +260,222 @@ def _flush_logs():
     for handler in logging.getLogger().handlers:
         handler.flush()
 
+
+def tail_file(filepath: Path, num_lines: int = 1000) -> str:
+    try:
+        size = filepath.stat().st_size
+    except FileNotFoundError:
+        return ""
+    except Exception as exc:
+        logger.warning("Failed to stat log file %s: %s", filepath, exc)
+        return "Error reading log file"
+
+    if size <= 10 * 1024 * 1024:  # 10MB
+        try:
+            with filepath.open("r", encoding="utf-8", errors="ignore") as handle:
+                limited = deque(handle, maxlen=num_lines)
+            return "".join(limited) if limited else ""
+        except Exception as exc:
+            logger.warning("Failed to read log file %s: %s", filepath, exc)
+            return "Error reading log file"
+
+    # Large file: read from the end in blocks
+    block_size = 8192
+    blocks: List[bytes] = []
+    bytes_to_read = size
+    lines_found = 0
+    try:
+        with filepath.open("rb") as handle:
+            while bytes_to_read > 0 and lines_found <= num_lines:
+                read_size = block_size if bytes_to_read > block_size else bytes_to_read
+                handle.seek(bytes_to_read - read_size)
+                data = handle.read(read_size)
+                if not data:
+                    break
+                blocks.append(data)
+                bytes_to_read -= read_size
+                lines_found += data.count(b"\n")
+    except Exception as exc:
+        logger.warning("Failed to stream log file %s: %s", filepath, exc)
+        return "Error reading log file"
+
+    text = b"".join(reversed(blocks)).decode("utf-8", errors="ignore")
+    return "\n".join(text.splitlines()[-num_lines:])
+
+
+def check_disk_space(path: Path, required_mb: int = MIN_FREE_SPACE_MB) -> None:
+    target = path if path.exists() else path.parent
+    target.mkdir(parents=True, exist_ok=True)
+    stat = shutil.disk_usage(target)
+    available_mb = stat.free / (1024 * 1024)
+    if available_mb < required_mb:
+        logger.warning(
+            "Insufficient disk space at %s: %.1f MB available, %d MB required",
+            target,
+            available_mb,
+            required_mb,
+        )
+        _flush_logs()
+        raise HTTPException(status_code=507, detail="Insufficient disk space")
+
+
+def disk_snapshot() -> Dict[str, Dict[str, float]]:
+    snapshot: Dict[str, Dict[str, float]] = {}
+    targets = {
+        "public": PUBLIC_DIR,
+        "work": WORK_DIR,
+        "logs": LOGS_DIR,
+    }
+    for name, target in targets.items():
+        try:
+            usage = shutil.disk_usage(target)
+            snapshot[name] = {
+                "total_mb": usage.total / (1024 * 1024),
+                "used_mb": usage.used / (1024 * 1024),
+                "available_mb": usage.free / (1024 * 1024),
+            }
+        except FileNotFoundError:
+            snapshot[name] = {"error": "not_found"}
+        except Exception as exc:
+            snapshot[name] = {"error": str(exc)}
+    return snapshot
+
+
+def memory_snapshot() -> Dict[str, Optional[float]]:
+    rss_bytes: Optional[float] = None
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        rss_bytes = float(usage.ru_maxrss)
+        if sys.platform != "darwin":
+            rss_bytes *= 1024.0
+    except Exception:
+        rss_bytes = None
+
+    total_bytes: Optional[float] = None
+    available_bytes: Optional[float] = None
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            values = {}
+            for line in handle:
+                if ":" not in line:
+                    continue
+                key, rest = line.split(":", 1)
+                values[key.strip()] = rest.strip()
+        if "MemTotal" in values:
+            total_bytes = float(values["MemTotal"].split()[0]) * 1024.0
+        if "MemAvailable" in values:
+            available_bytes = float(values["MemAvailable"].split()[0]) * 1024.0
+        elif "MemFree" in values:
+            available_bytes = float(values["MemFree"].split()[0]) * 1024.0
+    except Exception:
+        pass
+
+    def to_mb(value: Optional[float]) -> Optional[float]:
+        return (value / (1024.0 * 1024.0)) if value is not None else None
+
+    return {
+        "rss_mb": to_mb(rss_bytes),
+        "total_mb": to_mb(total_bytes),
+        "available_mb": to_mb(available_bytes),
+    }
+
+
+def ffmpeg_snapshot() -> Dict[str, Optional[str]]:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True, text=True, timeout=5
+        )
+        available = result.returncode == 0
+        version_line = (result.stdout or "").splitlines()[0] if available else ""
+        error = None if available else (result.stderr or "Unknown failure")
+    except Exception as exc:
+        available = False
+        version_line = ""
+        error = str(exc)
+    return {"available": available, "version": version_line, "error": error}
+
+
+def safe_path_check(base: Path, rel: str) -> Path:
+    try:
+        target = (base / rel).resolve()
+    except Exception as exc:
+        logger.warning("Invalid path provided for %s: %s", base, rel)
+        _flush_logs()
+        raise HTTPException(status_code=400, detail="Invalid path") from exc
+    if target == base:
+        return target
+    if base not in target.parents:
+        logger.warning("Blocked path traversal attempt: %s -> %s", rel, target)
+        _flush_logs()
+        raise HTTPException(status_code=403, detail="Access denied")
+    return target
+
+
+async def stream_upload_to_path(upload: UploadFile, dest: Path) -> int:
+    await upload.seek(0)
+    total = 0
+    try:
+        with dest.open("wb") as buffer:
+            while chunk := await upload.read(UPLOAD_CHUNK_SIZE):
+                total += len(chunk)
+                if total > MAX_FILE_SIZE_BYTES:
+                    logger.warning("Upload exceeded max size: %s", upload.filename)
+                    _flush_logs()
+                    raise HTTPException(status_code=413, detail="File too large")
+                buffer.write(chunk)
+    except HTTPException:
+        if dest.exists():
+            try:
+                dest.unlink()
+            except Exception as exc:
+                logger.warning("Failed cleaning partial upload %s: %s", dest, exc)
+        raise
+    except Exception as exc:
+        if dest.exists():
+            try:
+                dest.unlink()
+            except Exception as cleanup_exc:
+                logger.warning("Failed removing incomplete upload %s: %s", dest, cleanup_exc)
+        logger.error("Failed to persist upload %s: %s", upload.filename, exc)
+        _flush_logs()
+        raise HTTPException(status_code=500, detail="Failed to save upload") from exc
+    return total
+
+
+def ensure_upload_type(upload: UploadFile, expected_prefix: str, field: str) -> None:
+    content_type = (upload.content_type or "").lower()
+    if not content_type.startswith(expected_prefix):
+        logger.warning(
+            "%s upload rejected due to invalid content-type: %s",
+            field,
+            content_type or "unknown",
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be {expected_prefix}*, got {content_type or 'unknown'}",
+        )
+
+
+def run_ffmpeg_with_timeout(cmd: List[str], log_handle) -> int:
+    try:
+        proc = subprocess.Popen(cmd, stdout=log_handle, stderr=log_handle)
+    except Exception as exc:
+        logger.error("Failed to launch ffmpeg command %s: %s", cmd, exc)
+        _flush_logs()
+        raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from exc
+    try:
+        return proc.wait(timeout=FFMPEG_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
+        _flush_logs()
+        raise HTTPException(status_code=504, detail="Processing timeout")
 
 def cleanup_old_public(days: int = RETENTION_DAYS):
     """Delete files older than specified days based on actual file modification time."""
@@ -114,44 +494,63 @@ def cleanup_old_public(days: int = RETENTION_DAYS):
                         file_mtime = file_path.stat().st_mtime
                         if file_mtime < cutoff_timestamp:
                             files_to_delete.append(file_path)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("Failed to inspect file %s: %s", file_path, exc)
             
             # Delete old files
             for fp in files_to_delete:
                 try:
                     fp.unlink()
                     deleted_count += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Failed to delete expired file %s: %s", fp, exc)
             
             # Remove directory if empty
             try:
                 if not any(child.iterdir()):
                     child.rmdir()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to remove empty directory %s: %s", child, exc)
     
     if deleted_count > 0:
         logger.info(f"Cleanup: deleted {deleted_count} files older than {days} days")
-        _flush_logs()
+
+
+async def _periodic_public_cleanup():
+    """Periodically clean up expired files from the public directory."""
+    try:
+        # Stagger the first run so startup work can finish
+        await asyncio.sleep(PUBLIC_CLEANUP_INTERVAL_SECONDS)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            cleanup_old_public()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Periodic public cleanup failed: %s", exc)
+        try:
+            await asyncio.sleep(PUBLIC_CLEANUP_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
 
 
 def publish_file(src: Path, ext: str) -> Dict[str, str]:
     """Move a finished file into PUBLIC_DIR/YYYYMMDD/ and return URLs/paths.
        Uses shutil.move to be cross-device safe (works across Docker volumes/Windows)."""
-    cleanup_old_public()
+    check_disk_space(PUBLIC_DIR)
     day = datetime.utcnow().strftime("%Y%m%d")
     folder = PUBLIC_DIR / day
     folder.mkdir(parents=True, exist_ok=True)
+    check_disk_space(folder)
     name = datetime.utcnow().strftime("%Y%m%d_%H%M%S_") + _rand() + ext
     dst = folder / name
 
     # Cross-device safe move
     shutil.move(str(src), str(dst))
-    
+
     logger.info(f"Published file: {name} ({dst.stat().st_size / (1024*1024):.2f} MB)")
-    _flush_logs()
 
     rel = f"/files/{day}/{name}"
     url = f"{PUBLIC_BASE_URL.rstrip('/')}{rel}" if PUBLIC_BASE_URL else rel
@@ -162,9 +561,11 @@ def save_log(log_path: Path, operation: str) -> None:
     """Save ffmpeg log to persistent logs directory."""
     if not log_path.exists():
         return
+    check_disk_space(LOGS_DIR)
     day = datetime.utcnow().strftime("%Y%m%d")
     folder = LOGS_DIR / day
     folder.mkdir(parents=True, exist_ok=True)
+    check_disk_space(folder)
     name = datetime.utcnow().strftime("%Y%m%d_%H%M%S_") + _rand() + f"_{operation}.log"
     dst = folder / name
     try:
@@ -190,8 +591,15 @@ def downloads():
                 continue
             rel = f"/files/{day.name}/{f.name}"
             size_mb = f.stat().st_size / (1024*1024)
-            rows.append(f"<tr><td>{day.name}</td><td><a href='{rel}'>{f.name}</a></td><td>{size_mb:.2f} MB</td></tr>")
-    html = f"""
+            rows.append(
+                "<tr><td>{day}</td><td><a href='{href}'>{name}</a></td><td>{size:.2f} MB</td></tr>".format(
+                    day=html.escape(day.name),
+                    href=html.escape(rel, quote=True),
+                    name=html.escape(f.name),
+                    size=size_mb,
+                )
+            )
+    html_content = f"""
     <!doctype html>
     <html>
     <head>
@@ -216,6 +624,7 @@ def downloads():
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
+        <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
       </nav>
       <h2>Generated Files</h2>
@@ -226,7 +635,7 @@ def downloads():
     </body>
     </html>
     """
-    return HTMLResponse(html)
+    return HTMLResponse(html_content)
 
 
 @app.get("/logs", response_class=HTMLResponse)
@@ -242,8 +651,16 @@ def logs():
             # Extract operation name from filename
             parts = f.name.split("_")
             operation = parts[-1].replace(".log", "") if len(parts) > 3 else "unknown"
-            rows.append(f"<tr><td>{day.name}</td><td>{f.name}</td><td>{operation}</td><td>{size_kb:.1f} KB</td><td><a href='/logs/view?path={day.name}/{f.name}' target='_blank'>View</a></td></tr>")
-    html = f"""
+            rows.append(
+                "<tr><td>{day}</td><td>{name}</td><td>{op}</td><td>{size:.1f} KB</td><td><a href='/logs/view?path={path}' target='_blank'>View</a></td></tr>".format(
+                    day=html.escape(day.name),
+                    name=html.escape(f.name),
+                    op=html.escape(operation),
+                    size=size_kb,
+                    path=html.escape(f"{day.name}/{f.name}", quote=True),
+                )
+            )
+    html_content = f"""
     <!doctype html>
     <html>
     <head>
@@ -268,6 +685,7 @@ def logs():
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
+        <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
       </nav>
       <h2>FFmpeg Logs</h2>
@@ -278,16 +696,14 @@ def logs():
     </body>
     </html>
     """
-    return HTMLResponse(html)
+    return HTMLResponse(html_content)
 
 
 @app.get("/logs/view", response_class=PlainTextResponse)
 def view_log(path: str):
     """View individual log file content."""
-    target = (LOGS_DIR / path).resolve()
-    if LOGS_DIR not in target.parents and target != LOGS_DIR:
-        raise HTTPException(status_code=400, detail="Invalid path")
-    if not target.exists():
+    target = safe_path_check(LOGS_DIR, path)
+    if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="Log not found")
     return target.read_text(encoding="utf-8", errors="ignore")
 
@@ -316,11 +732,7 @@ def ffmpeg_info(auto_refresh: int = 0):
             size_kb = stat.st_size / 1024
             mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
             log_info = f"Log file: {size_kb:.1f} KB, Last modified: {mtime}"
-            
-            with APP_LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-                # Get last 1000 lines
-                app_logs = "".join(lines[-1000:]) if lines else "No logs yet"
+            app_logs = tail_file(APP_LOG_FILE, 1000) or "No logs yet"
         except Exception as e:
             app_logs = f"Error reading logs: {e}"
             log_info = "Error reading log file"
@@ -335,8 +747,12 @@ def ffmpeg_info(auto_refresh: int = 0):
     
     # Current time
     current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    
-    html = f"""
+
+    version_output_safe = html.escape(version_output)
+    app_logs_safe = html.escape(app_logs)
+    log_info_safe = html.escape(log_info)
+
+    html_content = f"""
     <!doctype html>
     <html>
     <head>
@@ -394,13 +810,14 @@ def ffmpeg_info(auto_refresh: int = 0):
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
+        <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
       </nav>
       <h2>FFmpeg & Container Information</h2>
       
       <div class="section">
         <h3>FFmpeg Version & Build</h3>
-        <pre>{version_output}</pre>
+        <pre>{version_output_safe}</pre>
       </div>
       
       <div class="section">
@@ -414,9 +831,9 @@ def ffmpeg_info(auto_refresh: int = 0):
           <span class="status {'active' if auto_refresh > 0 else ''}">{refresh_status}</span>
         </div>
         <div class="info">
-          Page loaded: {current_time} | {log_info}
+          Page loaded: {current_time} | {log_info_safe}
         </div>
-        <pre class="logs" id="logContainer">{app_logs}</pre>
+        <pre class="logs" id="logContainer">{app_logs_safe}</pre>
       </div>
     </body>
     <script>
@@ -430,7 +847,7 @@ def ffmpeg_info(auto_refresh: int = 0):
     </script>
     </html>
     """
-    return HTMLResponse(html)
+    return HTMLResponse(html_content)
 
 
 @app.get("/documentation", response_class=HTMLResponse)
@@ -491,9 +908,16 @@ def documentation():
 <div class="endpoint">
   <div class="method get">GET</div>
   <div class="path">/health</div>
-  <div class="desc">Health check endpoint</div>
-  <div class="response">Returns: {"ok": true}</div>
+  <div class="desc">Health check endpoint with disk, memory, FFmpeg, and operation metrics</div>
+  <div class="response">Returns: {"ok": true, "disk": {...}, "memory": {...}, "ffmpeg": {...}, "operations": {...}}</div>
   <div class="example">Example:<br>curl http://localhost:3000/health</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/metrics</div>
+  <div class="desc">Operational metrics dashboard (HTML page)</div>
+  <div class="example">Example:<br>curl http://localhost:3000/metrics</div>
 </div>
 
 <div class="endpoint">
@@ -666,7 +1090,7 @@ def documentation():
 </div>
 """
     
-    html = f"""
+    html_content = f"""
     <!doctype html>
     <html>
     <head>
@@ -760,6 +1184,7 @@ def documentation():
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
+        <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
       </nav>
       <h2>FFAPI Ultimate - API Documentation</h2>
@@ -775,14 +1200,152 @@ def documentation():
     </body>
     </html>
     """
-    return HTMLResponse(html)
+    return HTMLResponse(html_content)
 
 
 @app.get("/health")
 def health():
     logger.info("Health check requested")
-    _flush_logs()
-    return {"ok": True}
+    disk = disk_snapshot()
+    memory = memory_snapshot()
+    ffmpeg_info = ffmpeg_snapshot()
+    metrics_data = METRICS.snapshot()
+
+    disk_ok = True
+    for info in disk.values():
+        if "error" in info:
+            disk_ok = False
+            break
+        if info.get("available_mb", 0) < MIN_FREE_SPACE_MB:
+            disk_ok = False
+            break
+
+    overall_ok = ffmpeg_info.get("available", False) and disk_ok
+
+    return {
+        "ok": overall_ok,
+        "disk": disk,
+        "memory": memory,
+        "ffmpeg": ffmpeg_info,
+        "operations": {
+            "recent_success_rate": metrics_data["recent"],
+            "queue": metrics_data["queue"],
+            "error_counts": metrics_data["errors"],
+        },
+    }
+
+
+@app.get("/metrics", response_class=HTMLResponse)
+def metrics_dashboard():
+    snapshot = METRICS.snapshot()
+    endpoints_html = []
+    for path, stats in sorted(snapshot["per_endpoint"].items()):
+        success_rate = stats.get("success_rate", 0.0) * 100.0
+        endpoints_html.append(
+            "<tr><td>{path}</td><td>{success}</td><td>{failure}</td><td>{avg:.2f} ms</td><td>{rate:.1f}%</td></tr>".format(
+                path=html.escape(path),
+                success=int(stats.get("success", 0)),
+                failure=int(stats.get("failure", 0)),
+                avg=stats.get("avg_duration_ms", 0.0),
+                rate=success_rate,
+            )
+        )
+
+    if not endpoints_html:
+        endpoints_html.append(
+            "<tr><td colspan='5'>No requests recorded yet</td></tr>"
+        )
+
+    errors_html = []
+    for name, count in sorted(snapshot["errors"].items(), key=lambda item: item[0]):
+        errors_html.append(
+            "<tr><td>{name}</td><td>{count}</td></tr>".format(
+                name=html.escape(name), count=int(count)
+            )
+        )
+    if not errors_html:
+        errors_html.append("<tr><td colspan='2'>No errors recorded</td></tr>")
+
+    queue = snapshot["queue"]
+    recent = snapshot["recent"]
+    recent_rate = recent.get("success_rate")
+    recent_summary = (
+        f"{recent.get('successes', 0)} / {recent.get('window', 0)}"
+        if recent_rate is not None
+        else "No recent activity"
+    )
+    recent_percent = f"{recent_rate * 100.0:.1f}%" if recent_rate is not None else "-"
+
+    html_content = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>Operational Metrics</title>
+      <style>
+        body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .brand .ff {{ color: #28a745; }}
+        .brand .api {{ color: #000; }}
+        table {{ border-collapse: collapse; width: 100%; margin-bottom: 30px; }}
+        th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
+        th {{ text-align: left; background: #fafafa; }}
+        nav {{ margin-bottom: 20px; }}
+        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        .cards {{ display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 30px; }}
+        .card {{
+          flex: 1 1 240px;
+          background: #f7f9fc;
+          border-radius: 8px;
+          padding: 16px;
+          box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+        }}
+        .card h3 {{ margin-top: 0; font-size: 16px; color: #333; }}
+        .card p {{ margin: 6px 0; color: #555; font-size: 14px; }}
+      </style>
+    </head>
+    <body>
+      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
+      <nav>
+        <a href="/downloads">Downloads</a>
+        <a href="/logs">Logs</a>
+        <a href="/ffmpeg">FFmpeg Info</a>
+        <a href="/metrics">Metrics</a>
+        <a href="/documentation">API Docs</a>
+      </nav>
+
+      <div class="cards">
+        <div class="card">
+          <h3>Queue Depth</h3>
+          <p><strong>Current:</strong> {queue.get('current', 0)}</p>
+          <p><strong>Max Observed:</strong> {queue.get('max', 0)}</p>
+          <p><strong>Avg Wait:</strong> {queue.get('avg_wait_ms', 0.0):.2f} ms</p>
+        </div>
+        <div class="card">
+          <h3>Recent Success Rate</h3>
+          <p><strong>Window:</strong> {recent.get('window', 0)} operations</p>
+          <p><strong>Successful:</strong> {recent_summary}</p>
+          <p><strong>Rate:</strong> {recent_percent}</p>
+        </div>
+      </div>
+
+      <h2>Endpoint Performance</h2>
+      <table>
+        <thead>
+          <tr><th>Endpoint</th><th>Success</th><th>Failure</th><th>Avg Duration</th><th>Success %</th></tr>
+        </thead>
+        <tbody>{''.join(endpoints_html)}</tbody>
+      </table>
+
+      <h2>Error Frequency</h2>
+      <table>
+        <thead><tr><th>Error</th><th>Count</th></tr></thead>
+        <tbody>{''.join(errors_html)}</tbody>
+      </table>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html_content)
 
 
 # ---------- models ----------
@@ -798,6 +1361,20 @@ class ConcatJob(BaseModel):
     height: int = 1080
     fps: int = 30
 
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        if not (1 <= value <= 7680):
+            raise ValueError(f"Dimension must be 1-7680, got {value}")
+        return value
+
+    @field_validator("fps")
+    @classmethod
+    def validate_fps(cls, value: int) -> int:
+        if not (1 <= value <= 240):
+            raise ValueError(f"FPS must be 1-240, got {value}")
+        return value
+
 
 class ComposeFromUrlsJob(BaseModel):
     video_url: HttpUrl
@@ -809,6 +1386,27 @@ class ComposeFromUrlsJob(BaseModel):
     fps: int = 30
     bgm_volume: float = 0.3
     headers: Optional[Dict[str, str]] = None  # forwarded header subset
+
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        if not (1 <= value <= 7680):
+            raise ValueError(f"Dimension must be 1-7680, got {value}")
+        return value
+
+    @field_validator("fps")
+    @classmethod
+    def validate_fps(cls, value: int) -> int:
+        if not (1 <= value <= 240):
+            raise ValueError(f"FPS must be 1-240, got {value}")
+        return value
+
+    @field_validator("bgm_volume")
+    @classmethod
+    def validate_volume(cls, value: float) -> float:
+        if not (0.0 <= value <= 5.0):
+            raise ValueError(f"bgm_volume must be between 0 and 5, got {value}")
+        return value
 
 
 class Keyframe(BaseModel):
@@ -829,6 +1427,20 @@ class TracksComposeJob(BaseModel):
     height: int = 1080
     fps: int = 30
 
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        if not (1 <= value <= 7680):
+            raise ValueError(f"Dimension must be 1-7680, got {value}")
+        return value
+
+    @field_validator("fps")
+    @classmethod
+    def validate_fps(cls, value: int) -> int:
+        if not (1 <= value <= 240):
+            raise ValueError(f"FPS must be 1-240, got {value}")
+        return value
+
 
 # ---------- helpers ----------
 ALLOWED_FORWARD_HEADERS_LOWER = {
@@ -837,7 +1449,7 @@ ALLOWED_FORWARD_HEADERS_LOWER = {
 
 def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None, max_retries: int = 3, chunk_size: int = 1024 * 1024):
     """Download file with retry, resume, and progress tracking.
-    
+
     Args:
         url: URL to download from
         dest: Destination file path
@@ -845,45 +1457,88 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
         max_retries: Number of retry attempts (default: 3)
         chunk_size: Download chunk size in bytes (default: 1MB)
     """
-    hdr = {}
+    base_headers: Dict[str, str] = {}
     if headers:
         for k, v in headers.items():
             if k.lower() in ALLOWED_FORWARD_HEADERS_LOWER:
-                hdr[k] = v
-    
+                base_headers[k] = v
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    check_disk_space(dest.parent)
+
+    can_resume = True
+
     for attempt in range(max_retries):
         try:
-            # Check if partial file exists from previous attempt
+            req_hdr = dict(base_headers)
             existing_size = dest.stat().st_size if dest.exists() else 0
-            
-            # Try to resume from existing position
-            if existing_size > 0:
-                hdr['Range'] = f'bytes={existing_size}-'
-                mode = 'ab'  # Append mode
+
+            if not can_resume and dest.exists():
+                try:
+                    dest.unlink()
+                except Exception as cleanup_exc:
+                    logger.warning("Failed to reset download %s: %s", dest, cleanup_exc)
+                    _flush_logs()
+                existing_size = 0
+
+            use_resume = can_resume and existing_size > 0
+
+            if use_resume:
+                req_hdr['Range'] = f'bytes={existing_size}-'
                 logger.info(f"Resuming download from {existing_size/1024/1024:.1f}MB: {url}")
-            else:
-                mode = 'wb'  # Write mode (new file)
-            
-            # Dynamic timeout: 10 minutes base
+
+            # Estimate timeout based on size hints
             timeout = 600
-            
-            with requests.get(url, headers=hdr, stream=True, timeout=timeout) as r:
+            size_hint = None
+            try:
+                head_headers = dict(req_hdr)
+                head_headers.pop('Range', None)
+                head_resp = requests.head(url, headers=head_headers, timeout=30)
+                head_resp.raise_for_status()
+                if 'content-length' in head_resp.headers:
+                    size_hint = int(head_resp.headers['content-length'])
+            except Exception:
+                size_hint = None
+
+            if size_hint is not None:
+                size_mb = size_hint / (1024 * 1024)
+                timeout = max(600, int(size_mb * 10))
+            else:
+                timeout = 3600
+
+            with requests.get(url, headers=req_hdr, stream=True, timeout=timeout) as r:
                 r.raise_for_status()
-                
+
                 # Check if server supports Range requests
-                if existing_size > 0:
+                if use_resume:
                     if r.status_code == 206:
                         # Server supports Range, we got partial content
                         logger.info(f"✓ Server supports resume for: {url}")
+                        mode = 'ab'
                     elif r.status_code == 200:
                         # Server doesn't support Range, gave us full file
                         logger.warning(f"⚠ Server doesn't support resume, downloading from start: {url}")
+                        if dest.exists():
+                            try:
+                                dest.unlink()
+                            except Exception as cleanup_exc:
+                                logger.warning("Failed to remove stale partial %s: %s", dest, cleanup_exc)
+                                _flush_logs()
                         mode = 'wb'  # Switch to overwrite mode
                         existing_size = 0
-                        # Remove Range header for clarity
-                        if 'Range' in hdr:
-                            del hdr['Range']
-                
+                        can_resume = False
+                    else:
+                        logger.error(
+                            "Unexpected status %s while resuming download %s", r.status_code, url
+                        )
+                        _flush_logs()
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Unexpected status {r.status_code} when requesting range",
+                        )
+                else:
+                    mode = 'wb'
+
                 # Get total size
                 if 'content-length' in r.headers:
                     content_length = int(r.headers['content-length'])
@@ -895,11 +1550,20 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                         total_size = content_length
                 else:
                     total_size = 0
-                
+
+                required_mb = MIN_FREE_SPACE_MB
+                if total_size:
+                    remaining = total_size - existing_size
+                    if remaining < 0:
+                        remaining = 0
+                    remaining_mb = (remaining + 1024 * 1024 - 1) // (1024 * 1024)
+                    required_mb = max(MIN_FREE_SPACE_MB, MIN_FREE_SPACE_MB + remaining_mb)
+                check_disk_space(dest.parent, required_mb=required_mb)
+
                 # Download with progress tracking
                 downloaded = existing_size
                 last_log = downloaded
-                
+
                 with dest.open(mode) as f:
                     for chunk in r.iter_content(chunk_size):
                         if chunk:
@@ -914,22 +1578,21 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                                 else:
                                     logger.info(f"Downloaded: {downloaded/1024/1024:.0f}MB")
                                 last_log = downloaded
-                                _flush_logs()
-                
+
                 # Verify size if we know what to expect
                 if total_size and downloaded != total_size:
                     raise Exception(f"Download incomplete: got {downloaded} bytes, expected {total_size}")
-                
+
                 logger.info(f"Download complete: {downloaded/1024/1024:.1f}MB - {url}")
-                _flush_logs()
                 return  # Success!
-                
+
+        except HTTPException:
+            raise
         except Exception as e:
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
                 logger.warning(f"Download failed (attempt {attempt + 1}/{max_retries}): {e}")
                 logger.warning(f"Retrying in {wait_time} seconds...")
-                _flush_logs()
                 time.sleep(wait_time)
             else:
                 # Final attempt failed
@@ -939,8 +1602,9 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                 if dest.exists():
                     try:
                         dest.unlink()
-                    except:
-                        pass
+                    except Exception as cleanup_exc:
+                        logger.warning("Failed to remove partial download %s: %s", dest, cleanup_exc)
+                        _flush_logs()
                 raise
 
 
@@ -948,21 +1612,18 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
 @app.post("/image/to-mp4-loop")
 async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as_json: bool = False):
     logger.info(f"Starting image-to-mp4-loop: {file.filename}, duration={duration}s")
-    _flush_logs()
     if file.content_type not in {"image/png", "image/jpeg"}:
         raise HTTPException(status_code=400, detail="Only PNG/JPEG are supported.")
     if not (1 <= duration <= 3600):
         raise HTTPException(status_code=400, detail="duration must be 1..3600 seconds")
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="loop_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         in_path = work / ("input.png" if file.content_type == "image/png" else "input.jpg")
         out_path = work / "output.mp4"
-        
-        # Stream file to disk in chunks (memory efficient)
-        with in_path.open('wb') as f:
-            while chunk := await file.read(1024 * 1024):  # 1MB chunks
-                f.write(chunk)
-        
+
+        await stream_upload_to_path(file, in_path)
+
         cmd = [
             "ffmpeg", "-y",
             "-loop", "1",
@@ -976,14 +1637,14 @@ async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as
         ]
         log = work / "ffmpeg.log"
         with log.open("wb") as lf:
-            code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+            code = run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "image-to-mp4")
         if code != 0 or not out_path.exists():
             logger.error(f"image-to-mp4-loop failed for {file.filename}")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
         pub = publish_file(out_path, ".mp4")
         logger.info(f"image-to-mp4-loop completed: {pub['rel']}")
-        _flush_logs()
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -997,14 +1658,19 @@ async def compose_from_binaries(
     audio: Optional[UploadFile] = File(None),
     bgm: Optional[UploadFile] = File(None),
     duration_ms: int = Query(30000, ge=1, le=3600000),
-    width: int = 1920,
-    height: int = 1080,
-    fps: int = 30,
-    bgm_volume: float = 0.3,
+    width: int = Query(1920, ge=1, le=7680),
+    height: int = Query(1080, ge=1, le=7680),
+    fps: int = Query(30, ge=1, le=240),
+    bgm_volume: float = Query(0.3, ge=0.0, le=5.0),
     as_json: bool = False,
 ):
     logger.info(f"Starting compose-from-binaries: video={video.filename}, audio={audio.filename if audio else None}, bgm={bgm.filename if bgm else None}")
-    _flush_logs()
+    ensure_upload_type(video, "video/", "video")
+    if audio:
+        ensure_upload_type(audio, "audio/", "audio")
+    if bgm:
+        ensure_upload_type(bgm, "audio/", "bgm")
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="compose_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         v_path = work / "video.mp4"
@@ -1012,24 +1678,15 @@ async def compose_from_binaries(
         b_path = work / "bgm"
         out_path = work / "output.mp4"
 
-        # Stream video file to disk in chunks
-        with v_path.open('wb') as f:
-            while chunk := await video.read(1024 * 1024):  # 1MB chunks
-                f.write(chunk)
-        
+        await stream_upload_to_path(video, v_path)
+
         has_audio = False
         has_bgm = False
         if audio:
-            # Stream audio file to disk in chunks
-            with a_path.open('wb') as f:
-                while chunk := await audio.read(1024 * 1024):
-                    f.write(chunk)
+            await stream_upload_to_path(audio, a_path)
             has_audio = True
         if bgm:
-            # Stream BGM file to disk in chunks
-            with b_path.open('wb') as f:
-                while chunk := await bgm.read(1024 * 1024):
-                    f.write(chunk)
+            await stream_upload_to_path(bgm, b_path)
             has_bgm = True
 
         dur_s = f"{duration_ms/1000:.3f}"
@@ -1059,15 +1716,15 @@ async def compose_from_binaries(
 
         log = work / "ffmpeg.log"
         with log.open("wb") as lf:
-            code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+            code = run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "compose-binaries")
         if code != 0 or not out_path.exists():
             logger.error("compose-from-binaries failed")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": cmd, "log": log.read_text()})
 
         pub = publish_file(out_path, ".mp4")
         logger.info(f"compose-from-binaries completed: {pub['rel']}")
-        _flush_logs()
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -1078,7 +1735,7 @@ async def compose_from_binaries(
 @app.post("/video/concat-from-urls")
 def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
     logger.info(f"Starting concat: {len(job.clips)} clips, {job.width}x{job.height}@{job.fps}fps")
-    _flush_logs()
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="concat_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         norm = []
@@ -1097,7 +1754,7 @@ def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             ]
             log = work / f"norm_{i:03d}.log"
             with log.open("wb") as lf:
-                code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+                code = run_ffmpeg_with_timeout(cmd, lf)
             save_log(log, f"concat-norm-{i}")
             if code != 0 or not out.exists():
                 return JSONResponse(status_code=500, content={"error": "ffmpeg_failed_on_clip", "clip": str(url), "log": log.read_text()})
@@ -1110,14 +1767,14 @@ def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
         cmd2 = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile), "-c", "copy", "-movflags", "+faststart", str(out_path)]
         log2 = work / "concat.log"
         with log2.open("wb") as lf:
-            code2 = subprocess.run(cmd2, stdout=lf, stderr=lf).returncode
+            code2 = run_ffmpeg_with_timeout(cmd2, lf)
         save_log(log2, "concat-final")
         if code2 != 0 or not out_path.exists():
             logger.error("concat failed at final stage")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed_concat", "log": log2.read_text()})
         pub = publish_file(out_path, ".mp4")
         logger.info(f"concat completed: {len(job.clips)} clips -> {pub['rel']}")
-        _flush_logs()
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -1132,6 +1789,20 @@ class ConcatAliasJob(BaseModel):
     height: int = 1080
     fps: int = 30
 
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        if not (1 <= value <= 7680):
+            raise ValueError(f"Dimension must be 1-7680, got {value}")
+        return value
+
+    @field_validator("fps")
+    @classmethod
+    def validate_fps(cls, value: int) -> int:
+        if not (1 <= value <= 240):
+            raise ValueError(f"FPS must be 1-240, got {value}")
+        return value
+
 @app.post("/video/concat")
 def video_concat_alias(job: ConcatAliasJob, as_json: bool = False):
     clip_list = job.clips or job.urls
@@ -1145,6 +1816,7 @@ def video_concat_alias(job: ConcatAliasJob, as_json: bool = False):
 def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
     if job.duration_ms <= 0 or job.duration_ms > 3600000:
         raise HTTPException(status_code=400, detail="invalid duration_ms (1..3600000)")
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="cfu_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         v_path = work / "video_in.mp4"
@@ -1189,9 +1861,11 @@ def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
 
         cmd += maps + [str(out_path)]
         with log_path.open("wb") as logf:
-            code = subprocess.run(cmd, stdout=logf, stderr=logf).returncode
+            code = run_ffmpeg_with_timeout(cmd, logf)
         save_log(log_path, "compose-urls")
         if code != 0 or not out_path.exists():
+            logger.error("compose-from-urls failed")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": cmd, "log": log_path.read_text()})
 
         pub = publish_file(out_path, ".mp4")
@@ -1206,25 +1880,36 @@ def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
 def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
     video_urls: List[str] = []
     audio_urls: List[str] = []
+    primary_video_url: Optional[str] = None
     max_dur = 0
-    for t in job.tracks:
-        for k in t.keyframes:
-            if k.duration is not None:
-                max_dur = max(max_dur, int(k.duration))
-            if k.url:
-                if t.type == "video":
-                    video_urls.append(str(k.url))
-                elif t.type == "audio":
-                    audio_urls.append(str(k.url))
+    for track in job.tracks:
+        for keyframe in track.keyframes:
+            duration_value: Optional[int] = None
+            if keyframe.duration is not None:
+                duration_value = int(keyframe.duration)
+                if duration_value <= 0:
+                    raise HTTPException(status_code=400, detail="Keyframe duration must be positive")
+                max_dur = max(max_dur, duration_value)
+            if keyframe.url:
+                if track.type == "video":
+                    video_urls.append(str(keyframe.url))
+                    if duration_value and duration_value > 0:
+                        if primary_video_url is None:
+                            primary_video_url = str(keyframe.url)
+                elif track.type == "audio":
+                    audio_urls.append(str(keyframe.url))
     if not video_urls:
-        raise HTTPException(status_code=400, detail="No video URL found in tracks")
+        raise HTTPException(status_code=400, detail="No video URLs found in tracks")
+    if primary_video_url is None:
+        raise HTTPException(status_code=400, detail="No valid video keyframes with URLs found in tracks")
     if max_dur <= 0:
-        max_dur = 30000
+        raise HTTPException(status_code=400, detail="At least one keyframe must include a duration")
 
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="tracks_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         v_in = work / "video.mp4"
-        _download_to(video_urls[0], v_in, None)
+        _download_to(primary_video_url, v_in, None)
         a_ins: List[Path] = []
         for i, url in enumerate(audio_urls):
             p = work / f"aud_{i:03d}.bin"
@@ -1251,10 +1936,12 @@ def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
 
         log = work / "ffmpeg.log"
         with log.open("wb") as lf:
-            code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+            code = run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "compose-tracks")
         out_path = work / "output.mp4"
         if code != 0 or not out_path.exists():
+            logger.error("compose-from-tracks failed")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
 
         pub = publish_file(out_path, ".mp4")
@@ -1267,6 +1954,7 @@ def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
 
 @app.post("/v1/run-ffmpeg-command")
 def run_rendi(job: RendiJob):
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="rendi_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         resolved = {}
@@ -1285,17 +1973,30 @@ def run_rendi(job: RendiJob):
         for k, p in out_paths.items():
             cmd_text = cmd_text.replace("{{" + k + "}}", str(p))
 
+        cmd_lower = cmd_text.lower()
+        dangerous_patterns = ["-f lavfi", "-i /dev/", "-i file:", "-i concat:"]
+        for pattern in dangerous_patterns:
+            if pattern in cmd_lower:
+                raise HTTPException(status_code=400, detail={"error": "forbidden_pattern", "pattern": pattern})
+        if REQUIRE_DURATION_LIMIT and "-t" not in cmd_lower and "-frames" not in cmd_lower:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "missing_limit", "detail": "Command must include -t or -frames"},
+            )
+
         try:
             args = shlex.split(cmd_text)
-        except Exception:
-            args = ["bash", "-lc", cmd_text]
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail={"error": "invalid_command", "msg": str(exc)}) from exc
 
         log = work / "ffmpeg.log"
+        run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args
         with log.open("wb") as lf:
-            run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args
-            code = subprocess.run(run_args, stdout=lf, stderr=lf).returncode
+            code = run_ffmpeg_with_timeout(run_args, lf)
         save_log(log, "rendi-command")
         if code != 0:
+            logger.error("run-ffmpeg-command failed")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": run_args, "log": log.read_text()})
 
         published = {}
@@ -1348,8 +2049,6 @@ def _ffprobe_cmd_base(
     if select_streams: cmd += ["-select_streams", select_streams]
     return cmd
 
-ALLOWED_FORWARD_HEADERS_LOWER = {"cookie","authorization","x-n8n-api-key","ngrok-skip-browser-warning"}
-
 def _headers_kv_list(h: Optional[Dict[str, str]]) -> list:
     if not h: return []
     out = []
@@ -1386,14 +2085,12 @@ async def probe_from_binary(
     analyze_duration: Optional[str] = None,
     select_streams: Optional[str] = None,
 ):
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="probe_", dir=str(WORK_DIR)) as workdir:
         p = Path(workdir) / (file.filename or "input.bin")
-        
-        # Stream file to disk in chunks
-        with p.open('wb') as f:
-            while chunk := await file.read(1024 * 1024):  # 1MB chunks
-                f.write(chunk)
-        
+
+        await stream_upload_to_path(file, p)
+
         cmd = _ffprobe_cmd_base(show_format, show_streams, show_chapters, show_programs, show_packets,
                                 count_frames, count_packets, probe_size, analyze_duration, select_streams) + [str(p)]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1418,10 +2115,8 @@ def probe_public(
     analyze_duration: Optional[str] = None,
     select_streams: Optional[str] = None,
 ):
-    target = (PUBLIC_DIR / rel).resolve()
-    if PUBLIC_DIR not in target.parents and target != PUBLIC_DIR:
-        raise HTTPException(status_code=400, detail="rel must be within PUBLIC_DIR")
-    if not target.exists():
+    target = safe_path_check(PUBLIC_DIR, rel)
+    if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
     cmd = _ffprobe_cmd_base(show_format, show_streams, show_chapters, show_programs, show_packets,
                             count_frames, count_packets, probe_size, analyze_duration, select_streams) + [str(target)]
