@@ -79,6 +79,7 @@ def app_module(tmp_path_factory: pytest.TempPathFactory):
         "RETENTION_DAYS": "7",
         "MIN_FREE_SPACE_MB": "0",
         "MAX_FILE_SIZE_MB": "1",
+        "PUBLIC_CLEANUP_INTERVAL_SECONDS": "0",
     }
     for key, value in env.items():
         os.environ[key] = value
@@ -234,6 +235,53 @@ def test_downloads_page_lists_existing_files(patched_app):
     assert "example.txt" in html
 
 
+def test_download_to_clears_range_header_when_resume_not_supported(app_module, monkeypatch, tmp_path):
+    dest = tmp_path / "asset.bin"
+    dest.write_bytes(b"abcd")
+
+    headers_seen = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, chunks, fail_after_first_chunk: bool):
+            self.status_code = status_code
+            self.headers = {"content-length": str(sum(len(chunk) for chunk in chunks))}
+            self._chunks = list(chunks)
+            self._fail_after_first_chunk = fail_after_first_chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            for index, chunk in enumerate(self._chunks):
+                yield chunk
+                if self._fail_after_first_chunk and index == 0:
+                    raise RuntimeError("connection dropped")
+
+    responses = [
+        FakeResponse(200, [b"one", b"two"], True),
+        FakeResponse(200, [b"onetwo"], False),
+    ]
+
+    def fake_get(url, headers=None, stream=True, timeout=None):
+        headers_seen.append(dict(headers or {}))
+        return responses.pop(0)
+
+    monkeypatch.setattr(app_module.requests, "get", fake_get)
+
+    app_module._download_to("https://example.com/file", dest, headers={"Authorization": "token"}, max_retries=2, chunk_size=3)
+
+    assert len(headers_seen) == 2
+    assert "Range" in headers_seen[0]
+    assert "Range" not in headers_seen[1]
+    assert dest.read_bytes() == b"onetwo"
+
+
 def test_logs_page_lists_entries(patched_app):
     day_dir = patched_app.LOGS_DIR / "20240102"
     day_dir.mkdir(parents=True, exist_ok=True)
@@ -352,6 +400,65 @@ def test_compose_from_binaries_with_all_inputs(patched_app):
         )
     )
     assert result["ok"] is True
+
+
+def test_compose_from_binaries_rejects_non_video_upload(patched_app):
+    bad_video = UploadFile(file=io.BytesIO(b"video"), filename="video.txt", headers=Headers({"content-type": "text/plain"}))
+    with pytest.raises(patched_app.HTTPException) as exc:
+        asyncio.run(
+            patched_app.compose_from_binaries(
+                video=bad_video,
+                audio=None,
+                bgm=None,
+                duration_ms=15000,
+                width=1280,
+                height=720,
+                fps=24,
+                bgm_volume=0.5,
+                as_json=True,
+            )
+        )
+    assert exc.value.status_code == 400
+
+
+def test_compose_from_binaries_rejects_invalid_audio_type(patched_app):
+    video = UploadFile(file=io.BytesIO(b"video"), filename="video.mp4", headers=Headers({"content-type": "video/mp4"}))
+    bad_audio = UploadFile(file=io.BytesIO(b"audio"), filename="audio.txt", headers=Headers({"content-type": "text/plain"}))
+    with pytest.raises(patched_app.HTTPException) as exc:
+        asyncio.run(
+            patched_app.compose_from_binaries(
+                video=video,
+                audio=bad_audio,
+                bgm=None,
+                duration_ms=15000,
+                width=1280,
+                height=720,
+                fps=24,
+                bgm_volume=0.5,
+                as_json=True,
+            )
+        )
+    assert exc.value.status_code == 400
+
+
+def test_compose_from_binaries_rejects_invalid_bgm_type(patched_app):
+    video = UploadFile(file=io.BytesIO(b"video"), filename="video.mp4", headers=Headers({"content-type": "video/mp4"}))
+    bgm = UploadFile(file=io.BytesIO(b"music"), filename="music.txt", headers=Headers({"content-type": "application/octet-stream"}))
+    with pytest.raises(patched_app.HTTPException) as exc:
+        asyncio.run(
+            patched_app.compose_from_binaries(
+                video=video,
+                audio=None,
+                bgm=bgm,
+                duration_ms=15000,
+                width=1280,
+                height=720,
+                fps=24,
+                bgm_volume=0.5,
+                as_json=True,
+            )
+        )
+    assert exc.value.status_code == 400
 
 
 def test_compose_from_urls_as_json(patched_app):

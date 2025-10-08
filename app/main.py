@@ -1,4 +1,4 @@
-import os, io, shlex, json, subprocess, random, string, shutil, time
+import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -35,6 +35,7 @@ MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", str(2 * 60 * 60)))
 MIN_FREE_SPACE_MB = int(os.getenv("MIN_FREE_SPACE_MB", "1000"))
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+PUBLIC_CLEANUP_INTERVAL_SECONDS = int(os.getenv("PUBLIC_CLEANUP_INTERVAL_SECONDS", "3600"))
 
 # Mount static /files
 app.mount("/files", StaticFiles(directory=str(PUBLIC_DIR)), name="files")
@@ -44,9 +45,13 @@ app.mount("/files", StaticFiles(directory=str(PUBLIC_DIR)), name="files")
 import logging
 import sys
 
-# Force unbuffered output
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
+# Force unbuffered output when supported
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except (AttributeError, io.UnsupportedOperation):
+    # Some deployment targets (e.g. WSGI, Windows) don't expose reconfigure
+    pass
 
 # Create file handler with immediate flush
 file_handler = logging.FileHandler(str(APP_LOG_FILE))
@@ -89,6 +94,12 @@ file_handler.flush()
 @app.on_event("startup")
 async def startup_event():
     logger.info("FastAPI server is ready to accept requests")
+    try:
+        cleanup_old_public()
+    except Exception as exc:
+        logger.warning("Initial public cleanup failed: %s", exc)
+    if PUBLIC_CLEANUP_INTERVAL_SECONDS > 0:
+        asyncio.create_task(_periodic_public_cleanup())
     _flush_logs()
 
 
@@ -101,6 +112,48 @@ def _flush_logs():
     """Force flush all log handlers."""
     for handler in logging.getLogger().handlers:
         handler.flush()
+
+
+def tail_file(filepath: Path, num_lines: int = 1000) -> str:
+    try:
+        size = filepath.stat().st_size
+    except FileNotFoundError:
+        return ""
+    except Exception as exc:
+        logger.warning("Failed to stat log file %s: %s", filepath, exc)
+        return "Error reading log file"
+
+    if size <= 10 * 1024 * 1024:  # 10MB
+        try:
+            with filepath.open("r", encoding="utf-8", errors="ignore") as handle:
+                lines = handle.readlines()
+            return "".join(lines[-num_lines:]) if lines else ""
+        except Exception as exc:
+            logger.warning("Failed to read log file %s: %s", filepath, exc)
+            return "Error reading log file"
+
+    # Large file: read from the end in blocks
+    block_size = 8192
+    blocks: List[bytes] = []
+    bytes_to_read = size
+    lines_found = 0
+    try:
+        with filepath.open("rb") as handle:
+            while bytes_to_read > 0 and lines_found <= num_lines:
+                read_size = block_size if bytes_to_read > block_size else bytes_to_read
+                handle.seek(bytes_to_read - read_size)
+                data = handle.read(read_size)
+                if not data:
+                    break
+                blocks.append(data)
+                bytes_to_read -= read_size
+                lines_found += data.count(b"\n")
+    except Exception as exc:
+        logger.warning("Failed to stream log file %s: %s", filepath, exc)
+        return "Error reading log file"
+
+    text = b"".join(reversed(blocks)).decode("utf-8", errors="ignore")
+    return "\n".join(text.splitlines()[-num_lines:])
 
 
 def check_disk_space(path: Path, required_mb: int = MIN_FREE_SPACE_MB) -> None:
@@ -166,6 +219,20 @@ async def stream_upload_to_path(upload: UploadFile, dest: Path) -> int:
     return total
 
 
+def ensure_upload_type(upload: UploadFile, expected_prefix: str, field: str) -> None:
+    content_type = (upload.content_type or "").lower()
+    if not content_type.startswith(expected_prefix):
+        logger.warning(
+            "%s upload rejected due to invalid content-type: %s",
+            field,
+            content_type or "unknown",
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be {expected_prefix}*, got {content_type or 'unknown'}",
+        )
+
+
 def run_ffmpeg_with_timeout(cmd: List[str], log_handle) -> int:
     try:
         proc = subprocess.Popen(cmd, stdout=log_handle, stderr=log_handle)
@@ -220,10 +287,29 @@ def cleanup_old_public(days: int = RETENTION_DAYS):
         logger.info(f"Cleanup: deleted {deleted_count} files older than {days} days")
 
 
+async def _periodic_public_cleanup():
+    """Periodically clean up expired files from the public directory."""
+    try:
+        # Stagger the first run so startup work can finish
+        await asyncio.sleep(PUBLIC_CLEANUP_INTERVAL_SECONDS)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            cleanup_old_public()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Periodic public cleanup failed: %s", exc)
+        try:
+            await asyncio.sleep(PUBLIC_CLEANUP_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+
 def publish_file(src: Path, ext: str) -> Dict[str, str]:
     """Move a finished file into PUBLIC_DIR/YYYYMMDD/ and return URLs/paths.
        Uses shutil.move to be cross-device safe (works across Docker volumes/Windows)."""
-    cleanup_old_public()
     check_disk_space(PUBLIC_DIR)
     day = datetime.utcnow().strftime("%Y%m%d")
     folder = PUBLIC_DIR / day
@@ -400,11 +486,7 @@ def ffmpeg_info(auto_refresh: int = 0):
             size_kb = stat.st_size / 1024
             mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
             log_info = f"Log file: {size_kb:.1f} KB, Last modified: {mtime}"
-            
-            with APP_LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-                # Get last 1000 lines
-                app_logs = "".join(lines[-1000:]) if lines else "No logs yet"
+            app_logs = tail_file(APP_LOG_FILE, 1000) or "No logs yet"
         except Exception as e:
             app_logs = f"Error reading logs: {e}"
             log_info = "Error reading log file"
@@ -977,36 +1059,42 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
         max_retries: Number of retry attempts (default: 3)
         chunk_size: Download chunk size in bytes (default: 1MB)
     """
-    hdr = {}
+    base_headers: Dict[str, str] = {}
     if headers:
         for k, v in headers.items():
             if k.lower() in ALLOWED_FORWARD_HEADERS_LOWER:
-                hdr[k] = v
-    
+                base_headers[k] = v
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     check_disk_space(dest.parent)
 
+    resume_supported = True
+
     for attempt in range(max_retries):
         try:
-            # Check if partial file exists from previous attempt
+            req_hdr = dict(base_headers)
+
+            if not resume_supported and dest.exists():
+                try:
+                    dest.unlink()
+                except Exception as cleanup_exc:
+                    logger.warning("Failed to reset partial download %s: %s", dest, cleanup_exc)
             existing_size = dest.stat().st_size if dest.exists() else 0
-            
-            # Try to resume from existing position
-            if existing_size > 0:
-                hdr['Range'] = f'bytes={existing_size}-'
-                mode = 'ab'  # Append mode
+
+            use_resume = resume_supported and existing_size > 0
+
+            if use_resume:
+                req_hdr['Range'] = f'bytes={existing_size}-'
                 logger.info(f"Resuming download from {existing_size/1024/1024:.1f}MB: {url}")
-            else:
-                mode = 'wb'  # Write mode (new file)
-            
+
             # Dynamic timeout: 10 minutes base
             timeout = 600
-            
-            with requests.get(url, headers=hdr, stream=True, timeout=timeout) as r:
+
+            with requests.get(url, headers=req_hdr, stream=True, timeout=timeout) as r:
                 r.raise_for_status()
-                
+
                 # Check if server supports Range requests
-                if existing_size > 0:
+                if use_resume:
                     if r.status_code == 206:
                         # Server supports Range, we got partial content
                         logger.info(f"✓ Server supports resume for: {url}")
@@ -1015,10 +1103,12 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                         logger.warning(f"⚠ Server doesn't support resume, downloading from start: {url}")
                         mode = 'wb'  # Switch to overwrite mode
                         existing_size = 0
-                        # Remove Range header for clarity
-                        if 'Range' in hdr:
-                            del hdr['Range']
-                
+                        resume_supported = False
+                    else:
+                        mode = 'ab'
+                else:
+                    mode = 'wb'
+
                 # Get total size
                 if 'content-length' in r.headers:
                     content_length = int(r.headers['content-length'])
@@ -1034,7 +1124,7 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                 # Download with progress tracking
                 downloaded = existing_size
                 last_log = downloaded
-                
+
                 with dest.open(mode) as f:
                     for chunk in r.iter_content(chunk_size):
                         if chunk:
@@ -1134,6 +1224,11 @@ async def compose_from_binaries(
     as_json: bool = False,
 ):
     logger.info(f"Starting compose-from-binaries: video={video.filename}, audio={audio.filename if audio else None}, bgm={bgm.filename if bgm else None}")
+    ensure_upload_type(video, "video/", "video")
+    if audio:
+        ensure_upload_type(audio, "audio/", "audio")
+    if bgm:
+        ensure_upload_type(bgm, "audio/", "bgm")
     check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="compose_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
@@ -1429,8 +1524,8 @@ def run_rendi(job: RendiJob):
 
         try:
             args = shlex.split(cmd_text)
-        except Exception:
-            args = ["bash", "-lc", cmd_text]
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail={"error": "invalid_command", "msg": str(exc)}) from exc
 
         log = work / "ffmpeg.log"
         run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args
@@ -1491,8 +1586,6 @@ def _ffprobe_cmd_base(
     if analyze_duration: cmd += ["-analyzeduration", analyze_duration]
     if select_streams: cmd += ["-select_streams", select_streams]
     return cmd
-
-ALLOWED_FORWARD_HEADERS_LOWER = {"cookie","authorization","x-n8n-api-key","ngrok-skip-browser-warning"}
 
 def _headers_kv_list(h: Optional[Dict[str, str]]) -> list:
     if not h: return []
