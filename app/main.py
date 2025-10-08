@@ -1146,7 +1146,14 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                         existing_size = 0
                         force_restart = True
                     else:
-                        mode = 'ab'
+                        logger.error(
+                            "Unexpected status %s while resuming download %s", r.status_code, url
+                        )
+                        _flush_logs()
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Unexpected status {r.status_code} when requesting range",
+                        )
                 else:
                     mode = 'wb'
 
@@ -1197,6 +1204,8 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                 logger.info(f"Download complete: {downloaded/1024/1024:.1f}MB - {url}")
                 return  # Success!
 
+        except HTTPException:
+            raise
         except Exception as e:
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s

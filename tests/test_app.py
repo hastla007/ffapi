@@ -12,7 +12,7 @@ from typing import Tuple
 from urllib.parse import urlencode
 
 import pytest
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 from starlette.datastructures import Headers
 
 
@@ -437,6 +437,50 @@ def test_download_to_appends_when_resume_supported(app_module, monkeypatch, tmp_
     app_module._download_to("https://example.com/resume.bin", dest, chunk_size=1024)
 
     assert dest.read_bytes() == b"oldnew"
+
+
+def test_download_to_fails_on_unexpected_resume_status(app_module, monkeypatch, tmp_path):
+    dest = tmp_path / "resume.bin"
+    dest.write_bytes(b"old")
+
+    class HeadResponse:
+        headers = {"content-length": "6"}
+
+        def raise_for_status(self):
+            return None
+
+    class StreamResponse:
+        def __init__(self):
+            self.status_code = 204
+            self.headers = {"content-length": "0"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            raise AssertionError("should not iterate on unexpected status")
+
+    def fake_head(url, headers=None, timeout=None):
+        return HeadResponse()
+
+    def fake_get(url, headers=None, stream=True, timeout=None):
+        assert headers.get("Range") == "bytes=3-"
+        return StreamResponse()
+
+    monkeypatch.setattr(app_module.requests, "head", fake_head)
+    monkeypatch.setattr(app_module.requests, "get", fake_get)
+
+    with pytest.raises(HTTPException) as exc:
+        app_module._download_to("https://example.com/resume.bin", dest, chunk_size=1024)
+
+    assert exc.value.status_code == 502
+    assert dest.read_bytes() == b"old"
 
 
 def test_download_to_removes_partial_file_on_final_failure(app_module, monkeypatch, tmp_path):
