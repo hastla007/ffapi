@@ -5,7 +5,7 @@
 ### Key features
 - `publish_file()` uses `shutil.move()` (works across devices / Docker volumes / Windows).
 - All `TemporaryDirectory(...)` calls use `dir=$WORK_DIR` (default `/data/work`) so temps are on the same volume.
-- **Fixed retention**: Files are deleted based on actual file age (modification time), not folder name. Files persist through restarts until truly RETENTION_DAYS old.
+- **Fixed retention**: Files are deleted based on actual file age (modification time), not folder name. Files persist through restarts until they are truly RETENTION_DAYS old, and cleanup resumes automatically on startup and via a periodic background task.
 - **Persistent FFmpeg logs**: All FFmpeg operations save logs to `/data/logs` for debugging.
 - **Application logging**: Container logs (stdout/stderr) are saved to `/data/logs/application.log` and viewable at `/ffmpeg` endpoint.
 
@@ -80,6 +80,6 @@ For complete API documentation with all parameters and examples, visit `/documen
 
 ### Retention Logic
 Files are automatically cleaned up based on their **actual modification time**, not the folder date. This means:
-- Files survive machine restarts
+- Files survive machine restarts but are still removed once their modification time exceeds RETENTION_DAYS, even after container restarts
 - Only truly old files are deleted
 - RETENTION_DAYS works as expected

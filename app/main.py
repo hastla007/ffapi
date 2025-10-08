@@ -199,8 +199,9 @@ except (AttributeError, io.UnsupportedOperation):
     # Some deployment targets (e.g. WSGI, Windows) don't expose reconfigure
     pass
 
-# Create file handler with immediate flush
-file_handler = logging.FileHandler(str(APP_LOG_FILE))
+# Create file handler with line buffering to avoid manual flush storms
+file_stream = open(APP_LOG_FILE, "a", encoding="utf-8", buffering=1)
+file_handler = logging.StreamHandler(file_stream)
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 
@@ -272,8 +273,8 @@ def tail_file(filepath: Path, num_lines: int = 1000) -> str:
     if size <= 10 * 1024 * 1024:  # 10MB
         try:
             with filepath.open("r", encoding="utf-8", errors="ignore") as handle:
-                lines = handle.readlines()
-            return "".join(lines[-num_lines:]) if lines else ""
+                limited = deque(handle, maxlen=num_lines)
+            return "".join(limited) if limited else ""
         except Exception as exc:
             logger.warning("Failed to read log file %s: %s", filepath, exc)
             return "Error reading log file"
@@ -1465,21 +1466,22 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
     dest.parent.mkdir(parents=True, exist_ok=True)
     check_disk_space(dest.parent)
 
-    force_restart = False
+    can_resume = True
 
     for attempt in range(max_retries):
         try:
             req_hdr = dict(base_headers)
-            if force_restart and dest.exists():
+            existing_size = dest.stat().st_size if dest.exists() else 0
+
+            if not can_resume and dest.exists():
                 try:
                     dest.unlink()
                 except Exception as cleanup_exc:
-                    logger.warning("Failed to reset partial download %s: %s", dest, cleanup_exc)
-                finally:
-                    force_restart = False
-            existing_size = dest.stat().st_size if dest.exists() else 0
+                    logger.warning("Failed to reset download %s: %s", dest, cleanup_exc)
+                    _flush_logs()
+                existing_size = 0
 
-            use_resume = existing_size > 0
+            use_resume = can_resume and existing_size > 0
 
             if use_resume:
                 req_hdr['Range'] = f'bytes={existing_size}-'
@@ -1516,9 +1518,15 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                     elif r.status_code == 200:
                         # Server doesn't support Range, gave us full file
                         logger.warning(f"⚠ Server doesn't support resume, downloading from start: {url}")
+                        if dest.exists():
+                            try:
+                                dest.unlink()
+                            except Exception as cleanup_exc:
+                                logger.warning("Failed to remove stale partial %s: %s", dest, cleanup_exc)
+                                _flush_logs()
                         mode = 'wb'  # Switch to overwrite mode
                         existing_size = 0
-                        force_restart = True
+                        can_resume = False
                     else:
                         logger.error(
                             "Unexpected status %s while resuming download %s", r.status_code, url

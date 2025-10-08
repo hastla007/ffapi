@@ -441,6 +441,58 @@ def test_download_to_appends_when_resume_supported(app_module, monkeypatch, tmp_
     assert dest.read_bytes() == b"oldnew"
 
 
+def test_download_to_removes_partial_before_full_restart(app_module, monkeypatch, tmp_path):
+    dest = tmp_path / "resume.bin"
+    dest.write_bytes(b"stale-data")
+
+    class HeadResponse:
+        headers = {"content-length": "6"}
+
+        def raise_for_status(self):
+            return None
+
+    class StreamResponse:
+        def __init__(self):
+            self.status_code = 200
+            self.headers = {"content-length": "6"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield b"result"
+
+    def fake_head(url, headers=None, timeout=None):
+        return HeadResponse()
+
+    def fake_get(url, headers=None, stream=True, timeout=None):
+        assert headers.get("Range") == f"bytes={len('stale-data')}-"
+        return StreamResponse()
+
+    unlink_calls: list[Path] = []
+    original_unlink = app_module.Path.unlink
+
+    def spy_unlink(self, *args, **kwargs):
+        if self == dest:
+            unlink_calls.append(self)
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.Path, "unlink", spy_unlink, raising=False)
+    monkeypatch.setattr(app_module.requests, "head", fake_head)
+    monkeypatch.setattr(app_module.requests, "get", fake_get)
+
+    app_module._download_to("https://example.com/resume.bin", dest, chunk_size=1024)
+
+    assert unlink_calls == [dest]
+    assert dest.read_bytes() == b"result"
+
+
 def test_download_to_fails_on_unexpected_resume_status(app_module, monkeypatch, tmp_path):
     dest = tmp_path / "resume.bin"
     dest.write_bytes(b"old")
