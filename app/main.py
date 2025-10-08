@@ -36,6 +36,7 @@ FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", str(2 * 60 * 60
 MIN_FREE_SPACE_MB = int(os.getenv("MIN_FREE_SPACE_MB", "1000"))
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 PUBLIC_CLEANUP_INTERVAL_SECONDS = int(os.getenv("PUBLIC_CLEANUP_INTERVAL_SECONDS", "3600"))
+REQUIRE_DURATION_LIMIT = os.getenv("REQUIRE_DURATION_LIMIT", "false").lower() == "true"
 
 # Mount static /files
 app.mount("/files", StaticFiles(directory=str(PUBLIC_DIR)), name="files")
@@ -1596,8 +1597,11 @@ def run_rendi(job: RendiJob):
         for pattern in dangerous_patterns:
             if pattern in cmd_lower:
                 raise HTTPException(status_code=400, detail={"error": "forbidden_pattern", "pattern": pattern})
-        if "-t" not in cmd_lower and "-frames" not in cmd_lower:
-            raise HTTPException(status_code=400, detail={"error": "missing_limit", "detail": "Command must include -t or -frames"})
+        if REQUIRE_DURATION_LIMIT and "-t" not in cmd_lower and "-frames" not in cmd_lower:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "missing_limit", "detail": "Command must include -t or -frames"},
+            )
 
         try:
             args = shlex.split(cmd_text)

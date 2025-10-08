@@ -883,7 +883,8 @@ def test_run_ffmpeg_command_rejects_dangerous_patterns(patched_app):
     assert exc.value.detail["error"] == "forbidden_pattern"
 
 
-def test_run_ffmpeg_command_requires_duration_limit(patched_app):
+def test_run_ffmpeg_command_requires_duration_limit(patched_app, monkeypatch):
+    monkeypatch.setattr(patched_app, "REQUIRE_DURATION_LIMIT", True)
     job = patched_app.RendiJob(
         input_files={"video": "https://example.com/input.mp4"},
         output_files={"out": "result.mp4"},
