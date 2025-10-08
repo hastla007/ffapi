@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from itertools import count
 from pathlib import Path
 from typing import Tuple
@@ -249,6 +250,30 @@ def test_downloads_page_escapes_special_characters(patched_app):
     assert "<img" not in html.split("Generated Files", 1)[1]
 
 
+def test_concurrent_requests_handle_independent_state(patched_app):
+    day_dir = patched_app.PUBLIC_DIR / "20240201"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    (day_dir / "file.txt").write_text("data", encoding="utf-8")
+
+    log_dir = patched_app.LOGS_DIR / "20240201"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "event.log").write_text("entry", encoding="utf-8")
+
+    async def run_requests():
+        downloads_task = _call_app(patched_app.app, "GET", "/downloads")
+        logs_task = _call_app(patched_app.app, "GET", "/logs")
+        health_task = _call_app(patched_app.app, "GET", "/health")
+        return await asyncio.gather(downloads_task, logs_task, health_task)
+
+    responses = asyncio.run(run_requests())
+
+    assert [status for status, _, _ in responses] == [200, 200, 200]
+    downloads_html = responses[0][2].decode()
+    assert "file.txt" in downloads_html
+    logs_html = responses[1][2].decode()
+    assert "event.log" in logs_html
+
+
 def test_download_to_clears_range_header_when_resume_not_supported(app_module, monkeypatch, tmp_path):
     dest = tmp_path / "asset.bin"
     dest.write_bytes(b"abcd")
@@ -414,6 +439,59 @@ def test_download_to_appends_when_resume_supported(app_module, monkeypatch, tmp_
     assert dest.read_bytes() == b"oldnew"
 
 
+def test_download_to_removes_partial_file_on_final_failure(app_module, monkeypatch, tmp_path):
+    dest = tmp_path / "broken.bin"
+    dest.write_bytes(b"partial")
+
+    class HeadResponse:
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+    def fake_head(url, headers=None, timeout=None):
+        return HeadResponse()
+
+    def fake_get(url, headers=None, stream=True, timeout=None):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(app_module.requests, "head", fake_head)
+    monkeypatch.setattr(app_module.requests, "get", fake_get)
+
+    with pytest.raises(RuntimeError):
+        app_module._download_to("https://example.com/broken.bin", dest, max_retries=1)
+
+    assert not dest.exists()
+
+
+def test_cleanup_old_public_handles_missing_file_race(app_module, monkeypatch):
+    day_dir = app_module.PUBLIC_DIR / "20200101"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    old_file = day_dir / "stale.mp4"
+    old_file.write_text("data", encoding="utf-8")
+
+    cutoff = time.time() - ((app_module.RETENTION_DAYS + 1) * 86400)
+    os.utime(old_file, (cutoff, cutoff))
+
+    original_unlink = app_module.os.unlink
+    triggered = {"count": 0}
+
+    def flaky_unlink(path, *args, **kwargs):
+        if Path(path) == old_file and not triggered["count"]:
+            triggered["count"] = 1
+            if old_file.exists():
+                original_unlink(path)
+            raise FileNotFoundError("already removed")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.os, "unlink", flaky_unlink)
+
+    app_module.cleanup_old_public(days=app_module.RETENTION_DAYS)
+
+    assert triggered["count"] == 1
+    assert not old_file.exists()
+
+
 def test_logs_page_lists_entries(patched_app):
     day_dir = patched_app.LOGS_DIR / "20240102"
     day_dir.mkdir(parents=True, exist_ok=True)
@@ -565,6 +643,37 @@ def test_compose_from_binaries_rejects_non_video_upload(patched_app):
             )
         )
     assert exc.value.status_code == 400
+
+
+def test_compose_from_binaries_rejects_oversized_audio(patched_app):
+    video = UploadFile(
+        file=io.BytesIO(b"video"),
+        filename="video.mp4",
+        headers=Headers({"content-type": "video/mp4"}),
+    )
+    big_audio_payload = b"audio" + b"0" * (patched_app.MAX_FILE_SIZE_BYTES + 5)
+    audio = UploadFile(
+        file=io.BytesIO(big_audio_payload),
+        filename="audio.mp3",
+        headers=Headers({"content-type": "audio/mpeg"}),
+    )
+
+    with pytest.raises(patched_app.HTTPException) as exc:
+        asyncio.run(
+            patched_app.compose_from_binaries(
+                video=video,
+                audio=audio,
+                bgm=None,
+                duration_ms=15000,
+                width=1280,
+                height=720,
+                fps=24,
+                bgm_volume=0.5,
+                as_json=True,
+            )
+        )
+
+    assert exc.value.status_code == 413
 
 
 def test_compose_from_binaries_rejects_invalid_audio_type(patched_app):
@@ -740,6 +849,55 @@ def test_run_ffmpeg_command_requires_duration_limit(patched_app):
         patched_app.run_rendi(job)
     assert exc.value.status_code == 400
     assert exc.value.detail["error"] == "missing_limit"
+
+
+def test_run_ffmpeg_with_timeout_handles_spawn_failure(app_module, monkeypatch):
+    def boom_popen(cmd, stdout=None, stderr=None):
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(app_module.subprocess, "Popen", boom_popen)
+
+    with pytest.raises(app_module.HTTPException) as exc:
+        app_module.run_ffmpeg_with_timeout(["ffmpeg", "-i", "in.mp4", "out.mp4"], io.StringIO())
+
+    assert exc.value.status_code == 500
+
+
+def test_run_ffmpeg_with_timeout_handles_timeout(app_module, monkeypatch):
+    wait_calls = []
+    terminated = False
+    killed = False
+
+    class SlowProc:
+        def __init__(self, cmd, stdout=None, stderr=None):
+            self.cmd = cmd
+            self._wait_count = 0
+
+        def wait(self, timeout=None):
+            self._wait_count += 1
+            wait_calls.append(timeout)
+            raise app_module.subprocess.TimeoutExpired(cmd=self.cmd, timeout=timeout)
+
+        def terminate(self):
+            nonlocal terminated
+            terminated = True
+
+        def kill(self):
+            nonlocal killed
+            killed = True
+
+    def slow_popen(cmd, stdout=None, stderr=None):
+        return SlowProc(cmd, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(app_module.subprocess, "Popen", slow_popen)
+
+    with pytest.raises(app_module.HTTPException) as exc:
+        app_module.run_ffmpeg_with_timeout(["ffmpeg", "-i", "in.mp4", "out.mp4"], io.StringIO())
+
+    assert exc.value.status_code == 504
+    assert terminated is True
+    assert killed is True
+    assert wait_calls == [app_module.FFMPEG_TIMEOUT_SECONDS, 5]
 
 
 def test_probe_from_urls_returns_json(patched_app):
