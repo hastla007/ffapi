@@ -8,7 +8,7 @@ import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, field_validator
 
 app = FastAPI()
 
@@ -29,6 +29,12 @@ APP_LOG_FILE = LOGS_DIR / "application.log"
 
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # e.g. "http://10.120.2.5:3000"
+
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "2048"))
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", str(2 * 60 * 60)))
+MIN_FREE_SPACE_MB = int(os.getenv("MIN_FREE_SPACE_MB", "1000"))
+UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 # Mount static /files
 app.mount("/files", StaticFiles(directory=str(PUBLIC_DIR)), name="files")
@@ -97,6 +103,84 @@ def _flush_logs():
         handler.flush()
 
 
+def check_disk_space(path: Path, required_mb: int = MIN_FREE_SPACE_MB) -> None:
+    target = path if path.exists() else path.parent
+    target.mkdir(parents=True, exist_ok=True)
+    stat = shutil.disk_usage(target)
+    available_mb = stat.free / (1024 * 1024)
+    if available_mb < required_mb:
+        logger.warning(
+            "Insufficient disk space at %s: %.1f MB available, %d MB required",
+            target,
+            available_mb,
+            required_mb,
+        )
+        _flush_logs()
+        raise HTTPException(status_code=507, detail="Insufficient disk space")
+
+
+def safe_path_check(base: Path, rel: str) -> Path:
+    try:
+        target = (base / rel).resolve()
+    except Exception as exc:
+        logger.warning("Invalid path provided for %s: %s", base, rel)
+        _flush_logs()
+        raise HTTPException(status_code=400, detail="Invalid path") from exc
+    if target == base:
+        return target
+    if base not in target.parents:
+        logger.warning("Blocked path traversal attempt: %s -> %s", rel, target)
+        _flush_logs()
+        raise HTTPException(status_code=403, detail="Access denied")
+    return target
+
+
+async def stream_upload_to_path(upload: UploadFile, dest: Path) -> int:
+    await upload.seek(0)
+    total = 0
+    try:
+        with dest.open("wb") as buffer:
+            while chunk := await upload.read(UPLOAD_CHUNK_SIZE):
+                total += len(chunk)
+                if total > MAX_FILE_SIZE_BYTES:
+                    logger.warning("Upload exceeded max size: %s", upload.filename)
+                    _flush_logs()
+                    raise HTTPException(status_code=413, detail="File too large")
+                buffer.write(chunk)
+    except HTTPException:
+        if dest.exists():
+            try:
+                dest.unlink()
+            except Exception as exc:
+                logger.warning("Failed cleaning partial upload %s: %s", dest, exc)
+        raise
+    except Exception as exc:
+        if dest.exists():
+            try:
+                dest.unlink()
+            except Exception as cleanup_exc:
+                logger.warning("Failed removing incomplete upload %s: %s", dest, cleanup_exc)
+        logger.error("Failed to persist upload %s: %s", upload.filename, exc)
+        _flush_logs()
+        raise HTTPException(status_code=500, detail="Failed to save upload") from exc
+    return total
+
+
+def run_ffmpeg_with_timeout(cmd: List[str], log_handle) -> int:
+    try:
+        proc = subprocess.Popen(cmd, stdout=log_handle, stderr=log_handle)
+    except Exception as exc:
+        logger.error("Failed to launch ffmpeg command %s: %s", cmd, exc)
+        _flush_logs()
+        raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from exc
+    try:
+        return proc.wait(timeout=FFMPEG_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
+        _flush_logs()
+        raise HTTPException(status_code=504, detail="Processing timeout")
+
 def cleanup_old_public(days: int = RETENTION_DAYS):
     """Delete files older than specified days based on actual file modification time."""
     if days <= 0:
@@ -114,44 +198,44 @@ def cleanup_old_public(days: int = RETENTION_DAYS):
                         file_mtime = file_path.stat().st_mtime
                         if file_mtime < cutoff_timestamp:
                             files_to_delete.append(file_path)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("Failed to inspect file %s: %s", file_path, exc)
             
             # Delete old files
             for fp in files_to_delete:
                 try:
                     fp.unlink()
                     deleted_count += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Failed to delete expired file %s: %s", fp, exc)
             
             # Remove directory if empty
             try:
                 if not any(child.iterdir()):
                     child.rmdir()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to remove empty directory %s: %s", child, exc)
     
     if deleted_count > 0:
         logger.info(f"Cleanup: deleted {deleted_count} files older than {days} days")
-        _flush_logs()
 
 
 def publish_file(src: Path, ext: str) -> Dict[str, str]:
     """Move a finished file into PUBLIC_DIR/YYYYMMDD/ and return URLs/paths.
        Uses shutil.move to be cross-device safe (works across Docker volumes/Windows)."""
     cleanup_old_public()
+    check_disk_space(PUBLIC_DIR)
     day = datetime.utcnow().strftime("%Y%m%d")
     folder = PUBLIC_DIR / day
     folder.mkdir(parents=True, exist_ok=True)
+    check_disk_space(folder)
     name = datetime.utcnow().strftime("%Y%m%d_%H%M%S_") + _rand() + ext
     dst = folder / name
 
     # Cross-device safe move
     shutil.move(str(src), str(dst))
-    
+
     logger.info(f"Published file: {name} ({dst.stat().st_size / (1024*1024):.2f} MB)")
-    _flush_logs()
 
     rel = f"/files/{day}/{name}"
     url = f"{PUBLIC_BASE_URL.rstrip('/')}{rel}" if PUBLIC_BASE_URL else rel
@@ -162,9 +246,11 @@ def save_log(log_path: Path, operation: str) -> None:
     """Save ffmpeg log to persistent logs directory."""
     if not log_path.exists():
         return
+    check_disk_space(LOGS_DIR)
     day = datetime.utcnow().strftime("%Y%m%d")
     folder = LOGS_DIR / day
     folder.mkdir(parents=True, exist_ok=True)
+    check_disk_space(folder)
     name = datetime.utcnow().strftime("%Y%m%d_%H%M%S_") + _rand() + f"_{operation}.log"
     dst = folder / name
     try:
@@ -284,10 +370,8 @@ def logs():
 @app.get("/logs/view", response_class=PlainTextResponse)
 def view_log(path: str):
     """View individual log file content."""
-    target = (LOGS_DIR / path).resolve()
-    if LOGS_DIR not in target.parents and target != LOGS_DIR:
-        raise HTTPException(status_code=400, detail="Invalid path")
-    if not target.exists():
+    target = safe_path_check(LOGS_DIR, path)
+    if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="Log not found")
     return target.read_text(encoding="utf-8", errors="ignore")
 
@@ -781,7 +865,6 @@ def documentation():
 @app.get("/health")
 def health():
     logger.info("Health check requested")
-    _flush_logs()
     return {"ok": True}
 
 
@@ -798,6 +881,20 @@ class ConcatJob(BaseModel):
     height: int = 1080
     fps: int = 30
 
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        if not (1 <= value <= 7680):
+            raise ValueError(f"Dimension must be 1-7680, got {value}")
+        return value
+
+    @field_validator("fps")
+    @classmethod
+    def validate_fps(cls, value: int) -> int:
+        if not (1 <= value <= 240):
+            raise ValueError(f"FPS must be 1-240, got {value}")
+        return value
+
 
 class ComposeFromUrlsJob(BaseModel):
     video_url: HttpUrl
@@ -809,6 +906,27 @@ class ComposeFromUrlsJob(BaseModel):
     fps: int = 30
     bgm_volume: float = 0.3
     headers: Optional[Dict[str, str]] = None  # forwarded header subset
+
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        if not (1 <= value <= 7680):
+            raise ValueError(f"Dimension must be 1-7680, got {value}")
+        return value
+
+    @field_validator("fps")
+    @classmethod
+    def validate_fps(cls, value: int) -> int:
+        if not (1 <= value <= 240):
+            raise ValueError(f"FPS must be 1-240, got {value}")
+        return value
+
+    @field_validator("bgm_volume")
+    @classmethod
+    def validate_volume(cls, value: float) -> float:
+        if not (0.0 <= value <= 5.0):
+            raise ValueError(f"bgm_volume must be between 0 and 5, got {value}")
+        return value
 
 
 class Keyframe(BaseModel):
@@ -829,6 +947,20 @@ class TracksComposeJob(BaseModel):
     height: int = 1080
     fps: int = 30
 
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        if not (1 <= value <= 7680):
+            raise ValueError(f"Dimension must be 1-7680, got {value}")
+        return value
+
+    @field_validator("fps")
+    @classmethod
+    def validate_fps(cls, value: int) -> int:
+        if not (1 <= value <= 240):
+            raise ValueError(f"FPS must be 1-240, got {value}")
+        return value
+
 
 # ---------- helpers ----------
 ALLOWED_FORWARD_HEADERS_LOWER = {
@@ -837,7 +969,7 @@ ALLOWED_FORWARD_HEADERS_LOWER = {
 
 def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None, max_retries: int = 3, chunk_size: int = 1024 * 1024):
     """Download file with retry, resume, and progress tracking.
-    
+
     Args:
         url: URL to download from
         dest: Destination file path
@@ -851,6 +983,9 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
             if k.lower() in ALLOWED_FORWARD_HEADERS_LOWER:
                 hdr[k] = v
     
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    check_disk_space(dest.parent)
+
     for attempt in range(max_retries):
         try:
             # Check if partial file exists from previous attempt
@@ -914,22 +1049,19 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                                 else:
                                     logger.info(f"Downloaded: {downloaded/1024/1024:.0f}MB")
                                 last_log = downloaded
-                                _flush_logs()
-                
+
                 # Verify size if we know what to expect
                 if total_size and downloaded != total_size:
                     raise Exception(f"Download incomplete: got {downloaded} bytes, expected {total_size}")
-                
+
                 logger.info(f"Download complete: {downloaded/1024/1024:.1f}MB - {url}")
-                _flush_logs()
                 return  # Success!
-                
+
         except Exception as e:
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
                 logger.warning(f"Download failed (attempt {attempt + 1}/{max_retries}): {e}")
                 logger.warning(f"Retrying in {wait_time} seconds...")
-                _flush_logs()
                 time.sleep(wait_time)
             else:
                 # Final attempt failed
@@ -939,8 +1071,9 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                 if dest.exists():
                     try:
                         dest.unlink()
-                    except:
-                        pass
+                    except Exception as cleanup_exc:
+                        logger.warning("Failed to remove partial download %s: %s", dest, cleanup_exc)
+                        _flush_logs()
                 raise
 
 
@@ -948,21 +1081,18 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
 @app.post("/image/to-mp4-loop")
 async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as_json: bool = False):
     logger.info(f"Starting image-to-mp4-loop: {file.filename}, duration={duration}s")
-    _flush_logs()
     if file.content_type not in {"image/png", "image/jpeg"}:
         raise HTTPException(status_code=400, detail="Only PNG/JPEG are supported.")
     if not (1 <= duration <= 3600):
         raise HTTPException(status_code=400, detail="duration must be 1..3600 seconds")
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="loop_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         in_path = work / ("input.png" if file.content_type == "image/png" else "input.jpg")
         out_path = work / "output.mp4"
-        
-        # Stream file to disk in chunks (memory efficient)
-        with in_path.open('wb') as f:
-            while chunk := await file.read(1024 * 1024):  # 1MB chunks
-                f.write(chunk)
-        
+
+        await stream_upload_to_path(file, in_path)
+
         cmd = [
             "ffmpeg", "-y",
             "-loop", "1",
@@ -976,14 +1106,14 @@ async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as
         ]
         log = work / "ffmpeg.log"
         with log.open("wb") as lf:
-            code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+            code = run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "image-to-mp4")
         if code != 0 or not out_path.exists():
             logger.error(f"image-to-mp4-loop failed for {file.filename}")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
         pub = publish_file(out_path, ".mp4")
         logger.info(f"image-to-mp4-loop completed: {pub['rel']}")
-        _flush_logs()
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -997,14 +1127,14 @@ async def compose_from_binaries(
     audio: Optional[UploadFile] = File(None),
     bgm: Optional[UploadFile] = File(None),
     duration_ms: int = Query(30000, ge=1, le=3600000),
-    width: int = 1920,
-    height: int = 1080,
-    fps: int = 30,
-    bgm_volume: float = 0.3,
+    width: int = Query(1920, ge=1, le=7680),
+    height: int = Query(1080, ge=1, le=7680),
+    fps: int = Query(30, ge=1, le=240),
+    bgm_volume: float = Query(0.3, ge=0.0, le=5.0),
     as_json: bool = False,
 ):
     logger.info(f"Starting compose-from-binaries: video={video.filename}, audio={audio.filename if audio else None}, bgm={bgm.filename if bgm else None}")
-    _flush_logs()
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="compose_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         v_path = work / "video.mp4"
@@ -1012,24 +1142,15 @@ async def compose_from_binaries(
         b_path = work / "bgm"
         out_path = work / "output.mp4"
 
-        # Stream video file to disk in chunks
-        with v_path.open('wb') as f:
-            while chunk := await video.read(1024 * 1024):  # 1MB chunks
-                f.write(chunk)
-        
+        await stream_upload_to_path(video, v_path)
+
         has_audio = False
         has_bgm = False
         if audio:
-            # Stream audio file to disk in chunks
-            with a_path.open('wb') as f:
-                while chunk := await audio.read(1024 * 1024):
-                    f.write(chunk)
+            await stream_upload_to_path(audio, a_path)
             has_audio = True
         if bgm:
-            # Stream BGM file to disk in chunks
-            with b_path.open('wb') as f:
-                while chunk := await bgm.read(1024 * 1024):
-                    f.write(chunk)
+            await stream_upload_to_path(bgm, b_path)
             has_bgm = True
 
         dur_s = f"{duration_ms/1000:.3f}"
@@ -1059,15 +1180,15 @@ async def compose_from_binaries(
 
         log = work / "ffmpeg.log"
         with log.open("wb") as lf:
-            code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+            code = run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "compose-binaries")
         if code != 0 or not out_path.exists():
             logger.error("compose-from-binaries failed")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": cmd, "log": log.read_text()})
 
         pub = publish_file(out_path, ".mp4")
         logger.info(f"compose-from-binaries completed: {pub['rel']}")
-        _flush_logs()
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -1078,7 +1199,7 @@ async def compose_from_binaries(
 @app.post("/video/concat-from-urls")
 def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
     logger.info(f"Starting concat: {len(job.clips)} clips, {job.width}x{job.height}@{job.fps}fps")
-    _flush_logs()
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="concat_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         norm = []
@@ -1097,7 +1218,7 @@ def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             ]
             log = work / f"norm_{i:03d}.log"
             with log.open("wb") as lf:
-                code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+                code = run_ffmpeg_with_timeout(cmd, lf)
             save_log(log, f"concat-norm-{i}")
             if code != 0 or not out.exists():
                 return JSONResponse(status_code=500, content={"error": "ffmpeg_failed_on_clip", "clip": str(url), "log": log.read_text()})
@@ -1110,14 +1231,14 @@ def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
         cmd2 = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile), "-c", "copy", "-movflags", "+faststart", str(out_path)]
         log2 = work / "concat.log"
         with log2.open("wb") as lf:
-            code2 = subprocess.run(cmd2, stdout=lf, stderr=lf).returncode
+            code2 = run_ffmpeg_with_timeout(cmd2, lf)
         save_log(log2, "concat-final")
         if code2 != 0 or not out_path.exists():
             logger.error("concat failed at final stage")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed_concat", "log": log2.read_text()})
         pub = publish_file(out_path, ".mp4")
         logger.info(f"concat completed: {len(job.clips)} clips -> {pub['rel']}")
-        _flush_logs()
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -1132,6 +1253,20 @@ class ConcatAliasJob(BaseModel):
     height: int = 1080
     fps: int = 30
 
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        if not (1 <= value <= 7680):
+            raise ValueError(f"Dimension must be 1-7680, got {value}")
+        return value
+
+    @field_validator("fps")
+    @classmethod
+    def validate_fps(cls, value: int) -> int:
+        if not (1 <= value <= 240):
+            raise ValueError(f"FPS must be 1-240, got {value}")
+        return value
+
 @app.post("/video/concat")
 def video_concat_alias(job: ConcatAliasJob, as_json: bool = False):
     clip_list = job.clips or job.urls
@@ -1145,6 +1280,7 @@ def video_concat_alias(job: ConcatAliasJob, as_json: bool = False):
 def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
     if job.duration_ms <= 0 or job.duration_ms > 3600000:
         raise HTTPException(status_code=400, detail="invalid duration_ms (1..3600000)")
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="cfu_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         v_path = work / "video_in.mp4"
@@ -1189,9 +1325,11 @@ def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
 
         cmd += maps + [str(out_path)]
         with log_path.open("wb") as logf:
-            code = subprocess.run(cmd, stdout=logf, stderr=logf).returncode
+            code = run_ffmpeg_with_timeout(cmd, logf)
         save_log(log_path, "compose-urls")
         if code != 0 or not out_path.exists():
+            logger.error("compose-from-urls failed")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": cmd, "log": log_path.read_text()})
 
         pub = publish_file(out_path, ".mp4")
@@ -1221,6 +1359,7 @@ def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
     if max_dur <= 0:
         max_dur = 30000
 
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="tracks_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         v_in = work / "video.mp4"
@@ -1251,10 +1390,12 @@ def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
 
         log = work / "ffmpeg.log"
         with log.open("wb") as lf:
-            code = subprocess.run(cmd, stdout=lf, stderr=lf).returncode
+            code = run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "compose-tracks")
         out_path = work / "output.mp4"
         if code != 0 or not out_path.exists():
+            logger.error("compose-from-tracks failed")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
 
         pub = publish_file(out_path, ".mp4")
@@ -1267,6 +1408,7 @@ def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
 
 @app.post("/v1/run-ffmpeg-command")
 def run_rendi(job: RendiJob):
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="rendi_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         resolved = {}
@@ -1291,11 +1433,13 @@ def run_rendi(job: RendiJob):
             args = ["bash", "-lc", cmd_text]
 
         log = work / "ffmpeg.log"
+        run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args
         with log.open("wb") as lf:
-            run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args
-            code = subprocess.run(run_args, stdout=lf, stderr=lf).returncode
+            code = run_ffmpeg_with_timeout(run_args, lf)
         save_log(log, "rendi-command")
         if code != 0:
+            logger.error("run-ffmpeg-command failed")
+            _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": run_args, "log": log.read_text()})
 
         published = {}
@@ -1386,14 +1530,12 @@ async def probe_from_binary(
     analyze_duration: Optional[str] = None,
     select_streams: Optional[str] = None,
 ):
+    check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="probe_", dir=str(WORK_DIR)) as workdir:
         p = Path(workdir) / (file.filename or "input.bin")
-        
-        # Stream file to disk in chunks
-        with p.open('wb') as f:
-            while chunk := await file.read(1024 * 1024):  # 1MB chunks
-                f.write(chunk)
-        
+
+        await stream_upload_to_path(file, p)
+
         cmd = _ffprobe_cmd_base(show_format, show_streams, show_chapters, show_programs, show_packets,
                                 count_frames, count_packets, probe_size, analyze_duration, select_streams) + [str(p)]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1418,10 +1560,8 @@ def probe_public(
     analyze_duration: Optional[str] = None,
     select_streams: Optional[str] = None,
 ):
-    target = (PUBLIC_DIR / rel).resolve()
-    if PUBLIC_DIR not in target.parents and target != PUBLIC_DIR:
-        raise HTTPException(status_code=400, detail="rel must be within PUBLIC_DIR")
-    if not target.exists():
+    target = safe_path_check(PUBLIC_DIR, rel)
+    if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
     cmd = _ffprobe_cmd_base(show_format, show_streams, show_chapters, show_programs, show_packets,
                             count_frames, count_packets, probe_size, analyze_duration, select_streams) + [str(target)]

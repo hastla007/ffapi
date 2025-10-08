@@ -77,6 +77,8 @@ def app_module(tmp_path_factory: pytest.TempPathFactory):
         "LOGS_DIR": str(base / "logs"),
         "PUBLIC_BASE_URL": "http://example.com",
         "RETENTION_DAYS": "7",
+        "MIN_FREE_SPACE_MB": "0",
+        "MAX_FILE_SIZE_MB": "1",
     }
     for key, value in env.items():
         os.environ[key] = value
@@ -167,10 +169,44 @@ def patched_app(app_module, monkeypatch, tmp_path):
             stdout_value = "" if text_mode else b""
         return DummyCompletedProcess(returncode=0, stdout=stdout_value, stderr="" if text_mode else b"")
 
+    class DummyPopen:
+        def __init__(self, cmd, stdout=None, stderr=None, **kwargs):
+            self.cmd = cmd
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = 0
+            payload = b"run"
+            output_path = None
+            for token in reversed(cmd):
+                if isinstance(token, str) and token.startswith("-"):
+                    continue
+                output_path = Path(token)
+                break
+            if output_path is not None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"fake output")
+            if stdout is not None:
+                try:
+                    stdout.write(payload)
+                except TypeError:
+                    stdout.write(payload.decode("utf-8"))
+            if stderr is not None and stderr is not stdout:
+                try:
+                    stderr.write(payload)
+                except TypeError:
+                    stderr.write(payload.decode("utf-8"))
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
     monkeypatch.setattr(app_module, "publish_file", fake_publish_file)
     monkeypatch.setattr(app_module, "_download_to", fake_download_to)
     monkeypatch.setattr(app_module, "save_log", fake_save_log)
     monkeypatch.setattr(app_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(app_module.subprocess, "Popen", DummyPopen)
 
     for directory in (app_module.PUBLIC_DIR, app_module.LOGS_DIR, app_module.WORK_DIR):
         if directory.exists():
@@ -230,7 +266,7 @@ def test_view_log_endpoint(patched_app):
         "/logs/view",
         query=urlencode({"path": "../outside.log"}),
     )
-    assert status == 400
+    assert status == 403
 
 
 def test_ffmpeg_page_includes_version_and_auto_refresh(patched_app):
@@ -284,6 +320,18 @@ def test_image_to_mp4_loop_as_json(patched_app):
     result = asyncio.run(patched_app.image_to_mp4_loop(upload, duration=5, as_json=True))
     assert result["ok"] is True
     assert result["file_url"].startswith("http://example.com/")
+
+
+def test_image_upload_rejects_oversized_file(patched_app):
+    big_payload = b"\x89PNG\r\n\x1a\n" + b"0" * (patched_app.MAX_FILE_SIZE_BYTES + 1)
+    upload = UploadFile(
+        file=io.BytesIO(big_payload),
+        filename="too-big.png",
+        headers=Headers({"content-type": "image/png"}),
+    )
+    with pytest.raises(patched_app.HTTPException) as exc:
+        asyncio.run(patched_app.image_to_mp4_loop(upload, duration=5, as_json=True))
+    assert exc.value.status_code == 413
 
 
 def test_compose_from_binaries_with_all_inputs(patched_app):
