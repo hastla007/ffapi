@@ -235,6 +235,20 @@ def test_downloads_page_lists_existing_files(patched_app):
     assert "example.txt" in html
 
 
+def test_downloads_page_escapes_special_characters(patched_app):
+    day_dir = patched_app.PUBLIC_DIR / "20240104"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    filename = "<img src=x onerror=alert('xss')>.mp4"
+    (day_dir / filename).write_text("attack", encoding="utf-8")
+
+    status, _, body = call_app(patched_app.app, "GET", "/downloads")
+    assert status == 200
+    html = body.decode()
+    assert "&lt;img src=x onerror=alert(&#x27;xss&#x27;)&gt;.mp4" in html
+    assert "onerror" in html
+    assert "<img" not in html.split("Generated Files", 1)[1]
+
+
 def test_download_to_clears_range_header_when_resume_not_supported(app_module, monkeypatch, tmp_path):
     dest = tmp_path / "asset.bin"
     dest.write_bytes(b"abcd")
@@ -358,6 +372,48 @@ def test_download_to_scales_timeout_and_disk_check(app_module, monkeypatch, tmp_
     assert disk_checks[-1] == 70
 
 
+def test_download_to_appends_when_resume_supported(app_module, monkeypatch, tmp_path):
+    dest = tmp_path / "resume.bin"
+    dest.write_bytes(b"old")
+
+    class HeadResponse:
+        headers = {"content-length": "6"}
+
+        def raise_for_status(self):
+            return None
+
+    class StreamResponse:
+        def __init__(self):
+            self.status_code = 206
+            self.headers = {"content-length": "3"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield b"new"
+
+    def fake_head(url, headers=None, timeout=None):
+        return HeadResponse()
+
+    def fake_get(url, headers=None, stream=True, timeout=None):
+        assert headers.get("Range") == "bytes=3-"
+        return StreamResponse()
+
+    monkeypatch.setattr(app_module.requests, "head", fake_head)
+    monkeypatch.setattr(app_module.requests, "get", fake_get)
+
+    app_module._download_to("https://example.com/resume.bin", dest, chunk_size=1024)
+
+    assert dest.read_bytes() == b"oldnew"
+
+
 def test_logs_page_lists_entries(patched_app):
     day_dir = patched_app.LOGS_DIR / "20240102"
     day_dir.mkdir(parents=True, exist_ok=True)
@@ -368,6 +424,19 @@ def test_logs_page_lists_entries(patched_app):
     html = body.decode()
     assert "20240102" in html
     assert "View" in html
+
+
+def test_logs_page_escapes_malicious_names(patched_app):
+    day_dir = patched_app.LOGS_DIR / "20240106"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    filename = "<<script>>.log"
+    (day_dir / filename).write_text("entry", encoding="utf-8")
+
+    status, _, body = call_app(patched_app.app, "GET", "/logs")
+    assert status == 200
+    html = body.decode()
+    assert "&lt;&lt;script&gt;&gt;.log" in html
+    assert "<<script" not in html
 
 
 def test_view_log_endpoint(patched_app):
@@ -394,7 +463,7 @@ def test_view_log_endpoint(patched_app):
 
 
 def test_ffmpeg_page_includes_version_and_auto_refresh(patched_app):
-    patched_app.APP_LOG_FILE.write_text("first line\nsecond line", encoding="utf-8")
+    patched_app.APP_LOG_FILE.write_text("<script>alert(1)</script>\nsecond line", encoding="utf-8")
 
     status, _, body = call_app(
         patched_app.app,
@@ -406,6 +475,7 @@ def test_ffmpeg_page_includes_version_and_auto_refresh(patched_app):
     html = body.decode()
     assert "ffmpeg version" in html
     assert "Auto-refreshing every 60 seconds" in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
 
 
 def test_documentation_page_loads(patched_app):
@@ -641,11 +711,35 @@ def test_run_ffmpeg_command_returns_outputs(patched_app):
     job = patched_app.RendiJob(
         input_files={"video": "https://example.com/input.mp4"},
         output_files={"out": "result.mp4"},
-        ffmpeg_command="-i {{video}} {{out}}",
+        ffmpeg_command="-i {{video}} -t 1 {{out}}",
     )
     result = patched_app.run_rendi(job)
     assert result["ok"] is True
     assert "out" in result["outputs"]
+
+
+def test_run_ffmpeg_command_rejects_dangerous_patterns(patched_app):
+    job = patched_app.RendiJob(
+        input_files={"video": "https://example.com/input.mp4"},
+        output_files={"out": "result.mp4"},
+        ffmpeg_command="-i {{video}} -f lavfi -t 1 {{out}}",
+    )
+    with pytest.raises(patched_app.HTTPException) as exc:
+        patched_app.run_rendi(job)
+    assert exc.value.status_code == 400
+    assert exc.value.detail["error"] == "forbidden_pattern"
+
+
+def test_run_ffmpeg_command_requires_duration_limit(patched_app):
+    job = patched_app.RendiJob(
+        input_files={"video": "https://example.com/input.mp4"},
+        output_files={"out": "result.mp4"},
+        ffmpeg_command="-i {{video}} {{out}}",
+    )
+    with pytest.raises(patched_app.HTTPException) as exc:
+        patched_app.run_rendi(job)
+    assert exc.value.status_code == 400
+    assert exc.value.detail["error"] == "missing_limit"
 
 
 def test_probe_from_urls_returns_json(patched_app):

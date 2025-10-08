@@ -1,4 +1,4 @@
-import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio
+import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -243,7 +243,11 @@ def run_ffmpeg_with_timeout(cmd: List[str], log_handle) -> int:
     try:
         return proc.wait(timeout=FFMPEG_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
         logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
         _flush_logs()
         raise HTTPException(status_code=504, detail="Processing timeout")
@@ -362,8 +366,15 @@ def downloads():
                 continue
             rel = f"/files/{day.name}/{f.name}"
             size_mb = f.stat().st_size / (1024*1024)
-            rows.append(f"<tr><td>{day.name}</td><td><a href='{rel}'>{f.name}</a></td><td>{size_mb:.2f} MB</td></tr>")
-    html = f"""
+            rows.append(
+                "<tr><td>{day}</td><td><a href='{href}'>{name}</a></td><td>{size:.2f} MB</td></tr>".format(
+                    day=html.escape(day.name),
+                    href=html.escape(rel, quote=True),
+                    name=html.escape(f.name),
+                    size=size_mb,
+                )
+            )
+    html_content = f"""
     <!doctype html>
     <html>
     <head>
@@ -398,7 +409,7 @@ def downloads():
     </body>
     </html>
     """
-    return HTMLResponse(html)
+    return HTMLResponse(html_content)
 
 
 @app.get("/logs", response_class=HTMLResponse)
@@ -414,8 +425,16 @@ def logs():
             # Extract operation name from filename
             parts = f.name.split("_")
             operation = parts[-1].replace(".log", "") if len(parts) > 3 else "unknown"
-            rows.append(f"<tr><td>{day.name}</td><td>{f.name}</td><td>{operation}</td><td>{size_kb:.1f} KB</td><td><a href='/logs/view?path={day.name}/{f.name}' target='_blank'>View</a></td></tr>")
-    html = f"""
+            rows.append(
+                "<tr><td>{day}</td><td>{name}</td><td>{op}</td><td>{size:.1f} KB</td><td><a href='/logs/view?path={path}' target='_blank'>View</a></td></tr>".format(
+                    day=html.escape(day.name),
+                    name=html.escape(f.name),
+                    op=html.escape(operation),
+                    size=size_kb,
+                    path=html.escape(f"{day.name}/{f.name}", quote=True),
+                )
+            )
+    html_content = f"""
     <!doctype html>
     <html>
     <head>
@@ -450,7 +469,7 @@ def logs():
     </body>
     </html>
     """
-    return HTMLResponse(html)
+    return HTMLResponse(html_content)
 
 
 @app.get("/logs/view", response_class=PlainTextResponse)
@@ -501,8 +520,12 @@ def ffmpeg_info(auto_refresh: int = 0):
     
     # Current time
     current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    
-    html = f"""
+
+    version_output_safe = html.escape(version_output)
+    app_logs_safe = html.escape(app_logs)
+    log_info_safe = html.escape(log_info)
+
+    html_content = f"""
     <!doctype html>
     <html>
     <head>
@@ -566,7 +589,7 @@ def ffmpeg_info(auto_refresh: int = 0):
       
       <div class="section">
         <h3>FFmpeg Version & Build</h3>
-        <pre>{version_output}</pre>
+        <pre>{version_output_safe}</pre>
       </div>
       
       <div class="section">
@@ -580,9 +603,9 @@ def ffmpeg_info(auto_refresh: int = 0):
           <span class="status {'active' if auto_refresh > 0 else ''}">{refresh_status}</span>
         </div>
         <div class="info">
-          Page loaded: {current_time} | {log_info}
+          Page loaded: {current_time} | {log_info_safe}
         </div>
-        <pre class="logs" id="logContainer">{app_logs}</pre>
+        <pre class="logs" id="logContainer">{app_logs_safe}</pre>
       </div>
     </body>
     <script>
@@ -596,7 +619,7 @@ def ffmpeg_info(auto_refresh: int = 0):
     </script>
     </html>
     """
-    return HTMLResponse(html)
+    return HTMLResponse(html_content)
 
 
 @app.get("/documentation", response_class=HTMLResponse)
@@ -832,7 +855,7 @@ def documentation():
 </div>
 """
     
-    html = f"""
+    html_content = f"""
     <!doctype html>
     <html>
     <head>
@@ -941,7 +964,7 @@ def documentation():
     </body>
     </html>
     """
-    return HTMLResponse(html)
+    return HTMLResponse(html_content)
 
 
 @app.get("/health")
@@ -1068,20 +1091,21 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
     dest.parent.mkdir(parents=True, exist_ok=True)
     check_disk_space(dest.parent)
 
-    resume_supported = True
+    force_restart = False
 
     for attempt in range(max_retries):
         try:
             req_hdr = dict(base_headers)
-
-            if not resume_supported and dest.exists():
+            if force_restart and dest.exists():
                 try:
                     dest.unlink()
                 except Exception as cleanup_exc:
                     logger.warning("Failed to reset partial download %s: %s", dest, cleanup_exc)
+                finally:
+                    force_restart = False
             existing_size = dest.stat().st_size if dest.exists() else 0
 
-            use_resume = resume_supported and existing_size > 0
+            use_resume = existing_size > 0
 
             if use_resume:
                 req_hdr['Range'] = f'bytes={existing_size}-'
@@ -1114,12 +1138,13 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
                     if r.status_code == 206:
                         # Server supports Range, we got partial content
                         logger.info(f"✓ Server supports resume for: {url}")
+                        mode = 'ab'
                     elif r.status_code == 200:
                         # Server doesn't support Range, gave us full file
                         logger.warning(f"⚠ Server doesn't support resume, downloading from start: {url}")
                         mode = 'wb'  # Switch to overwrite mode
                         existing_size = 0
-                        resume_supported = False
+                        force_restart = True
                     else:
                         mode = 'ab'
                 else:
@@ -1485,7 +1510,7 @@ def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
     if not video_urls:
         raise HTTPException(status_code=400, detail="No video URLs found in tracks")
     if primary_video_url is None:
-        raise HTTPException(status_code=400, detail="No valid video keyframes found")
+        raise HTTPException(status_code=400, detail="No valid video keyframes with URLs found in tracks")
     if max_dur <= 0:
         raise HTTPException(status_code=400, detail="At least one keyframe must include a duration")
 
@@ -1556,6 +1581,14 @@ def run_rendi(job: RendiJob):
             cmd_text = cmd_text.replace("{{" + k + "}}", p)
         for k, p in out_paths.items():
             cmd_text = cmd_text.replace("{{" + k + "}}", str(p))
+
+        cmd_lower = cmd_text.lower()
+        dangerous_patterns = ["-f lavfi", "-i /dev/", "-i file:", "-i concat:"]
+        for pattern in dangerous_patterns:
+            if pattern in cmd_lower:
+                raise HTTPException(status_code=400, detail={"error": "forbidden_pattern", "pattern": pattern})
+        if "-t" not in cmd_lower and "-frames" not in cmd_lower:
+            raise HTTPException(status_code=400, detail={"error": "missing_limit", "detail": "Command must include -t or -frames"})
 
         try:
             args = shlex.split(cmd_text)
