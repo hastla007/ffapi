@@ -1,8 +1,11 @@
 import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Dict, List, Optional, Literal
+
+import threading
 
 import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
@@ -38,8 +41,150 @@ UPLOAD_CHUNK_SIZE = 1024 * 1024
 PUBLIC_CLEANUP_INTERVAL_SECONDS = int(os.getenv("PUBLIC_CLEANUP_INTERVAL_SECONDS", "3600"))
 REQUIRE_DURATION_LIMIT = os.getenv("REQUIRE_DURATION_LIMIT", "false").lower() == "true"
 
+
+class MetricsTracker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._per_endpoint: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: {"success": 0, "failure": 0, "total_duration": 0.0}
+        )
+        self._error_counts: Counter[str] = Counter()
+        self._recent_outcomes: deque[bool] = deque(maxlen=100)
+        self._operation_history: deque[Dict[str, float]] = deque(maxlen=200)
+        self._current_requests = 0
+        self._max_queue_depth = 0
+        self._total_wait_time = 0.0
+        self._wait_samples = 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._per_endpoint.clear()
+            self._error_counts.clear()
+            self._recent_outcomes.clear()
+            self._operation_history.clear()
+            self._current_requests = 0
+            self._max_queue_depth = 0
+            self._total_wait_time = 0.0
+            self._wait_samples = 0
+
+    def request_started(self) -> None:
+        with self._lock:
+            self._current_requests += 1
+            if self._current_requests > self._max_queue_depth:
+                self._max_queue_depth = self._current_requests
+
+    def request_finished(
+        self,
+        path: str,
+        status_code: int,
+        duration: float,
+        wait_time: float,
+        error_key: Optional[str] = None,
+    ) -> None:
+        success = 200 <= status_code < 400
+        with self._lock:
+            stats = self._per_endpoint[path]
+            if success:
+                stats["success"] += 1
+            else:
+                stats["failure"] += 1
+            stats["total_duration"] += duration
+            self._recent_outcomes.append(success)
+            self._operation_history.append(
+                {
+                    "timestamp": time.time(),
+                    "path": path,
+                    "status": status_code,
+                    "duration": duration,
+                }
+            )
+            self._total_wait_time += max(wait_time, 0.0)
+            self._wait_samples += 1
+            if not success:
+                key = error_key or str(status_code)
+                self._error_counts[key] += 1
+
+    def request_completed(self) -> None:
+        with self._lock:
+            if self._current_requests > 0:
+                self._current_requests -= 1
+
+    def snapshot(self) -> Dict[str, object]:
+        with self._lock:
+            per_endpoint: Dict[str, Dict[str, object]] = {}
+            for path, stats in self._per_endpoint.items():
+                total_calls = stats["success"] + stats["failure"]
+                avg_duration = (
+                    stats["total_duration"] / total_calls if total_calls else 0.0
+                )
+                success_rate = (
+                    stats["success"] / total_calls if total_calls else 0.0
+                )
+                per_endpoint[path] = {
+                    "success": int(stats["success"]),
+                    "failure": int(stats["failure"]),
+                    "total": int(total_calls),
+                    "avg_duration_ms": avg_duration * 1000.0,
+                    "success_rate": success_rate,
+                }
+
+            total_recent = len(self._recent_outcomes)
+            recent_successes = sum(1 for outcome in self._recent_outcomes if outcome)
+            queue_avg_wait = (
+                (self._total_wait_time / self._wait_samples)
+                if self._wait_samples
+                else 0.0
+            )
+
+            return {
+                "per_endpoint": per_endpoint,
+                "errors": dict(self._error_counts),
+                "queue": {
+                    "current": self._current_requests,
+                    "max": self._max_queue_depth,
+                    "avg_wait_ms": queue_avg_wait * 1000.0,
+                },
+                "recent": {
+                    "window": total_recent,
+                    "successes": recent_successes,
+                    "failures": total_recent - recent_successes,
+                    "success_rate": (
+                        recent_successes / total_recent if total_recent else None
+                    ),
+                },
+                "history": list(self._operation_history),
+            }
+
+
+METRICS = MetricsTracker()
+
 # Mount static /files
 app.mount("/files", StaticFiles(directory=str(PUBLIC_DIR)), name="files")
+
+
+@app.middleware("http")
+async def metrics_middleware(request, call_next):
+    path = request.url.path
+    arrival = time.perf_counter()
+    METRICS.request_started()
+    processing_start = time.perf_counter()
+    wait_time = processing_start - arrival
+    try:
+        response = await call_next(request)
+        duration = time.perf_counter() - processing_start
+        METRICS.request_finished(path, response.status_code, duration, wait_time)
+        return response
+    except HTTPException as exc:
+        duration = time.perf_counter() - processing_start
+        detail = exc.detail if isinstance(exc.detail, str) else exc.__class__.__name__
+        METRICS.request_finished(path, exc.status_code, duration, wait_time, detail)
+        raise
+    except Exception as exc:
+        duration = time.perf_counter() - processing_start
+        METRICS.request_finished(path, 500, duration, wait_time, exc.__class__.__name__)
+        raise
+    finally:
+        METRICS.request_completed()
 
 
 # Setup logging to file
@@ -171,6 +316,84 @@ def check_disk_space(path: Path, required_mb: int = MIN_FREE_SPACE_MB) -> None:
         )
         _flush_logs()
         raise HTTPException(status_code=507, detail="Insufficient disk space")
+
+
+def disk_snapshot() -> Dict[str, Dict[str, float]]:
+    snapshot: Dict[str, Dict[str, float]] = {}
+    targets = {
+        "public": PUBLIC_DIR,
+        "work": WORK_DIR,
+        "logs": LOGS_DIR,
+    }
+    for name, target in targets.items():
+        try:
+            usage = shutil.disk_usage(target)
+            snapshot[name] = {
+                "total_mb": usage.total / (1024 * 1024),
+                "used_mb": usage.used / (1024 * 1024),
+                "available_mb": usage.free / (1024 * 1024),
+            }
+        except FileNotFoundError:
+            snapshot[name] = {"error": "not_found"}
+        except Exception as exc:
+            snapshot[name] = {"error": str(exc)}
+    return snapshot
+
+
+def memory_snapshot() -> Dict[str, Optional[float]]:
+    rss_bytes: Optional[float] = None
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        rss_bytes = float(usage.ru_maxrss)
+        if sys.platform != "darwin":
+            rss_bytes *= 1024.0
+    except Exception:
+        rss_bytes = None
+
+    total_bytes: Optional[float] = None
+    available_bytes: Optional[float] = None
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            values = {}
+            for line in handle:
+                if ":" not in line:
+                    continue
+                key, rest = line.split(":", 1)
+                values[key.strip()] = rest.strip()
+        if "MemTotal" in values:
+            total_bytes = float(values["MemTotal"].split()[0]) * 1024.0
+        if "MemAvailable" in values:
+            available_bytes = float(values["MemAvailable"].split()[0]) * 1024.0
+        elif "MemFree" in values:
+            available_bytes = float(values["MemFree"].split()[0]) * 1024.0
+    except Exception:
+        pass
+
+    def to_mb(value: Optional[float]) -> Optional[float]:
+        return (value / (1024.0 * 1024.0)) if value is not None else None
+
+    return {
+        "rss_mb": to_mb(rss_bytes),
+        "total_mb": to_mb(total_bytes),
+        "available_mb": to_mb(available_bytes),
+    }
+
+
+def ffmpeg_snapshot() -> Dict[str, Optional[str]]:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True, text=True, timeout=5
+        )
+        available = result.returncode == 0
+        version_line = (result.stdout or "").splitlines()[0] if available else ""
+        error = None if available else (result.stderr or "Unknown failure")
+    except Exception as exc:
+        available = False
+        version_line = ""
+        error = str(exc)
+    return {"available": available, "version": version_line, "error": error}
 
 
 def safe_path_check(base: Path, rel: str) -> Path:
@@ -400,6 +623,7 @@ def downloads():
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
+        <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
       </nav>
       <h2>Generated Files</h2>
@@ -460,6 +684,7 @@ def logs():
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
+        <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
       </nav>
       <h2>FFmpeg Logs</h2>
@@ -584,6 +809,7 @@ def ffmpeg_info(auto_refresh: int = 0):
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
+        <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
       </nav>
       <h2>FFmpeg & Container Information</h2>
@@ -681,9 +907,16 @@ def documentation():
 <div class="endpoint">
   <div class="method get">GET</div>
   <div class="path">/health</div>
-  <div class="desc">Health check endpoint</div>
-  <div class="response">Returns: {"ok": true}</div>
+  <div class="desc">Health check endpoint with disk, memory, FFmpeg, and operation metrics</div>
+  <div class="response">Returns: {"ok": true, "disk": {...}, "memory": {...}, "ffmpeg": {...}, "operations": {...}}</div>
   <div class="example">Example:<br>curl http://localhost:3000/health</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/metrics</div>
+  <div class="desc">Operational metrics dashboard (HTML page)</div>
+  <div class="example">Example:<br>curl http://localhost:3000/metrics</div>
 </div>
 
 <div class="endpoint">
@@ -950,6 +1183,7 @@ def documentation():
         <a href="/downloads">Downloads</a>
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
+        <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
       </nav>
       <h2>FFAPI Ultimate - API Documentation</h2>
@@ -971,7 +1205,146 @@ def documentation():
 @app.get("/health")
 def health():
     logger.info("Health check requested")
-    return {"ok": True}
+    disk = disk_snapshot()
+    memory = memory_snapshot()
+    ffmpeg_info = ffmpeg_snapshot()
+    metrics_data = METRICS.snapshot()
+
+    disk_ok = True
+    for info in disk.values():
+        if "error" in info:
+            disk_ok = False
+            break
+        if info.get("available_mb", 0) < MIN_FREE_SPACE_MB:
+            disk_ok = False
+            break
+
+    overall_ok = ffmpeg_info.get("available", False) and disk_ok
+
+    return {
+        "ok": overall_ok,
+        "disk": disk,
+        "memory": memory,
+        "ffmpeg": ffmpeg_info,
+        "operations": {
+            "recent_success_rate": metrics_data["recent"],
+            "queue": metrics_data["queue"],
+            "error_counts": metrics_data["errors"],
+        },
+    }
+
+
+@app.get("/metrics", response_class=HTMLResponse)
+def metrics_dashboard():
+    snapshot = METRICS.snapshot()
+    endpoints_html = []
+    for path, stats in sorted(snapshot["per_endpoint"].items()):
+        success_rate = stats.get("success_rate", 0.0) * 100.0
+        endpoints_html.append(
+            "<tr><td>{path}</td><td>{success}</td><td>{failure}</td><td>{avg:.2f} ms</td><td>{rate:.1f}%</td></tr>".format(
+                path=html.escape(path),
+                success=int(stats.get("success", 0)),
+                failure=int(stats.get("failure", 0)),
+                avg=stats.get("avg_duration_ms", 0.0),
+                rate=success_rate,
+            )
+        )
+
+    if not endpoints_html:
+        endpoints_html.append(
+            "<tr><td colspan='5'>No requests recorded yet</td></tr>"
+        )
+
+    errors_html = []
+    for name, count in sorted(snapshot["errors"].items(), key=lambda item: item[0]):
+        errors_html.append(
+            "<tr><td>{name}</td><td>{count}</td></tr>".format(
+                name=html.escape(name), count=int(count)
+            )
+        )
+    if not errors_html:
+        errors_html.append("<tr><td colspan='2'>No errors recorded</td></tr>")
+
+    queue = snapshot["queue"]
+    recent = snapshot["recent"]
+    recent_rate = recent.get("success_rate")
+    recent_summary = (
+        f"{recent.get('successes', 0)} / {recent.get('window', 0)}"
+        if recent_rate is not None
+        else "No recent activity"
+    )
+    recent_percent = f"{recent_rate * 100.0:.1f}%" if recent_rate is not None else "-"
+
+    html_content = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>Operational Metrics</title>
+      <style>
+        body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .brand .ff {{ color: #28a745; }}
+        .brand .api {{ color: #000; }}
+        table {{ border-collapse: collapse; width: 100%; margin-bottom: 30px; }}
+        th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
+        th {{ text-align: left; background: #fafafa; }}
+        nav {{ margin-bottom: 20px; }}
+        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        .cards {{ display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 30px; }}
+        .card {{
+          flex: 1 1 240px;
+          background: #f7f9fc;
+          border-radius: 8px;
+          padding: 16px;
+          box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+        }}
+        .card h3 {{ margin-top: 0; font-size: 16px; color: #333; }}
+        .card p {{ margin: 6px 0; color: #555; font-size: 14px; }}
+      </style>
+    </head>
+    <body>
+      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
+      <nav>
+        <a href="/downloads">Downloads</a>
+        <a href="/logs">Logs</a>
+        <a href="/ffmpeg">FFmpeg Info</a>
+        <a href="/metrics">Metrics</a>
+        <a href="/documentation">API Docs</a>
+      </nav>
+
+      <div class="cards">
+        <div class="card">
+          <h3>Queue Depth</h3>
+          <p><strong>Current:</strong> {queue.get('current', 0)}</p>
+          <p><strong>Max Observed:</strong> {queue.get('max', 0)}</p>
+          <p><strong>Avg Wait:</strong> {queue.get('avg_wait_ms', 0.0):.2f} ms</p>
+        </div>
+        <div class="card">
+          <h3>Recent Success Rate</h3>
+          <p><strong>Window:</strong> {recent.get('window', 0)} operations</p>
+          <p><strong>Successful:</strong> {recent_summary}</p>
+          <p><strong>Rate:</strong> {recent_percent}</p>
+        </div>
+      </div>
+
+      <h2>Endpoint Performance</h2>
+      <table>
+        <thead>
+          <tr><th>Endpoint</th><th>Success</th><th>Failure</th><th>Avg Duration</th><th>Success %</th></tr>
+        </thead>
+        <tbody>{''.join(endpoints_html)}</tbody>
+      </table>
+
+      <h2>Error Frequency</h2>
+      <table>
+        <thead><tr><th>Error</th><th>Count</th></tr></thead>
+        <tbody>{''.join(errors_html)}</tbody>
+      </table>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html_content)
 
 
 # ---------- models ----------

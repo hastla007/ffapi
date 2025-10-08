@@ -215,6 +215,8 @@ def patched_app(app_module, monkeypatch, tmp_path):
             shutil.rmtree(directory)
         directory.mkdir(parents=True, exist_ok=True)
 
+    app_module.METRICS.reset()
+
     return app_module
 
 
@@ -607,9 +609,29 @@ def test_documentation_page_loads(patched_app):
 
 
 def test_health_endpoint(patched_app):
+    # Prime metrics with a request so the tracker has data
+    call_app(patched_app.app, "GET", "/downloads")
+
     status, _, body = call_app(patched_app.app, "GET", "/health")
     assert status == 200
-    assert json.loads(body.decode()) == {"ok": True}
+    payload = json.loads(body.decode())
+    assert payload["ok"] is True
+    assert "disk" in payload and "public" in payload["disk"]
+    assert payload["ffmpeg"]["available"] is True
+    assert "recent_success_rate" in payload["operations"]
+    assert payload["operations"]["recent_success_rate"]["successes"] >= 0
+
+
+def test_metrics_dashboard_reports_activity(patched_app):
+    call_app(patched_app.app, "GET", "/downloads")
+    call_app(patched_app.app, "GET", "/logs")
+
+    status, _, body = call_app(patched_app.app, "GET", "/metrics")
+    assert status == 200
+    html = body.decode()
+    assert "Operational Metrics" in html
+    assert "/downloads" in html
+    assert "Recent Success Rate" in html
 
 
 def test_static_file_serving(patched_app):
