@@ -266,6 +266,7 @@ def app_module(tmp_path_factory: pytest.TempPathFactory):
     if module_name in sys.modules:
         del sys.modules[module_name]
     module = importlib.import_module(module_name)
+    module._FFMPEG_VERSION_CACHE = None
     module.UI_AUTH.reset()
     module.csrf_protect.validate_csrf = lambda submitted, cookie: None
     return module
@@ -389,6 +390,7 @@ def patched_app(app_module, monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "save_log", fake_save_log)
     monkeypatch.setattr(app_module.subprocess, "run", fake_run)
     monkeypatch.setattr(app_module.subprocess, "Popen", DummyPopen)
+    app_module._FFMPEG_VERSION_CACHE = None
 
     for directory in (app_module.PUBLIC_DIR, app_module.LOGS_DIR, app_module.WORK_DIR):
         if directory.exists():

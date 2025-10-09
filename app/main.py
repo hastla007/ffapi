@@ -221,6 +221,8 @@ PUBLIC_CLEANUP_INTERVAL_SECONDS = settings.PUBLIC_CLEANUP_INTERVAL_SECONDS
 REQUIRE_DURATION_LIMIT = settings.REQUIRE_DURATION_LIMIT
 RATE_LIMITER = RateLimiter(settings.RATE_LIMIT_REQUESTS_PER_MINUTE)
 
+_FFMPEG_VERSION_CACHE: Optional[Dict[str, Optional[str]]] = None
+
 JOBS: Dict[str, Dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
 
@@ -972,7 +974,7 @@ def render_settings_page(
               <form method=\"post\" action=\"/settings/two-factor\">
                 {csrf_field}
                 <input type=\"hidden\" name=\"action\" value=\"disable\" />
-                <button type=\"submit\" class=\"secondary\"{two_factor_disabled_attr}>Disable two-factor</button>
+                <button type=\"submit\" class=\"secondary\" onclick=\"return confirm('Disable two-factor authentication?')\"{two_factor_disabled_attr}>Disable two-factor</button>
               </form>
               <form method=\"post\" action=\"/settings/two-factor\">
                 {csrf_field}
@@ -1098,7 +1100,14 @@ def render_settings_page(
         .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
         .field-card {{ background: #f9fbff; padding: 12px; border-radius: 8px; box-shadow: inset 0 0 0 1px #d6e2f1; display: grid; gap: 8px; }}
         .retention-form button, .performance-form button {{ margin-top: 16px; }}
-        .field-card label {{ margin-bottom: 0; }}
+        .field-card label {{ margin-bottom: 0; display: flex; align-items: center; gap: 6px; }}
+        .tooltip {{ position: relative; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; background: #e2e8f0; color: #1e293b; font-size: 12px; font-weight: 600; cursor: help; }}
+        .tooltip:focus-visible {{ outline: 2px solid #2563eb; outline-offset: 2px; }}
+        .tooltip .tooltiptext {{ visibility: hidden; opacity: 0; width: 220px; background: #1e293b; color: #f8fafc; text-align: left; border-radius: 6px; padding: 8px 10px; position: absolute; z-index: 10; bottom: 125%; left: 50%; transform: translateX(-50%); transition: opacity 0.2s ease-in-out; box-shadow: 0 8px 16px rgba(15, 23, 42, 0.25); }}
+        .tooltip:hover .tooltiptext, .tooltip:focus .tooltiptext {{ visibility: visible; opacity: 1; }}
+        #processingIndicator {{ display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.35); color: #f8fafc; font-size: 16px; font-weight: 600; align-items: center; justify-content: center; z-index: 9999; gap: 8px; }}
+        #processingIndicator .spinner {{ width: 18px; height: 18px; border-radius: 50%; border: 2px solid rgba(248, 250, 252, 0.45); border-top-color: #f8fafc; animation: spin 0.8s linear infinite; }}
+        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
       </style>
     </head>
     <body>
@@ -1180,7 +1189,11 @@ def render_settings_page(
         <h2>Retention Settings</h2>
         <form method="post" action="/settings/retention" class="retention-form">
           {csrf_field}
-          <label for="retention_hours">Default retention (hours)</label>
+          <label for="retention_hours">Default retention (hours)
+            <span class="tooltip" tabindex="0">?
+              <span class="tooltiptext">Hours files remain available before cleanup runs.</span>
+            </span>
+          </label>
           <input
               id="retention_hours"
               name="retention_hours"
@@ -1229,7 +1242,11 @@ def render_settings_page(
             {csrf_field}
             <div class="form-grid">
               <div class="field-card">
-                <label for="rate_limit_rpm">Rate limit (requests/minute)</label>
+                <label for="rate_limit_rpm">Rate limit (requests/minute)
+                  <span class="tooltip" tabindex="0">?
+                    <span class="tooltiptext">Maximum requests per client IP per minute.</span>
+                  </span>
+                </label>
                 <input
                   id="rate_limit_rpm"
                   name="rate_limit_rpm"
@@ -1243,7 +1260,11 @@ def render_settings_page(
                 <span class="help-text">Requests allowed per minute.</span>
               </div>
               <div class="field-card">
-                <label for="ffmpeg_timeout_minutes">FFmpeg timeout (minutes)</label>
+                <label for="ffmpeg_timeout_minutes">FFmpeg timeout (minutes)
+                  <span class="tooltip" tabindex="0">?
+                    <span class="tooltiptext">Terminate jobs exceeding this processing time.</span>
+                  </span>
+                </label>
                 <input
                   id="ffmpeg_timeout_minutes"
                   name="ffmpeg_timeout_minutes"
@@ -1257,7 +1278,11 @@ def render_settings_page(
                 <span class="help-text">Maximum processing duration.</span>
               </div>
               <div class="field-card">
-                <label for="upload_chunk_mb">Upload chunk size (MB)</label>
+                <label for="upload_chunk_mb">Upload chunk size (MB)
+                  <span class="tooltip" tabindex="0">?
+                    <span class="tooltiptext">Size of each streamed upload chunk.</span>
+                  </span>
+                </label>
                 <input
                   id="upload_chunk_mb"
                   name="upload_chunk_mb"
@@ -1271,7 +1296,11 @@ def render_settings_page(
                 <span class="help-text">Per-stream read buffer.</span>
               </div>
               <div class="field-card">
-                <label for="max_file_size_mb">File size limit (MB)</label>
+                <label for="max_file_size_mb">File size limit (MB)
+                  <span class="tooltip" tabindex="0">?
+                    <span class="tooltiptext">Largest upload accepted by the server.</span>
+                  </span>
+                </label>
                 <input
                   id="max_file_size_mb"
                   name="max_file_size_mb"
@@ -1289,9 +1318,10 @@ def render_settings_page(
           </form>
         </section>
       </div>
+      <div id="processingIndicator">Processing... <span class="spinner"></span></div>
       <script>
-        function downloadBackupCodes() {{
-          const codes = Array.from(document.querySelectorAll('.backup-list code')).map(function(el) {{
+        window.downloadBackupCodes = function downloadBackupCodes() {{
+          const codes = Array.from(document.querySelectorAll('.backup-list code')).map(function (el) {{
             return el.textContent;
           }});
           if (!codes.length) {{
@@ -1307,7 +1337,32 @@ def render_settings_page(
           link.click();
           document.body.removeChild(link);
           URL.revokeObjectURL(url);
-        }}
+        }};
+
+        document.addEventListener('DOMContentLoaded', function () {{
+          const indicator = document.getElementById('processingIndicator');
+          if (indicator) {{
+            document.querySelectorAll('form').forEach(function (form) {{
+              form.addEventListener('submit', function () {{
+                indicator.style.display = 'flex';
+              }});
+            }});
+          }}
+
+          document.querySelectorAll('input[type="file"]').forEach(function (input) {{
+            input.addEventListener('change', function (event) {{
+              const file = event.target.files && event.target.files[0];
+              if (!file) {{
+                return;
+              }}
+              const maxSize = 1024 * 1024 * 1024; // 1GB
+              if (file.size > maxSize) {{
+                alert('File too large');
+                event.target.value = '';
+              }}
+            }});
+          }});
+        }});
       </script>
     </body>
     </html>
@@ -1365,7 +1420,7 @@ def render_api_keys_page(
                 <form method="post" action="/api-keys/revoke">
                   {csrf_field}
                   <input type="hidden" name="key_id" value="{key_id}" />
-                  <button type="submit" class="secondary"{disabled}>Revoke</button>
+                  <button type="submit" class="secondary" onclick="return confirm('Are you sure you want to revoke this API key?')"{disabled}>Revoke</button>
                 </form>
               </td>
             </tr>
@@ -1440,6 +1495,9 @@ def render_api_keys_page(
         th, td {{ padding: 10px 12px; border-bottom: 1px solid #e5edf6; font-size: 14px; text-align: left; }}
         th {{ color: #1f2937; }}
         code {{ background: #0f172a; color: #e2e8f0; padding: 6px 10px; border-radius: 4px; display: inline-block; font-size: 13px; }}
+        #processingIndicator {{ display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.35); color: #f8fafc; font-size: 16px; font-weight: 600; align-items: center; justify-content: center; z-index: 9999; gap: 8px; }}
+        #processingIndicator .spinner {{ width: 18px; height: 18px; border-radius: 50%; border: 2px solid rgba(248, 250, 252, 0.45); border-top-color: #f8fafc; animation: spin 0.8s linear infinite; }}
+        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
       </style>
     </head>
     <body>
@@ -1478,6 +1536,33 @@ def render_api_keys_page(
           </table>
         </div>
       </section>
+      <div id="processingIndicator">Processing... <span class="spinner"></span></div>
+      <script>
+        document.addEventListener('DOMContentLoaded', function () {{
+          const indicator = document.getElementById('processingIndicator');
+          if (indicator) {{
+            document.querySelectorAll('form').forEach(function (form) {{
+              form.addEventListener('submit', function () {{
+                indicator.style.display = 'flex';
+              }});
+            }});
+          }}
+
+          document.querySelectorAll('input[type="file"]').forEach(function (input) {{
+            input.addEventListener('change', function (event) {{
+              const file = event.target.files && event.target.files[0];
+              if (!file) {{
+                return;
+              }}
+              const maxSize = 1024 * 1024 * 1024; // 1GB
+              if (file.size > maxSize) {{
+                alert('File too large');
+                event.target.value = '';
+              }}
+            }});
+          }});
+        }});
+      </script>
     </body>
     </html>
     """
@@ -1967,6 +2052,9 @@ def memory_snapshot() -> Dict[str, Optional[float]]:
 
 
 def ffmpeg_snapshot() -> Dict[str, Optional[str]]:
+    global _FFMPEG_VERSION_CACHE
+    if _FFMPEG_VERSION_CACHE is not None:
+        return dict(_FFMPEG_VERSION_CACHE)
     try:
         result = subprocess.run(
             ["ffmpeg", "-version"], capture_output=True, text=True, timeout=5
@@ -1978,7 +2066,9 @@ def ffmpeg_snapshot() -> Dict[str, Optional[str]]:
         available = False
         version_line = ""
         error = str(exc)
-    return {"available": available, "version": version_line, "error": error}
+    snapshot = {"available": available, "version": version_line, "error": error}
+    _FFMPEG_VERSION_CACHE = dict(snapshot)
+    return snapshot
 
 
 def safe_path_check(base: Path, rel: str) -> Path:
@@ -2134,21 +2224,26 @@ def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
         return None
     return thumb_path
 
-def cleanup_old_public(days: Optional[float] = None) -> None:
+def cleanup_old_public(days: Optional[float] = None, *, batch_size: Optional[int] = None) -> None:
     """Delete files older than specified days based on actual file modification time."""
     retention_days = RETENTION_DAYS if days is None else days
     if retention_days <= 0:
         return
     cutoff_timestamp = time.time() - (retention_days * 86400)
-    
+
+    remaining = None if batch_size is None or batch_size <= 0 else int(batch_size)
     deleted_count = 0
     for child in PUBLIC_DIR.iterdir():
+        if remaining is not None and remaining <= 0:
+            break
         if not child.is_dir():
             continue
 
         files_to_delete: List[Path] = []
         try:
             for file_path in child.iterdir():
+                if remaining is not None and remaining <= 0:
+                    break
                 if not file_path.is_file():
                     continue
                 try:
@@ -2165,8 +2260,14 @@ def cleanup_old_public(days: Optional[float] = None) -> None:
             try:
                 fp.unlink()
                 deleted_count += 1
+                if remaining is not None:
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
             except Exception as exc:
                 logger.warning("Failed to delete expired file %s: %s", fp, exc)
+        if remaining is not None and remaining <= 0:
+            break
 
         try:
             if not any(child.iterdir()):
@@ -2189,7 +2290,7 @@ async def _periodic_public_cleanup():
         raise
     while True:
         try:
-            cleanup_old_public()
+            cleanup_old_public(batch_size=100)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
