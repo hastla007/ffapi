@@ -1,11 +1,11 @@
-import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit, hmac, hashlib, secrets, base64, struct
+import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit, hmac, hashlib, secrets, base64, struct, math
 from collections import Counter, defaultdict, deque
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal, Tuple
 from urllib.parse import urlencode, quote, parse_qs
 from uuid import uuid4
 
@@ -92,6 +92,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl, field_validator
 
 from fastapi_csrf_protect import CsrfProtect, CsrfProtectException
+try:  # pragma: no cover - optional dependency for QR generation
+    import qrcode  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - environments without qrcode
+    qrcode = None  # type: ignore[assignment]
 
 app = FastAPI()
 
@@ -227,6 +231,12 @@ SESSION_TTL_SECONDS = 3600
 TOTP_STEP_SECONDS = 30
 TOTP_DIGITS = 6
 TOTP_RATE_LIMIT = 5
+BACKUP_CODE_LENGTH = 10
+BACKUP_CODE_GROUP_SIZE = 5
+BACKUP_CODE_COUNT = 10
+VIDEO_THUMBNAIL_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+THUMBNAIL_DIR_NAME = "thumbnails"
+JOB_HISTORY_LIMIT = 20
 
 
 def _generate_totp_secret(length: int = 20) -> str:
@@ -272,6 +282,29 @@ def verify_totp_code(secret: str, code: str, window: int = 1) -> bool:
     return False
 
 
+_QR_PLACEHOLDER_PNG = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg=="
+)
+
+
+def build_totp_qr_data_uri(otpauth_uri: str) -> Optional[str]:
+    if not otpauth_uri:
+        return None
+    if qrcode is None:
+        return f"data:image/png;base64,{_QR_PLACEHOLDER_PNG}"
+    try:
+        qr = qrcode.QRCode(version=1, box_size=4, border=2)
+        qr.add_data(otpauth_uri)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+    except Exception:
+        return f"data:image/png;base64,{_QR_PLACEHOLDER_PNG}"
+
+
 class CsrfSettings(BaseModel):
     secret_key: str = os.getenv("CSRF_SECRET_KEY", secrets.token_urlsafe(32))
     cookie_name: str = os.getenv("CSRF_COOKIE_NAME", "csrftoken")
@@ -301,6 +334,8 @@ class UIAuthManager:
         self.two_factor_enabled = False
         self._totp_secret = _generate_totp_secret()
         self._totp_attempts: Dict[str, List[float]] = {}
+        self._backup_codes: Dict[str, Dict[str, Any]] = {}
+        self._pending_backup_codes: List[str] = []
 
     def _hash(self, password: str) -> str:
         if bcrypt is not None:
@@ -309,6 +344,10 @@ class UIAuthManager:
             return f"bcrypt${hashed.decode('utf-8')}"
         digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
         return f"sha256${digest}"
+
+    def _clear_backup_codes_locked(self) -> None:
+        self._backup_codes.clear()
+        self._pending_backup_codes = []
 
     def reset(self) -> None:
         with self._lock:
@@ -319,6 +358,7 @@ class UIAuthManager:
             self.two_factor_enabled = False
             self._totp_secret = _generate_totp_secret()
             self._totp_attempts.clear()
+            self._clear_backup_codes_locked()
 
     def set_require_login(self, enabled: bool) -> None:
         with self._lock:
@@ -326,6 +366,7 @@ class UIAuthManager:
             if not enabled:
                 self._sessions.clear()
                 self._totp_attempts.clear()
+                self._clear_backup_codes_locked()
 
     def set_credentials(self, username: str, password: str) -> None:
         username = username.strip()
@@ -343,6 +384,7 @@ class UIAuthManager:
             self.two_factor_enabled = False
             self._totp_secret = _generate_totp_secret()
             self._totp_attempts.clear()
+            self._clear_backup_codes_locked()
 
     def verify(self, username: str, password: str) -> bool:
         with self._lock:
@@ -412,6 +454,7 @@ class UIAuthManager:
             if not enabled:
                 self._sessions.clear()
                 self._totp_attempts.clear()
+                self._clear_backup_codes_locked()
 
     def regenerate_two_factor_secret(self) -> str:
         secret = _generate_totp_secret()
@@ -420,11 +463,78 @@ class UIAuthManager:
             self.two_factor_enabled = False
             self._sessions.clear()
             self._totp_attempts.clear()
+            self._clear_backup_codes_locked()
         return secret
 
     def is_two_factor_enabled(self) -> bool:
         with self._lock:
             return self.two_factor_enabled
+
+    def _normalize_backup_code(self, code: str) -> Optional[str]:
+        cleaned = "".join(ch for ch in code.upper() if ch.isalnum())
+        if len(cleaned) != BACKUP_CODE_LENGTH:
+            return None
+        return cleaned
+
+    def _hash_backup_code(self, normalized: str) -> str:
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def generate_backup_codes(self, count: int = BACKUP_CODE_COUNT) -> List[str]:
+        alphabet = string.ascii_uppercase + string.digits
+        new_codes: Dict[str, Dict[str, Any]] = {}
+        plain_codes: List[str] = []
+        for _ in range(count):
+            normalized = "".join(secrets.choice(alphabet) for _ in range(BACKUP_CODE_LENGTH))
+            chunks = [
+                normalized[i : i + BACKUP_CODE_GROUP_SIZE]
+                for i in range(0, BACKUP_CODE_LENGTH, BACKUP_CODE_GROUP_SIZE)
+            ]
+            display = "-".join(chunks)
+            hashed = self._hash_backup_code(normalized)
+            new_codes[hashed] = {"used": False, "last_four": normalized[-4:]}
+            plain_codes.append(display)
+        with self._lock:
+            self._backup_codes = new_codes
+            self._pending_backup_codes = list(plain_codes)
+        return plain_codes
+
+    def verify_backup_code(self, code: str) -> bool:
+        normalized = self._normalize_backup_code(code)
+        if not normalized:
+            return False
+        hashed = self._hash_backup_code(normalized)
+        with self._lock:
+            entry = self._backup_codes.get(hashed)
+            if not entry or entry["used"]:
+                return False
+            entry["used"] = True
+            self._backup_codes[hashed] = entry
+            self._totp_attempts.pop(self.username, None)
+        return True
+
+    def pop_pending_backup_codes(self) -> List[str]:
+        with self._lock:
+            pending = list(self._pending_backup_codes)
+            self._pending_backup_codes = []
+        return pending
+
+    def get_backup_code_status(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                {"last_four": entry["last_four"], "used": entry["used"]}
+                for entry in self._backup_codes.values()
+            ]
+
+    def verify_second_factor(self, totp_code: str = "", backup_code: str = "") -> bool:
+        totp_code = totp_code.strip()
+        backup_code = backup_code.strip()
+        if totp_code and self.verify_totp(totp_code):
+            return True
+        if backup_code and self.verify_backup_code(backup_code):
+            return True
+        if totp_code and not backup_code:
+            return self.verify_backup_code(totp_code)
+        return False
 
     def verify_totp(self, code: str) -> bool:
         username = self.get_username()
@@ -660,7 +770,10 @@ def render_login_page(next_path: str, csrf_token: str, error: Optional[str] = No
     if require_code:
         code_field = """
         <label for=\"totp\">Authentication code</label>
-        <input id=\"totp\" name=\"totp\" type=\"text\" inputmode=\"numeric\" pattern=\"\\d*\" autocomplete=\"one-time-code\" required />
+        <input id=\"totp\" name=\"totp\" type=\"text\" inputmode=\"numeric\" pattern=\"\\d*\" autocomplete=\"one-time-code\" />
+        <label for=\"backup_code\">Backup code (optional)</label>
+        <input id=\"backup_code\" name=\"backup_code\" type=\"text\" autocomplete=\"one-time-code\" placeholder=\"ABCDE-12345\" />
+        <p class=\"help-text\">Enter a 6-digit authenticator code or one of your backup codes.</p>
         """
     csrf_field = csrf_hidden_input(csrf_token)
     return f"""
@@ -682,6 +795,7 @@ def render_login_page(next_path: str, csrf_token: str, error: Optional[str] = No
         .alert {{ padding: 10px; border-radius: 4px; font-size: 14px; margin-bottom: 16px; }}
         .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
         .help {{ font-size: 13px; color: #555; text-align: center; margin-top: 12px; }}
+        .help-text {{ font-size: 13px; color: #4b5563; margin-top: -4px; }}
       </style>
     </head>
     <body>
@@ -710,6 +824,8 @@ def render_settings_page(
     *,
     authenticated: bool,
     csrf_token: str,
+    backup_codes: Optional[List[str]] = None,
+    backup_status: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     total_used_mb = storage["total_bytes"] / (1024 * 1024) if storage["total_bytes"] else 0.0
     active_files = storage["active_files"]
@@ -721,6 +837,21 @@ def render_settings_page(
         alert_blocks.append(f"<div class=\"alert success\">{html.escape(message)}</div>")
     if error:
         alert_blocks.append(f"<div class=\"alert error\">{html.escape(error)}</div>")
+    backup_codes = backup_codes or []
+    backup_status = backup_status or []
+    if backup_codes:
+        code_items = "".join(
+            f"<li><code>{html.escape(code)}</code></li>" for code in backup_codes
+        )
+        alert_blocks.append(
+            """
+            <div class="alert info">
+              <strong>Backup codes generated.</strong>
+              <p>Store these codes in a safe place. Each code can be used once if you lose access to your authenticator app.</p>
+              <ul class="backup-list">{items}</ul>
+            </div>
+            """.format(items=code_items)
+        )
     alerts = "".join(alert_blocks)
     require_login = UI_AUTH.require_login
     status_text = "Enabled" if require_login else "Disabled"
@@ -794,10 +925,44 @@ def render_settings_page(
         secret_raw[i : i + 4] for i in range(0, len(secret_raw), 4)
     )
     secret_display = html.escape(grouped_secret)
-    otpauth_uri = html.escape(UI_AUTH.get_otpauth_uri(), quote=True)
+    otpauth_uri_value = UI_AUTH.get_otpauth_uri()
+    otpauth_uri = html.escape(otpauth_uri_value, quote=True)
+    qr_data_uri = build_totp_qr_data_uri(otpauth_uri_value)
+    qr_image_html = ""
+    if qr_data_uri:
+        qr_image_html = (
+            "<div class=\"qr-wrapper\">"
+            f"<img src=\"{html.escape(qr_data_uri, quote=True)}\" alt=\"Authenticator QR code\" class=\"qr-image\" />"
+            "</div>"
+        )
     two_factor_disabled_attr = disabled_attr
     two_factor_card_class = disabled_class
     two_factor_status_class = "status-pill enabled" if two_factor_enabled else "status-pill"
+    backup_generation_disabled = two_factor_disabled_attr or ("" if two_factor_enabled else " disabled")
+    backup_card_class = "" if two_factor_enabled else " is-disabled"
+    backup_rows: List[str] = []
+    for idx, item in enumerate(backup_status, start=1):
+        last_four = html.escape(item.get("last_four", "????"))
+        masked = f"\u2022\u2022\u2022\u2022-{last_four}"
+        status_text = "Used" if item.get("used") else "Unused"
+        status_class = "status used" if item.get("used") else "status unused"
+        backup_rows.append(
+            """
+            <tr>
+              <td>{index}</td>
+              <td><code>{masked}</code></td>
+              <td><span class="{cls}">{status}</span></td>
+            </tr>
+            """.format(index=idx, masked=masked, cls=status_class, status=html.escape(status_text))
+        )
+    if not backup_rows:
+        backup_rows.append(
+            """
+            <tr>
+              <td colspan="3">Generate backup codes to view their status.</td>
+            </tr>
+            """
+        )
     if two_factor_enabled:
         two_factor_actions = f"""
             <div class=\"twofactor-actions\">
@@ -832,6 +997,24 @@ def render_settings_page(
             </div>
         """
 
+    backup_section = f"""
+            <div class=\"backup-codes{backup_card_class}\">
+              <div class=\"backup-header\">
+                <h4>Backup codes</h4>
+                <form method=\"post\" action=\"/settings/two-factor\">
+                  {csrf_field}
+                  <input type=\"hidden\" name=\"action\" value=\"generate_codes\" />
+                  <button type=\"submit\" class=\"secondary\"{backup_generation_disabled}>Generate backup codes</button>
+                </form>
+              </div>
+              <p class=\"help-text\">Each backup code may be used once when your authenticator is unavailable.</p>
+              <table class=\"backup-table\">
+                <thead><tr><th>#</th><th>Code</th><th>Status</th></tr></thead>
+                <tbody>{"".join(backup_rows)}</tbody>
+              </table>
+            </div>
+    """
+
     return f"""
     <!doctype html>
     <html>
@@ -862,6 +1045,9 @@ def render_settings_page(
         .alert {{ padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }}
         .alert.success {{ background: #e8f5e9; color: #256029; border: 1px solid #c8e6c9; }}
         .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
+        .alert.info {{ background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }}
+        .alert.info ul {{ margin: 8px 0 0; padding-left: 20px; }}
+        .alert.info li {{ font-family: 'Courier New', monospace; margin-bottom: 4px; }}
         .storage-table {{ margin-top: 20px; background: #fff; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; overflow: hidden; }}
         .storage-table h3 {{ margin: 0; padding: 16px; font-size: 16px; color: #1f2937; border-bottom: 1px solid #d6e2f1; }}
         .storage-table table {{ width: 100%; border-collapse: collapse; }}
@@ -890,6 +1076,18 @@ def render_settings_page(
         .twofactor-actions button {{ width: fit-content; }}
         .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e8f5e9; color: #256029; border-radius: 999px; font-weight: 600; width: fit-content; }}
         .help-text {{ font-size: 13px; color: #526079; }}
+        .qr-wrapper {{ margin: 12px 0; }}
+        .qr-image {{ width: 140px; height: 140px; image-rendering: pixelated; border: 1px solid #d1d9e6; border-radius: 8px; padding: 8px; background: #fff; }}
+        .backup-codes {{ margin-top: 16px; background: #fff; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; padding: 16px; display: flex; flex-direction: column; gap: 12px; }}
+        .backup-codes.is-disabled {{ opacity: 0.55; }}
+        .backup-header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; }}
+        .backup-header h4 {{ margin: 0; font-size: 15px; color: #1f2937; }}
+        .backup-header form {{ margin: 0; }}
+        .backup-table {{ width: 100%; border-collapse: collapse; }}
+        .backup-table th, .backup-table td {{ padding: 8px 10px; font-size: 13px; border-bottom: 1px solid #e2e8f0; text-align: left; }}
+        .backup-table td code {{ font-size: 13px; }}
+        .backup-table .status {{ display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 999px; font-weight: 600; background: #e0f2fe; color: #0369a1; }}
+        .backup-table .status.used {{ background: #f8f0f0; color: #b91c1c; }}
         .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
         .field-card {{ background: #f9fbff; padding: 12px; border-radius: 8px; box-shadow: inset 0 0 0 1px #d6e2f1; display: grid; gap: 8px; }}
         .retention-form button, .performance-form button {{ margin-top: 16px; }}
@@ -947,8 +1145,10 @@ def render_settings_page(
               <span>Secret</span>
               <code>{secret_display}</code>
             </div>
+            {qr_image_html}
             <p class="help-text">Scan or add the secret manually, then use<br><a href="{otpauth_uri}">{otpauth_uri}</a> in your authenticator.</p>
             {two_factor_actions}
+            {backup_section}
           </div>
         </div>
       </section>
@@ -1273,6 +1473,31 @@ def cleanup_old_jobs(max_age_seconds: int = 3600) -> None:
                 to_remove.append(job_id)
         for job_id in to_remove:
             JOBS.pop(job_id, None)
+
+
+class JobProgressReporter:
+    def __init__(self, job_id: str) -> None:
+        self.job_id = job_id
+
+    def update(self, percent: float, message: str, detail: Optional[str] = None) -> None:
+        clamped = max(0, min(100, int(percent)))
+        now = time.time()
+        with JOBS_LOCK:
+            data = JOBS.get(self.job_id)
+            if not data or data.get("status") not in {"queued", "processing"}:
+                return
+            updated = dict(data)
+            updated["progress"] = clamped
+            updated["message"] = message
+            if detail is not None:
+                updated["detail"] = detail
+            history = list(updated.get("history", []))
+            history.append({"timestamp": now, "progress": clamped, "message": message})
+            if len(history) > JOB_HISTORY_LIMIT:
+                history = history[-JOB_HISTORY_LIMIT:]
+            updated["history"] = history
+            updated["updated"] = now
+            JOBS[self.job_id] = updated
 
 
 class MetricsTracker:
@@ -1831,6 +2056,57 @@ def run_ffmpeg_with_timeout(cmd: List[str], log_handle) -> int:
         _flush_logs()
         raise HTTPException(status_code=504, detail="Processing timeout")
 
+
+def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
+    suffix = video_path.suffix.lower()
+    if suffix not in VIDEO_THUMBNAIL_EXTENSIONS:
+        return None
+    thumb_dir = video_path.parent / THUMBNAIL_DIR_NAME
+    try:
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.debug("Unable to create thumbnail directory %s: %s", thumb_dir, exc)
+        return None
+    thumb_path = thumb_dir / f"{video_path.stem}.jpg"
+    temp_log = WORK_DIR / f"thumb_{video_path.stem}.log"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-ss",
+        "00:00:01",
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=320:-1",
+        str(thumb_path),
+    ]
+    try:
+        with temp_log.open("wb") as log_handle:
+            code = run_ffmpeg_with_timeout(cmd, log_handle)
+    except HTTPException:
+        if thumb_path.exists():
+            try:
+                thumb_path.unlink()
+            except Exception:
+                pass
+        return None
+    finally:
+        if temp_log.exists():
+            try:
+                temp_log.unlink()
+            except Exception:
+                pass
+    if code != 0 or not thumb_path.exists():
+        if thumb_path.exists():
+            try:
+                thumb_path.unlink()
+            except Exception:
+                pass
+        return None
+    return thumb_path
+
 def cleanup_old_public(days: Optional[float] = None) -> None:
     """Delete files older than specified days based on actual file modification time."""
     retention_days = RETENTION_DAYS if days is None else days
@@ -1952,9 +2228,18 @@ def publish_file(src: Path, ext: str) -> Dict[str, str]:
 
     logger.info(f"Published file: {name} ({dst.stat().st_size / (1024*1024):.2f} MB)")
 
+    thumbnail_rel: Optional[str] = None
+    try:
+        thumb_path = generate_video_thumbnail(dst)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.debug("Thumbnail generation failed for %s: %s", dst, exc)
+    else:
+        if thumb_path:
+            thumbnail_rel = f"/files/{day}/{THUMBNAIL_DIR_NAME}/{thumb_path.name}"
+
     rel = f"/files/{day}/{name}"
     url = f"{PUBLIC_BASE_URL.rstrip('/')}{rel}" if PUBLIC_BASE_URL else rel
-    return {"dst": str(dst), "url": url, "rel": rel}
+    return {"dst": str(dst), "url": url, "rel": rel, "thumbnail": thumbnail_rel}
 
 
 def save_log(log_path: Path, operation: str) -> None:
@@ -1982,27 +2267,127 @@ def root():
 
 
 @app.get("/downloads", response_class=HTMLResponse)
-def downloads(request: Request):
+def downloads(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    q: str = "",
+):
     redirect = ensure_dashboard_access(request)
     if redirect:
         return redirect
-    rows = []
+
+    search = q.strip()
+    search_lower = search.lower()
+    entries: List[Dict[str, Any]] = []
     for day in sorted(PUBLIC_DIR.iterdir(), reverse=True):
         if not day.is_dir():
             continue
-        for f in sorted(day.iterdir(), reverse=True):
-            if not f.is_file():
+        for file_path in sorted(day.iterdir(), reverse=True):
+            if not file_path.is_file():
                 continue
-            rel = f"/files/{day.name}/{f.name}"
-            size_mb = f.stat().st_size / (1024*1024)
-            rows.append(
-                "<tr><td>{day}</td><td><a href='{href}'>{name}</a></td><td>{size:.2f} MB</td></tr>".format(
-                    day=html.escape(day.name),
-                    href=html.escape(rel, quote=True),
-                    name=html.escape(f.name),
-                    size=size_mb,
-                )
+            name = file_path.name
+            if search and search_lower not in name.lower() and search_lower not in day.name.lower():
+                continue
+            rel = f"/files/{day.name}/{name}"
+            stat = file_path.stat()
+            size_mb = stat.st_size / (1024 * 1024)
+            thumb_path = file_path.parent / THUMBNAIL_DIR_NAME / f"{file_path.stem}.jpg"
+            thumb_rel = None
+            if thumb_path.exists():
+                thumb_rel = f"/files/{day.name}/{THUMBNAIL_DIR_NAME}/{thumb_path.name}"
+            entries.append(
+                {
+                    "day": day.name,
+                    "name": name,
+                    "rel": rel,
+                    "size": size_mb,
+                    "thumb": thumb_rel,
+                    "mtime": stat.st_mtime,
+                }
             )
+
+    entries.sort(key=lambda item: item["mtime"], reverse=True)
+    total_items = len(entries)
+    total_pages = max(1, math.ceil(total_items / page_size)) if total_items else 1
+    page = min(max(page, 1), total_pages)
+    start = (page - 1) * page_size
+    end = start + page_size
+    current_entries = entries[start:end]
+
+    rows: List[str] = []
+    for item in current_entries:
+        thumb_html = (
+            f"<img src=\"{html.escape(item['thumb'], quote=True)}\" alt=\"Thumbnail\" class=\"thumb-image\" />"
+            if item["thumb"]
+            else "<span class=\"thumb-placeholder\">—</span>"
+        )
+        rows.append(
+            """
+            <tr>
+              <td>
+                <div class="file-entry">
+                  {thumb}
+                  <div class="file-meta">
+                    <a href="{href}">{name}</a>
+                    <div class="file-size">{size:.2f} MB</div>
+                  </div>
+                </div>
+              </td>
+              <td class="date-cell">{day}</td>
+            </tr>
+            """.format(
+                day=html.escape(item["day"]),
+                href=html.escape(item["rel"], quote=True),
+                name=html.escape(item["name"]),
+                size=item["size"],
+                thumb=thumb_html,
+            )
+        )
+
+    if not rows:
+        if total_items:
+            rows.append("<tr><td colspan='3'>No files match your filters.</td></tr>")
+        else:
+            rows.append("<tr><td colspan='3'>No files yet</td></tr>")
+
+    def build_page_url(target_page: int) -> str:
+        params: Dict[str, Any] = {"page": target_page}
+        if page_size != 25:
+            params["page_size"] = page_size
+        if search:
+            params["q"] = search
+        query = urlencode(params)
+        return f"/downloads?{query}" if query else "/downloads"
+
+    summary_text = ""
+    if total_items:
+        display_start = start + 1
+        display_end = min(end, total_items)
+        summary_text = f"Showing {display_start}-{display_end} of {total_items} file(s)"
+    elif search:
+        summary_text = "No files match your filters"
+
+    pagination_links = []
+    if page > 1:
+        pagination_links.append(
+            f"<a href=\"{html.escape(build_page_url(page - 1), quote=True)}\" class=\"pager-link\">&laquo; Prev</a>"
+        )
+    if page < total_pages:
+        pagination_links.append(
+            f"<a href=\"{html.escape(build_page_url(page + 1), quote=True)}\" class=\"pager-link\">Next &raquo;</a>"
+        )
+    pagination_html = (
+        "<div class=\"pagination\">" + "".join(pagination_links) + f"<span>Page {page} of {total_pages}</span></div>"
+        if total_items
+        else ""
+    )
+
+    clear_link = (
+        f"<a class=\"clear-link\" href=\"/downloads?page_size={page_size}\">Clear</a>" if search else ""
+    )
+    search_value = html.escape(search, quote=True)
+
     html_content = f"""
     <!doctype html>
     <html>
@@ -2014,12 +2399,26 @@ def downloads(request: Request):
         .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
-        table {{ border-collapse: collapse; width: 100%; }}
-        th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
-        th {{ text-align: left; background: #fafafa; }}
-        a {{ text-decoration: none; }}
         nav {{ margin-bottom: 20px; }}
-        nav a {{ margin-right: 15px; color: #0066cc; }}
+        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        table {{ border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 2px rgba(15,23,42,0.08); }}
+        th, td {{ border-bottom: 1px solid #e2e8f0; padding: 12px 14px; font-size: 14px; vertical-align: top; }}
+        th {{ text-align: left; background: #f8fafc; color: #1f2937; }}
+        a {{ text-decoration: none; color: #0f172a; }}
+        .filters {{ display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }}
+        .filters input[type="text"] {{ flex: 1; padding: 10px; border: 1px solid #cbd5f5; border-radius: 6px; }}
+        .filters button {{ padding: 10px 16px; background: #0066cc; color: #fff; border: none; border-radius: 6px; cursor: pointer; }}
+        .filters button:hover {{ background: #0053a3; }}
+        .summary {{ margin-bottom: 12px; font-size: 14px; color: #475569; }}
+        .pagination {{ display: flex; gap: 12px; align-items: center; margin-top: 16px; font-size: 14px; color: #475569; }}
+        .pager-link {{ color: #0369a1; }}
+        .file-entry {{ display: flex; gap: 12px; align-items: center; }}
+        .thumb-image {{ width: 96px; height: 54px; object-fit: cover; border-radius: 4px; border: 1px solid #cbd5f5; background: #f8fafc; }}
+        .thumb-placeholder {{ display: inline-flex; width: 96px; height: 54px; align-items: center; justify-content: center; border: 1px dashed #cbd5f5; border-radius: 4px; color: #94a3b8; font-size: 12px; }}
+        .file-meta {{ display: flex; flex-direction: column; gap: 4px; }}
+        .file-size {{ font-size: 13px; color: #64748b; }}
+        .date-cell {{ width: 140px; color: #475569; font-size: 13px; }}
+        .clear-link {{ font-size: 13px; color: #64748b; }}
       </style>
     </head>
     <body>
@@ -2034,10 +2433,18 @@ def downloads(request: Request):
         <a href="/settings">Settings</a>
       </nav>
       <h2>Generated Files</h2>
+      <form method="get" class="filters">
+        <input type="text" name="q" value="{search_value}" placeholder="Search by filename or date" />
+        <input type="hidden" name="page_size" value="{page_size}" />
+        <button type="submit">Search</button>
+        {clear_link}
+      </form>
+      <div class="summary">{html.escape(summary_text) if summary_text else ''}</div>
       <table>
-        <thead><tr><th>Date</th><th>File</th><th>Size</th></tr></thead>
-        <tbody>{"".join(rows) if rows else "<tr><td colspan='3'>No files yet</td></tr>"} </tbody>
+        <thead><tr><th>File</th><th>Date</th></tr></thead>
+        <tbody>{"".join(rows)}</tbody>
       </table>
+      {pagination_html}
     </body>
     </html>
     """
@@ -2045,30 +2452,84 @@ def downloads(request: Request):
 
 
 @app.get("/logs", response_class=HTMLResponse)
-def logs(request: Request):
+def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=200)):
     redirect = ensure_dashboard_access(request)
     if redirect:
         return redirect
-    rows = []
+
+    entries: List[Dict[str, Any]] = []
     for day in sorted(LOGS_DIR.iterdir(), reverse=True):
         if not day.is_dir():
             continue
-        for f in sorted(day.iterdir(), reverse=True):
-            if not f.is_file():
+        for file_path in sorted(day.iterdir(), reverse=True):
+            if not file_path.is_file():
                 continue
-            size_kb = f.stat().st_size / 1024
-            # Extract operation name from filename
-            parts = f.name.split("_")
+            stat = file_path.stat()
+            size_kb = stat.st_size / 1024
+            parts = file_path.name.split("_")
             operation = parts[-1].replace(".log", "") if len(parts) > 3 else "unknown"
-            rows.append(
-                "<tr><td>{day}</td><td>{name}</td><td>{op}</td><td>{size:.1f} KB</td><td><a href='/logs/view?path={path}' target='_blank'>View</a></td></tr>".format(
-                    day=html.escape(day.name),
-                    name=html.escape(f.name),
-                    op=html.escape(operation),
-                    size=size_kb,
-                    path=html.escape(f"{day.name}/{f.name}", quote=True),
-                )
+            entries.append(
+                {
+                    "day": day.name,
+                    "name": file_path.name,
+                    "operation": operation,
+                    "size": size_kb,
+                    "path": f"{day.name}/{file_path.name}",
+                    "mtime": stat.st_mtime,
+                }
             )
+
+    entries.sort(key=lambda item: item["mtime"], reverse=True)
+    total_items = len(entries)
+    total_pages = max(1, math.ceil(total_items / page_size)) if total_items else 1
+    page = min(max(page, 1), total_pages)
+    start = (page - 1) * page_size
+    end = start + page_size
+    current_entries = entries[start:end]
+
+    rows: List[str] = []
+    for item in current_entries:
+        rows.append(
+            """
+            <tr>
+              <td>{day}</td>
+              <td>{name}</td>
+              <td>{operation}</td>
+              <td>{size:.1f} KB</td>
+              <td><a href="/logs/view?path={path}" target="_blank">View</a></td>
+            </tr>
+            """.format(
+                day=html.escape(item["day"]),
+                name=html.escape(item["name"]),
+                operation=html.escape(item["operation"]),
+                size=item["size"],
+                path=html.escape(item["path"], quote=True),
+            )
+        )
+
+    if not rows:
+        rows.append("<tr><td colspan='5'>No logs yet</td></tr>")
+
+    def build_page_url(target_page: int) -> str:
+        params = {"page": target_page, "page_size": page_size}
+        query = urlencode(params)
+        return f"/logs?{query}" if query else "/logs"
+
+    pagination_links = []
+    if page > 1:
+        pagination_links.append(
+            f"<a href=\"{html.escape(build_page_url(page - 1), quote=True)}\" class=\"pager-link\">&laquo; Prev</a>"
+        )
+    if page < total_pages:
+        pagination_links.append(
+            f"<a href=\"{html.escape(build_page_url(page + 1), quote=True)}\" class=\"pager-link\">Next &raquo;</a>"
+        )
+    pagination_html = (
+        "<div class=\"pagination\">" + "".join(pagination_links) + f"<span>Page {page} of {total_pages}</span></div>"
+        if total_items
+        else ""
+    )
+
     html_content = f"""
     <!doctype html>
     <html>
@@ -2080,12 +2541,14 @@ def logs(request: Request):
         .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
-        table {{ border-collapse: collapse; width: 100%; }}
-        th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
-        th {{ text-align: left; background: #fafafa; }}
-        a {{ text-decoration: none; color: #0066cc; }}
         nav {{ margin-bottom: 20px; }}
-        nav a {{ margin-right: 15px; }}
+        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        table {{ border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 2px rgba(15,23,42,0.08); }}
+        th, td {{ border-bottom: 1px solid #e2e8f0; padding: 12px 14px; font-size: 14px; }}
+        th {{ text-align: left; background: #f8fafc; color: #1f2937; }}
+        a {{ text-decoration: none; color: #0f172a; }}
+        .pagination {{ display: flex; gap: 12px; align-items: center; margin-top: 16px; font-size: 14px; color: #475569; }}
+        .pager-link {{ color: #0369a1; }}
       </style>
     </head>
     <body>
@@ -2102,8 +2565,9 @@ def logs(request: Request):
       <h2>FFmpeg Logs</h2>
       <table>
         <thead><tr><th>Date</th><th>Filename</th><th>Operation</th><th>Size</th><th>Action</th></tr></thead>
-        <tbody>{"".join(rows) if rows else "<tr><td colspan='5'>No logs yet</td></tr>"} </tbody>
+        <tbody>{"".join(rows)}</tbody>
       </table>
+      {pagination_html}
     </body>
     </html>
     """
@@ -2695,12 +3159,16 @@ def settings_page(
 
     storage = storage_management_snapshot()
     csrf_token = ensure_csrf_token(request)
+    backup_codes = UI_AUTH.pop_pending_backup_codes()
+    backup_status = UI_AUTH.get_backup_code_status()
     html_content = render_settings_page(
         storage,
         message or None,
         error or None,
         authenticated=authed,
         csrf_token=csrf_token,
+        backup_codes=backup_codes,
+        backup_status=backup_status,
     )
     return HTMLResponse(html_content)
 
@@ -2711,19 +3179,28 @@ async def settings_login(request: Request):
     username = str(form.get("username", ""))
     password = str(form.get("password", ""))
     totp_code = str(form.get("totp", "")).strip()
+    backup_code = str(form.get("backup_code", "")).strip()
     next_path = str(form.get("next", "/settings")) or "/settings"
     if not next_path.startswith("/"):
         next_path = "/settings"
 
     if UI_AUTH.verify(username, password):
         if UI_AUTH.is_two_factor_enabled():
-            if not totp_code:
+            if not totp_code and not backup_code:
                 csrf_token = ensure_csrf_token(request)
-                html_content = render_login_page(next_path, csrf_token, "Authentication code required")
+                html_content = render_login_page(next_path, csrf_token, "Authentication or backup code required")
                 return HTMLResponse(html_content, status_code=401)
-            if not UI_AUTH.verify_totp(totp_code):
+            second_factor_ok = False
+            if totp_code:
+                second_factor_ok = UI_AUTH.verify_totp(totp_code)
+            if not second_factor_ok:
+                if backup_code:
+                    second_factor_ok = UI_AUTH.verify_backup_code(backup_code)
+                elif totp_code:
+                    second_factor_ok = UI_AUTH.verify_backup_code(totp_code)
+            if not second_factor_ok:
                 csrf_token = ensure_csrf_token(request)
-                html_content = render_login_page(next_path, csrf_token, "Invalid authentication code")
+                html_content = render_login_page(next_path, csrf_token, "Invalid authentication or backup code")
                 return HTMLResponse(html_content, status_code=401)
         token = UI_AUTH.create_session()
         response = RedirectResponse(url=next_path, status_code=303)
@@ -2857,13 +3334,20 @@ async def settings_update_two_factor(request: Request):
             error = "Invalid authentication code"
         else:
             UI_AUTH.set_two_factor_enabled(True)
-            message = "Two-factor authentication enabled"
+            UI_AUTH.generate_backup_codes()
+            message = "Two-factor authentication enabled. Backup codes generated"
     elif action == "disable":
         UI_AUTH.set_two_factor_enabled(False)
         message = "Two-factor authentication disabled"
     elif action == "regenerate":
         UI_AUTH.regenerate_two_factor_secret()
         message = "Generated a new authentication secret. Two-factor authentication has been disabled."
+    elif action == "generate_codes":
+        if not UI_AUTH.is_two_factor_enabled():
+            error = "Enable two-factor authentication before generating backup codes"
+        else:
+            UI_AUTH.generate_backup_codes()
+            message = "New backup codes generated"
     else:
         error = "Unknown two-factor action"
 
@@ -3832,7 +4316,9 @@ async def video_concat_alias(job: ConcatAliasJob, as_json: bool = False):
     return await video_concat_from_urls(cj, as_json=as_json)
 
 
-async def _compose_from_urls_impl(job: ComposeFromUrlsJob) -> Dict[str, str]:
+async def _compose_from_urls_impl(
+    job: ComposeFromUrlsJob, progress: Optional[JobProgressReporter] = None
+) -> Dict[str, str]:
     check_disk_space(WORK_DIR)
 
     with TemporaryDirectory(prefix="cfu_", dir=str(WORK_DIR)) as workdir:
@@ -3843,15 +4329,29 @@ async def _compose_from_urls_impl(job: ComposeFromUrlsJob) -> Dict[str, str]:
         out_path = work / "output.mp4"
         log_path = work / "ffmpeg.log"
 
+        if progress:
+            progress.update(15, "Preparing workspace")
         await _download_to(str(job.video_url), v_path, job.headers)
+        if progress:
+            progress.update(35, "Downloaded primary video")
         has_audio = False
         has_bgm = False
         if job.audio_url:
+            if progress:
+                progress.update(45, "Downloading audio track")
             await _download_to(str(job.audio_url), a_path, job.headers)
             has_audio = True
+        else:
+            if progress:
+                progress.update(45, "Audio track skipped")
         if job.bgm_url:
+            if progress:
+                progress.update(55, "Downloading background music")
             await _download_to(str(job.bgm_url), b_path, job.headers)
             has_bgm = True
+        else:
+            if progress:
+                progress.update(55, "Background music skipped")
 
         dur_s = f"{job.duration_ms/1000:.3f}"
         inputs = ["-i", str(v_path)]
@@ -3892,6 +4392,8 @@ async def _compose_from_urls_impl(job: ComposeFromUrlsJob) -> Dict[str, str]:
             cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
 
         cmd += maps + [str(out_path)]
+        if progress:
+            progress.update(70, "Rendering composition")
         with log_path.open("wb") as logf:
             code = run_ffmpeg_with_timeout(cmd, logf)
         save_log(log_path, "compose-urls")
@@ -3907,7 +4409,11 @@ async def _compose_from_urls_impl(job: ComposeFromUrlsJob) -> Dict[str, str]:
                 },
             )
 
+        if progress:
+            progress.update(85, "Saving rendered output")
         pub = publish_file(out_path, ".mp4")
+        if progress:
+            progress.update(95, "Publishing file")
         logger.info("compose-from-urls completed: %s", pub["rel"])
         return pub
 
@@ -3924,61 +4430,97 @@ async def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
 
 async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -> None:
     with JOBS_LOCK:
-        created = JOBS[job_id].get("created", time.time())
-        JOBS[job_id].update(
-            {
-                "status": "processing",
-                "progress": 10,
-                "started": time.time(),
-                "created": created,
-                "updated": time.time(),
-            }
-        )
+        existing = JOBS.get(job_id, {})
+        created = existing.get("created", time.time())
+        now = time.time()
+        history = list(existing.get("history", []))
+        history.append({"timestamp": now, "progress": 10, "message": "Job started"})
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+        JOBS[job_id] = {
+            **existing,
+            "status": "processing",
+            "progress": 10,
+            "message": "Job started",
+            "started": now,
+            "created": created,
+            "updated": now,
+            "history": history,
+        }
 
+    reporter = JobProgressReporter(job_id)
     start = time.perf_counter()
     try:
-        pub = await _compose_from_urls_impl(job)
+        pub = await _compose_from_urls_impl(job, reporter)
     except HTTPException as exc:
+        reporter.update(100, "Composition failed")
         detail = exc.detail if isinstance(exc.detail, (str, dict)) else str(exc.detail)
         with JOBS_LOCK:
-            created = JOBS[job_id].get("created", time.time())
+            existing = JOBS.get(job_id, {})
+            created = existing.get("created", time.time())
+            history = list(existing.get("history", []))
+            history.append({"timestamp": time.time(), "progress": 100, "message": "Failed"})
+            if len(history) > JOB_HISTORY_LIMIT:
+                history = history[-JOB_HISTORY_LIMIT:]
             JOBS[job_id] = {
+                **existing,
                 "status": "failed",
                 "progress": 100,
+                "message": "Failed",
                 "status_code": exc.status_code,
                 "error": detail,
                 "created": created,
                 "updated": time.time(),
+                "history": history,
             }
         return
     except Exception as exc:
+        reporter.update(100, "Unexpected failure")
         logger.exception("Async compose job %s failed", job_id)
         with JOBS_LOCK:
-            created = JOBS[job_id].get("created", time.time())
+            existing = JOBS.get(job_id, {})
+            created = existing.get("created", time.time())
+            history = list(existing.get("history", []))
+            history.append({"timestamp": time.time(), "progress": 100, "message": "Failed"})
+            if len(history) > JOB_HISTORY_LIMIT:
+                history = history[-JOB_HISTORY_LIMIT:]
             JOBS[job_id] = {
+                **existing,
                 "status": "failed",
                 "progress": 100,
+                "message": "Failed",
                 "status_code": 500,
                 "error": str(exc),
                 "created": created,
                 "updated": time.time(),
+                "history": history,
             }
         return
 
+    reporter.update(100, "Completed")
     duration_ms = (time.perf_counter() - start) * 1000.0
     with JOBS_LOCK:
-        created = JOBS[job_id].get("created", time.time())
+        existing = JOBS.get(job_id, {})
+        created = existing.get("created", time.time())
+        history = list(existing.get("history", []))
+        history.append({"timestamp": time.time(), "progress": 100, "message": "Completed"})
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
         JOBS[job_id] = {
+            **existing,
             "status": "finished",
             "progress": 100,
+            "message": "Completed",
             "result": {
                 "file_url": pub["url"],
                 "path": pub["dst"],
                 "rel": pub["rel"],
+                "thumbnail": pub.get("thumbnail"),
             },
             "duration_ms": duration_ms,
             "created": created,
             "updated": time.time(),
+            "history": history,
         }
 
 
@@ -3988,7 +4530,14 @@ async def compose_from_urls_async(job: ComposeFromUrlsJob):
     job_id = str(uuid4())
     with JOBS_LOCK:
         now = time.time()
-        JOBS[job_id] = {"status": "queued", "progress": 0, "created": now, "updated": now}
+        JOBS[job_id] = {
+            "status": "queued",
+            "progress": 0,
+            "message": "Queued",
+            "history": [{"timestamp": now, "progress": 0, "message": "Queued"}],
+            "created": now,
+            "updated": now,
+        }
     job_copy = job.model_copy(deep=True)
     asyncio.create_task(_process_compose_from_urls_job(job_id, job_copy))
     return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}

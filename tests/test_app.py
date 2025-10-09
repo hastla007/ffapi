@@ -284,7 +284,12 @@ def patched_app(app_module, monkeypatch, tmp_path):
             dst.write_bytes(src_path.read_bytes())
         else:
             dst.write_bytes(b"")
-        return {"dst": str(dst), "url": f"http://example.com/{dst.name}", "rel": f"/files/{dst.name}"}
+        return {
+            "dst": str(dst),
+            "url": f"http://example.com/{dst.name}",
+            "rel": f"/files/{dst.name}",
+            "thumbnail": None,
+        }
 
     async def fake_download_to(url: str, dest: Path, headers=None, max_retries: int = 3, chunk_size: int = 1024 * 1024, client=None):
         dest_path = Path(dest)
@@ -421,8 +426,10 @@ def test_downloads_page_lists_existing_files(patched_app):
     status, _, body = call_app(patched_app.app, "GET", "/downloads")
     assert status == 200
     html = body.decode()
-    assert "20240101" in html
+    assert "Search by filename or date" in html
     assert "example.txt" in html
+    assert "Showing 1-1 of 1 file(s)" in html
+    assert "thumb-placeholder" in html
 
 
 def test_downloads_page_escapes_special_characters(patched_app):
@@ -439,6 +446,65 @@ def test_downloads_page_escapes_special_characters(patched_app):
     assert "<img" not in html.split("Generated Files", 1)[1]
 
 
+def test_downloads_search_filters_results(patched_app):
+    day_one = patched_app.PUBLIC_DIR / "20240110"
+    day_two = patched_app.PUBLIC_DIR / "20240111"
+    day_one.mkdir(parents=True, exist_ok=True)
+    day_two.mkdir(parents=True, exist_ok=True)
+    (day_one / "report-a.txt").write_text("a", encoding="utf-8")
+    (day_two / "holiday.mp4").write_text("b", encoding="utf-8")
+
+    status, _, body = call_app(
+        patched_app.app,
+        "GET",
+        "/downloads",
+        query=urlencode({"q": "holiday"}),
+    )
+    assert status == 200
+    html = body.decode()
+    assert "holiday.mp4" in html
+    assert "report-a.txt" not in html
+    assert "No files match your filters" not in html
+
+
+def test_downloads_supports_pagination(patched_app):
+    day_dir = patched_app.PUBLIC_DIR / "20240112"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(30):
+        (day_dir / f"video_{index:02d}.mp4").write_text(str(index), encoding="utf-8")
+
+    status, _, body = call_app(
+        patched_app.app,
+        "GET",
+        "/downloads",
+        query=urlencode({"page": 2}),
+    )
+    assert status == 200
+    html = body.decode()
+    assert "Page 2 of 2" in html
+    assert "video_00.mp4" in html
+    assert "video_29.mp4" not in html
+
+
+def test_logs_page_supports_pagination(patched_app):
+    day_dir = patched_app.LOGS_DIR / "20240113"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(40):
+        (day_dir / f"log_{index:02d}_compose.log").write_text("entry", encoding="utf-8")
+
+    status, _, body = call_app(
+        patched_app.app,
+        "GET",
+        "/logs",
+        query=urlencode({"page": 2, "page_size": 20}),
+    )
+    assert status == 200
+    html = body.decode()
+    assert "Page 2 of 2" in html
+    assert "log_39_compose.log" not in html
+    assert "log_00_compose.log" in html
+
+
 def test_settings_page_shows_auth_retention_and_storage_sections(patched_app):
     status, _, body = call_app(patched_app.app, "GET", "/settings")
     assert status == 200
@@ -450,8 +516,8 @@ def test_settings_page_shows_auth_retention_and_storage_sections(patched_app):
     assert "button type=\"submit\" disabled" in html
     assert "Two-factor authentication" in html
     assert "twofactor-card is-disabled" in html
-    assert "name=\"code\"" in html
-    assert "Authentication code" in html
+    assert "Generate backup codes" in html
+    assert "Backup codes" in html
     assert "Enable dashboard login to configure two-factor authentication." in html
     assert "API Authentication" in html
     assert "Require API key for API requests" in html
@@ -561,8 +627,14 @@ def test_two_factor_toggle_requires_valid_code(patched_app):
         jar,
     )
     assert status == 303
-    assert "message=Two-factor+authentication+enabled" in headers["location"]
+    assert (
+        "message=Two-factor+authentication+enabled.+Backup+codes+generated"
+        in headers["location"]
+    )
     assert patched_app.UI_AUTH.is_two_factor_enabled()
+    statuses = patched_app.UI_AUTH.get_backup_code_status()
+    assert len(statuses) == patched_app.BACKUP_CODE_COUNT
+    assert all(not item["used"] for item in statuses)
 
 
 def test_login_requires_totp_when_two_factor_enabled(patched_app):
@@ -596,6 +668,8 @@ def test_login_requires_totp_when_two_factor_enabled(patched_app):
     )
     assert status == 303
     assert patched_app.UI_AUTH.is_two_factor_enabled()
+    backup_codes = patched_app.UI_AUTH.pop_pending_backup_codes()
+    assert len(backup_codes) == patched_app.BACKUP_CODE_COUNT
 
     logout_csrf = fetch_csrf_token(patched_app.app, jar)
     status, _, _ = post_form(
@@ -622,8 +696,9 @@ def test_login_requires_totp_when_two_factor_enabled(patched_app):
     )
     assert status == 401
     html = body.decode()
-    assert "Authentication code required" in html
+    assert "Authentication or backup code required" in html
     assert "name=\"totp\"" in html
+    assert "name=\"backup_code\"" in html
     login_csrf = extract_csrf_token(html)
 
     status, _, body = post_form(
@@ -640,17 +715,16 @@ def test_login_requires_totp_when_two_factor_enabled(patched_app):
     )
     assert status == 401
     html = body.decode()
-    assert "Invalid authentication code" in html
+    assert "Invalid authentication or backup code" in html
     login_csrf = extract_csrf_token(html)
 
-    final_code = patched_app.generate_totp_code(patched_app.UI_AUTH.get_two_factor_secret())
     status, headers, _ = post_form(
         patched_app.app,
         "/settings/login",
         {
             "username": "admin",
             "password": "admin123",
-            "totp": final_code,
+            "backup_code": backup_codes[0],
             "next": "/downloads",
             "csrf_token": login_csrf,
         },
@@ -658,6 +732,53 @@ def test_login_requires_totp_when_two_factor_enabled(patched_app):
     )
     assert status == 303
     assert headers["location"] == "/downloads"
+    statuses_after = patched_app.UI_AUTH.get_backup_code_status()
+    assert any(item["used"] for item in statuses_after)
+
+
+def test_settings_shows_backup_codes_alert(patched_app):
+    jar: dict[str, str] = {}
+    csrf_token = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
+        patched_app.app,
+        "/settings/ui-auth",
+        {"require_login": "true", "csrf_token": csrf_token},
+        jar,
+    )
+    assert status == 303
+
+    login_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
+        patched_app.app,
+        "/settings/login",
+        {"username": "admin", "password": "admin123", "csrf_token": login_csrf},
+        jar,
+    )
+    assert status == 303
+
+    secret = patched_app.UI_AUTH.get_two_factor_secret()
+    code = patched_app.generate_totp_code(secret)
+    settings_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, headers, _ = post_form(
+        patched_app.app,
+        "/settings/two-factor",
+        {"action": "enable", "code": code, "csrf_token": settings_csrf},
+        jar,
+    )
+    assert status == 303
+    target = headers["location"].split("/settings", 1)[1]
+    page_status, _, page_body = call_app(
+        patched_app.app,
+        "GET",
+        "/settings",
+        headers=[("Cookie", build_cookie_header(jar))],
+        query=target.lstrip("?"),
+    )
+    assert page_status == 200
+    html = page_body.decode()
+    assert "alert info" in html
+    assert "backup-list" in html
+    assert "Generate backup codes" in html
 
 
 def test_settings_page_enables_credentials_when_authentication_required(patched_app):
@@ -1447,6 +1568,11 @@ def test_async_compose_job_lifecycle(patched_app):
     job_info = json.loads(body.decode())
     assert job_info["status"] == "finished"
     assert job_info["result"]["file_url"].startswith("http://example.com/")
+    assert job_info["message"] == "Completed"
+    assert "thumbnail" in job_info["result"]
+    assert job_info["result"]["thumbnail"] is None
+    assert isinstance(job_info.get("history"), list)
+    assert any(entry["message"] == "Completed" for entry in job_info["history"])
 
 
 def test_static_file_serving(patched_app):

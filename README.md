@@ -8,7 +8,9 @@
 - **Fixed retention**: Files are deleted based on actual file age (modification time), not folder name. Files persist through restarts until they are truly RETENTION_DAYS old, and cleanup resumes automatically on startup and via a periodic background task.
 - **Runtime tuning**: Administrators can adjust retention windows, rate limits, FFmpeg timeouts, and upload limits directly from the `/settings` dashboard without restarting the service.
 - **Optional API authentication**: Toggle API key enforcement at runtime and issue/revoke keys from the `/api-keys` dashboard.
-- **Optional dashboard MFA**: Enable TOTP-based two-factor authentication for the settings and dashboard pages when UI authentication is required.
+- **Optional dashboard MFA**: Enable TOTP-based two-factor authentication with QR setup, backup codes, and recovery enforcement for the settings and dashboard pages when UI authentication is required. (Install `qrcode[pil]` to render setup QR codes—otherwise a placeholder image is shown.)
+- **Rich browsing experience**: The `/downloads` page now supports search, pagination, and inline video thumbnails while `/logs` offers paginated browsing for large histories.
+- **Job telemetry**: Asynchronous compose jobs expose granular progress updates, status messages, and a capped history log via the `/jobs/{job_id}` endpoint.
 - **Persistent FFmpeg logs**: All FFmpeg operations save logs to `/data/logs` for debugging.
 - **Application logging**: Container logs (stdout/stderr) are saved to `/data/logs/application.log` and viewable at `/ffmpeg` endpoint.
 
@@ -46,7 +48,7 @@ docker compose up -d
 ```
 
 **Page descriptions:**
-- `/downloads` - Browse and download generated video files
+- `/downloads` - Browse, search, and paginate generated video files with inline thumbnails
 - `/logs` - View FFmpeg operation logs
 - `/ffmpeg` - Monitor container with live logs and FFmpeg version info (supports auto-refresh)
 - `/documentation` - Complete API reference with all endpoints and parameters
