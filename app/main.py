@@ -1,4 +1,4 @@
-import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit
+import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit, hashlib, secrets
 from collections import Counter, defaultdict, deque
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Literal
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import threading
@@ -80,7 +81,7 @@ else:  # pragma: no cover - minimal environments without httpx
             await asyncio.to_thread(self._session.close)
 
     httpx = types.SimpleNamespace(AsyncClient=_AsyncClient)
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl, field_validator
@@ -203,6 +204,314 @@ RATE_LIMITER = RateLimiter(settings.RATE_LIMIT_REQUESTS_PER_MINUTE)
 JOBS: Dict[str, Dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
 
+
+SESSION_COOKIE_NAME = "ffapi_session"
+SESSION_TTL_SECONDS = 3600
+DEFAULT_UI_USERNAME = "admin"
+DEFAULT_UI_PASSWORD = "admin123"
+
+
+class UIAuthManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.require_login = False
+        self.username = DEFAULT_UI_USERNAME
+        self._password_hash = self._hash(DEFAULT_UI_PASSWORD)
+        self._sessions: Dict[str, float] = {}
+
+    def _hash(self, password: str) -> str:
+        return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.require_login = False
+            self.username = DEFAULT_UI_USERNAME
+            self._password_hash = self._hash(DEFAULT_UI_PASSWORD)
+            self._sessions.clear()
+
+    def set_require_login(self, enabled: bool) -> None:
+        with self._lock:
+            self.require_login = enabled
+            if not enabled:
+                self._sessions.clear()
+
+    def set_credentials(self, username: str, password: str) -> None:
+        username = username.strip()
+        if not username:
+            raise ValueError("Username is required")
+        if not password:
+            raise ValueError("Password is required")
+        if len(password) < 6:
+            raise ValueError("Password must be at least 6 characters long")
+        with self._lock:
+            self.username = username
+            self._password_hash = self._hash(password)
+            self._sessions.clear()
+
+    def verify(self, username: str, password: str) -> bool:
+        with self._lock:
+            expected_user = self.username
+            expected_hash = self._password_hash
+        if not secrets.compare_digest(expected_user, username):
+            return False
+        provided_hash = self._hash(password)
+        return secrets.compare_digest(expected_hash, provided_hash)
+
+    def create_session(self) -> str:
+        token = secrets.token_hex(16)
+        expiry = time.time() + SESSION_TTL_SECONDS
+        with self._lock:
+            self._sessions[token] = expiry
+        return token
+
+    def authenticate_session(self, token: Optional[str]) -> bool:
+        if not token:
+            return False
+        now = time.time()
+        with self._lock:
+            expiry = self._sessions.get(token)
+            if expiry is None:
+                return False
+            if expiry < now:
+                self._sessions.pop(token, None)
+                return False
+            self._sessions[token] = now + SESSION_TTL_SECONDS
+            return True
+
+    def clear_session(self, token: str) -> None:
+        with self._lock:
+            self._sessions.pop(token, None)
+
+
+UI_AUTH = UIAuthManager()
+
+
+def is_authenticated(request: Request) -> bool:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    return UI_AUTH.authenticate_session(token)
+
+
+def ensure_dashboard_access(request: Request) -> Optional[RedirectResponse]:
+    if not UI_AUTH.require_login:
+        return None
+    if is_authenticated(request):
+        return None
+    next_path = request.url.path
+    if request.url.query:
+        next_path = f"{next_path}?{request.url.query}"
+    response = RedirectResponse(
+        url=f"/settings?{urlencode({'next': next_path})}", status_code=303
+    )
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
+
+
+def storage_management_snapshot() -> Dict[str, Any]:
+    total_bytes = 0
+    active_files = 0
+    expired_files = 0
+    cutoff: Optional[float]
+    if RETENTION_DAYS > 0:
+        cutoff = time.time() - (RETENTION_DAYS * 86400)
+    else:
+        cutoff = None
+
+    for root, _, files in os.walk(PUBLIC_DIR):
+        for name in files:
+            path = Path(root) / name
+            try:
+                stat = path.stat()
+            except Exception:
+                continue
+            total_bytes += stat.st_size
+            if cutoff is None:
+                active_files += 1
+            elif stat.st_mtime < cutoff:
+                expired_files += 1
+            else:
+                active_files += 1
+
+    try:
+        quota_total = shutil.disk_usage(PUBLIC_DIR).total
+        quota_mb = quota_total / (1024 * 1024)
+    except Exception:
+        quota_mb = None
+
+    return {
+        "total_bytes": total_bytes,
+        "active_files": active_files,
+        "expired_files": expired_files,
+        "quota_mb": quota_mb,
+    }
+
+
+def render_login_page(next_path: str, error: Optional[str] = None) -> str:
+    alert = ""
+    if error:
+        alert = f"<div class=\"alert error\">{html.escape(error)}</div>"
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset=\"utf-8\" />
+      <title>Settings Login</title>
+      <style>
+        body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 400px; margin: 0 auto; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; text-align: center; }}
+        .brand .ff {{ color: #28a745; }}
+        .brand .api {{ color: #000; }}
+        form {{ display: flex; flex-direction: column; gap: 12px; }}
+        label {{ font-weight: 600; }}
+        input {{ padding: 10px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; }}
+        button {{ padding: 10px; background: #0066cc; color: #fff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }}
+        button:hover {{ background: #0053a3; }}
+        .alert {{ padding: 10px; border-radius: 4px; font-size: 14px; margin-bottom: 16px; }}
+        .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
+        .help {{ font-size: 13px; color: #555; text-align: center; margin-top: 12px; }}
+      </style>
+    </head>
+    <body>
+      <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
+      {alert}
+      <form method=\"post\" action=\"/settings/login\">
+        <input type=\"hidden\" name=\"next\" value=\"{html.escape(next_path, quote=True)}\" />
+        <label for=\"username\">Username</label>
+        <input id=\"username\" name=\"username\" type=\"text\" autocomplete=\"username\" required />
+        <label for=\"password\">Password</label>
+        <input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required />
+        <button type=\"submit\">Sign in</button>
+      </form>
+      <div class=\"help\">Default credentials: {html.escape(DEFAULT_UI_USERNAME)} / {html.escape(DEFAULT_UI_PASSWORD)}</div>
+    </body>
+    </html>
+    """
+
+
+def render_settings_page(
+    storage: Dict[str, Any],
+    message: Optional[str] = None,
+    error: Optional[str] = None,
+    *,
+    authenticated: bool,
+) -> str:
+    total_used_mb = storage["total_bytes"] / (1024 * 1024) if storage["total_bytes"] else 0.0
+    active_files = storage["active_files"]
+    expired_files = storage["expired_files"]
+    quota_mb = storage["quota_mb"]
+    quota_display = f"{quota_mb:.1f} MB" if quota_mb is not None else "Unknown"
+    alert_blocks = []
+    if message:
+        alert_blocks.append(f"<div class=\"alert success\">{html.escape(message)}</div>")
+    if error:
+        alert_blocks.append(f"<div class=\"alert error\">{html.escape(error)}</div>")
+    alerts = "".join(alert_blocks)
+    require_login = UI_AUTH.require_login
+    toggle_value = "false" if require_login else "true"
+    toggle_label = "Disable login requirement" if require_login else "Enable login requirement"
+    status_text = "Enabled" if require_login else "Disabled"
+    auth_note = (
+        "Dashboard pages currently require sign-in."
+        if require_login
+        else "Dashboard pages are open without authentication."
+    )
+    logout_button = ""
+    if require_login and authenticated:
+        logout_button = """
+        <form method=\"post\" action=\"/settings/logout\" style=\"margin-top: 10px;\">
+          <button type=\"submit\" class=\"secondary\">Log out</button>
+        </form>
+        """
+
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset=\"utf-8\" />
+      <title>Settings</title>
+      <style>
+        body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 900px; margin: 0 auto; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .brand .ff {{ color: #28a745; }}
+        .brand .api {{ color: #000; }}
+        nav {{ margin-bottom: 20px; }}
+        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        h2 {{ margin-top: 32px; }}
+        section {{ background: #f7f9fc; padding: 20px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.08); margin-bottom: 24px; }}
+        form {{ margin-top: 16px; }}
+        label {{ display: block; font-weight: 600; margin-bottom: 6px; }}
+        input {{ padding: 10px; font-size: 14px; border: 1px solid #ccd5e0; border-radius: 4px; width: 100%; box-sizing: border-box; }}
+        button {{ padding: 10px 16px; background: #0066cc; color: #fff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }}
+        button:hover {{ background: #0053a3; }}
+        button.secondary {{ background: #9aa5b1; }}
+        button.secondary:hover {{ background: #7c8794; }}
+        .alert {{ padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }}
+        .alert.success {{ background: #e8f5e9; color: #256029; border: 1px solid #c8e6c9; }}
+        .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
+        .storage-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-top: 16px; }}
+        .storage-card {{ background: #fff; padding: 16px; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; }}
+        .storage-card h3 {{ margin: 0 0 6px 0; font-size: 15px; color: #2f3b52; }}
+        .storage-card p {{ margin: 0; font-size: 24px; font-weight: 600; color: #0f172a; }}
+        .storage-card span {{ display: block; margin-top: 4px; font-size: 13px; color: #526079; }}
+      </style>
+    </head>
+    <body>
+      <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
+      <nav>
+        <a href=\"/downloads\">Downloads</a>
+        <a href=\"/logs\">Logs</a>
+        <a href=\"/ffmpeg\">FFmpeg Info</a>
+        <a href=\"/metrics\">Metrics</a>
+        <a href=\"/documentation\">API Docs</a>
+        <a href=\"/settings\">Settings</a>
+      </nav>
+      {alerts}
+      <section>
+        <h2>UI Authentication</h2>
+        <p><strong>Status:</strong> {status_text}</p>
+        <p>{auth_note}</p>
+        <form method=\"post\" action=\"/settings/ui-auth\">
+          <input type=\"hidden\" name=\"enable\" value=\"{toggle_value}\" />
+          <button type=\"submit\">{toggle_label}</button>
+        </form>
+        <p style=\"margin-top: 16px;\"><strong>Current username:</strong> {html.escape(UI_AUTH.username)}</p>
+        <form method=\"post\" action=\"/settings/credentials\">
+          <label for=\"username\">Username</label>
+          <input id=\"username\" name=\"username\" type=\"text\" value=\"{html.escape(UI_AUTH.username, quote=True)}\" required />
+          <label for=\"password\" style=\"margin-top: 12px;\">New password</label>
+          <input id=\"password\" name=\"password\" type=\"password\" placeholder=\"Enter a new password\" required />
+          <button type=\"submit\" style=\"margin-top: 12px;\">Update credentials</button>
+        </form>
+        {logout_button}
+      </section>
+
+      <section>
+        <h2>Storage Management</h2>
+        <div class=\"storage-grid\">
+          <div class=\"storage-card\">
+            <h3>Total storage used</h3>
+            <p>{total_used_mb:.2f} MB</p>
+            <span>Across all published files</span>
+          </div>
+          <div class=\"storage-card\">
+            <h3>Active files</h3>
+            <p>{active_files}</p>
+            <span>Within retention window</span>
+          </div>
+          <div class=\"storage-card\">
+            <h3>Expired files pending cleanup</h3>
+            <p>{expired_files}</p>
+            <span>Older than {RETENTION_DAYS} days</span>
+          </div>
+          <div class=\"storage-card\">
+            <h3>Storage quota limit</h3>
+            <p>{quota_display}</p>
+            <span>Based on current volume size</span>
+          </div>
+        </div>
+      </section>
+    </body>
+    </html>
+    """
 
 REQUEST_ID_CTX: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
 
@@ -856,7 +1165,10 @@ def root():
 
 
 @app.get("/downloads", response_class=HTMLResponse)
-def downloads():
+def downloads(request: Request):
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
     rows = []
     for day in sorted(PUBLIC_DIR.iterdir(), reverse=True):
         if not day.is_dir():
@@ -901,6 +1213,7 @@ def downloads():
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
+        <a href="/settings">Settings</a>
       </nav>
       <h2>Generated Files</h2>
       <table>
@@ -914,7 +1227,10 @@ def downloads():
 
 
 @app.get("/logs", response_class=HTMLResponse)
-def logs():
+def logs(request: Request):
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
     rows = []
     for day in sorted(LOGS_DIR.iterdir(), reverse=True):
         if not day.is_dir():
@@ -962,6 +1278,7 @@ def logs():
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
+        <a href="/settings">Settings</a>
       </nav>
       <h2>FFmpeg Logs</h2>
       <table>
@@ -975,8 +1292,11 @@ def logs():
 
 
 @app.get("/logs/view", response_class=PlainTextResponse)
-def view_log(path: str, max_size_mb: int = 10):
+def view_log(request: Request, path: str, max_size_mb: int = 10):
     """View individual log file content."""
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
     target = safe_path_check(LOGS_DIR, path)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="Log not found")
@@ -992,12 +1312,15 @@ def view_log(path: str, max_size_mb: int = 10):
 
 
 @app.get("/ffmpeg", response_class=HTMLResponse)
-def ffmpeg_info(auto_refresh: int = 0):
+def ffmpeg_info(request: Request, auto_refresh: int = 0):
     """Display FFmpeg version and container logs.
-    
+
     Args:
         auto_refresh: Auto-refresh interval in seconds (0 = disabled, max 60)
     """
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
     # Get version
     version_proc = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
     version_output = version_proc.stdout if version_proc.returncode == 0 else "Error getting version"
@@ -1095,6 +1418,7 @@ def ffmpeg_info(auto_refresh: int = 0):
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
+        <a href="/settings">Settings</a>
       </nav>
       <h2>FFmpeg & Container Information</h2>
       
@@ -1134,7 +1458,10 @@ def ffmpeg_info(auto_refresh: int = 0):
 
 
 @app.get("/documentation", response_class=HTMLResponse)
-def documentation():
+def documentation(request: Request):
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
     """Display API documentation."""
     
     # API Endpoints Documentation
@@ -1186,6 +1513,13 @@ def documentation():
   <div class="path">/documentation</div>
   <div class="desc">This page - Complete API documentation</div>
   <div class="example">Example:<br>curl http://localhost:3000/documentation</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/settings</div>
+  <div class="desc">Configuration page for UI authentication and storage overview</div>
+  <div class="example">Example:<br>curl http://localhost:3000/settings</div>
 </div>
 
 <div class="endpoint">
@@ -1263,28 +1597,6 @@ def documentation():
   </div>
   <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
   <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-urls \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "video_url": "https://example.com/video.mp4",<br>    "audio_url": "https://example.com/audio.mp3",<br>    "bgm_url": "https://example.com/music.mp3",<br>    "duration": 20.0,<br>    "width": 1280,<br>    "height": 720,<br>    "fps": 30,<br>    "bgm_volume": 0.3,<br>    "as_json": true<br>  }'</div>
-</div>
-
-<div class="endpoint">
-  <div class="method post">POST</div>
-  <div class="path">/compose/from-urls/async</div>
-  <div class="desc">Queue video composition as a background job</div>
-  <div class="params">
-    Same parameters as <code>/compose/from-urls</code>
-  </div>
-  <div class="response">Returns: {"job_id": "...", "status_url": "/jobs/{job_id}"}</div>
-  <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-urls/async \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "video_url": "https://example.com/video.mp4",<br>    "duration_ms": 10000<br>  }'</div>
-</div>
-
-<div class="endpoint">
-  <div class="method get">GET</div>
-  <div class="path">/jobs/{job_id}</div>
-  <div class="desc">Fetch status details for an asynchronous job</div>
-  <div class="params">
-    <span class="param">job_id</span> - Identifier returned from the async compose endpoint
-  </div>
-  <div class="response">Returns: {"status": "queued|processing|finished|failed", ...}</div>
-  <div class="example">Example:<br>curl http://localhost:3000/jobs/123e4567-e89b-12d3-a456-426614174000</div>
 </div>
 
 <div class="endpoint">
@@ -1514,6 +1826,7 @@ def documentation():
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
+        <a href="/settings">Settings</a>
       </nav>
       <h2>FFAPI Ultimate - API Documentation</h2>
       
@@ -1529,6 +1842,131 @@ def documentation():
     </html>
     """
     return HTMLResponse(html_content)
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(
+    request: Request,
+    next: str = "",
+    message: str = "",
+    error: str = "",
+):
+    authed = is_authenticated(request)
+    next_target = next or "/settings"
+    if UI_AUTH.require_login and not authed:
+        html_content = render_login_page(next_target, error or None)
+        return HTMLResponse(html_content)
+
+    storage = storage_management_snapshot()
+    html_content = render_settings_page(
+        storage,
+        message or None,
+        error or None,
+        authenticated=authed,
+    )
+    return HTMLResponse(html_content)
+
+
+@app.post("/settings/login")
+async def settings_login(request: Request):
+    form = await request.form()
+    username = str(form.get("username", ""))
+    password = str(form.get("password", ""))
+    next_path = str(form.get("next", "/settings")) or "/settings"
+    if not next_path.startswith("/"):
+        next_path = "/settings"
+
+    if UI_AUTH.verify(username, password):
+        token = UI_AUTH.create_session()
+        response = RedirectResponse(url=next_path, status_code=303)
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            token,
+            max_age=SESSION_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+        )
+        return response
+
+    html_content = render_login_page(next_path, "Invalid username or password")
+    return HTMLResponse(html_content, status_code=401)
+
+
+@app.post("/settings/logout")
+async def settings_logout(request: Request):
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if token:
+        UI_AUTH.clear_session(token)
+    response = RedirectResponse(url="/settings", status_code=303)
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
+
+
+@app.post("/settings/ui-auth")
+async def settings_toggle_auth(request: Request):
+    form = await request.form()
+    enable_value = str(form.get("enable", "")).lower()
+    authed = is_authenticated(request)
+    if UI_AUTH.require_login and not authed:
+        response = RedirectResponse(
+            url=f"/settings?{urlencode({'error': 'Authentication required to change settings'})}",
+            status_code=303,
+        )
+        response.delete_cookie(SESSION_COOKIE_NAME)
+        return response
+
+    if enable_value not in {"true", "false"}:
+        storage = storage_management_snapshot()
+        html_content = render_settings_page(
+            storage,
+            error="Invalid toggle value",
+            authenticated=authed,
+        )
+        return HTMLResponse(html_content, status_code=400)
+
+    enable = enable_value == "true"
+    UI_AUTH.set_require_login(enable)
+    message = (
+        "Dashboard login requirement enabled"
+        if enable
+        else "Dashboard login requirement disabled"
+    )
+    query = urlencode({"message": message})
+    response = RedirectResponse(url=f"/settings?{query}", status_code=303)
+    if not enable:
+        response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
+
+
+@app.post("/settings/credentials")
+async def settings_update_credentials(request: Request):
+    form = await request.form()
+    username = str(form.get("username", ""))
+    password = str(form.get("password", ""))
+    authed = is_authenticated(request)
+    if UI_AUTH.require_login and not authed:
+        response = RedirectResponse(
+            url=f"/settings?{urlencode({'error': 'Authentication required to change credentials'})}",
+            status_code=303,
+        )
+        response.delete_cookie(SESSION_COOKIE_NAME)
+        return response
+
+    try:
+        UI_AUTH.set_credentials(username, password)
+    except ValueError as exc:
+        storage = storage_management_snapshot()
+        html_content = render_settings_page(
+            storage,
+            error=str(exc),
+            authenticated=authed,
+        )
+        return HTMLResponse(html_content, status_code=400)
+
+    query = urlencode({"message": "Credentials updated"})
+    response = RedirectResponse(url=f"/settings?{query}", status_code=303)
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
 
 
 @app.get("/health")
@@ -1564,7 +2002,10 @@ def health():
 
 
 @app.get("/metrics", response_class=HTMLResponse)
-def metrics_dashboard():
+def metrics_dashboard(request: Request):
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
     snapshot = METRICS.snapshot()
     endpoints_html = []
     for path, stats in sorted(snapshot["per_endpoint"].items()):
@@ -1640,6 +2081,7 @@ def metrics_dashboard():
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
+        <a href="/settings">Settings</a>
       </nav>
 
       <div class="cards">

@@ -17,6 +17,7 @@
 - `/ffmpeg` - Display FFmpeg version and container logs (HTML)
 - `/documentation` - Complete API documentation (HTML)
 - `/metrics` - Operational dashboard with per-endpoint metrics
+- `/settings` - Settings page for UI auth and storage overview
 - `/files/*` - Static file serving
 - `/image/to-mp4-loop` - Convert image to looping video
 - `/compose/from-binaries` - Compose video from uploaded files
@@ -45,6 +46,7 @@ docker compose up -d
 - `/logs` - View FFmpeg operation logs
 - `/ffmpeg` - Monitor container with live logs and FFmpeg version info (supports auto-refresh)
 - `/documentation` - Complete API reference with all endpoints and parameters
+- `/settings` - Toggle dashboard authentication and review storage usage
 
 Outputs persist in `./public` (mounted to `/data/public`).  
 Temporary work files live in `./work` (`/data/work`).  

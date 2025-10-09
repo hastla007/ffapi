@@ -187,6 +187,7 @@ def app_module(tmp_path_factory: pytest.TempPathFactory):
     if module_name in sys.modules:
         del sys.modules[module_name]
     module = importlib.import_module(module_name)
+    module.UI_AUTH.reset()
     return module
 
 
@@ -311,8 +312,16 @@ def patched_app(app_module, monkeypatch, tmp_path):
 
     app_module.METRICS.reset()
     app_module.RATE_LIMITER.reset()
+    app_module.UI_AUTH.reset()
 
     return app_module
+
+
+@pytest.fixture(autouse=True)
+def reset_ui_auth_state(app_module):
+    app_module.UI_AUTH.reset()
+    yield
+    app_module.UI_AUTH.reset()
 
 
 def test_root_redirects_to_downloads(patched_app):
@@ -345,6 +354,77 @@ def test_downloads_page_escapes_special_characters(patched_app):
     assert "&lt;img src=x onerror=alert(&#x27;xss&#x27;)&gt;.mp4" in html
     assert "onerror" in html
     assert "<img" not in html.split("Generated Files", 1)[1]
+
+
+def test_settings_page_shows_auth_and_storage_sections(patched_app):
+    status, _, body = call_app(patched_app.app, "GET", "/settings")
+    assert status == 200
+    html = body.decode()
+    assert "UI Authentication" in html
+    assert "Storage Management" in html
+    assert "Total storage used" in html
+
+
+def test_dashboard_requires_login_when_enabled(patched_app):
+    enable_body = urlencode({"enable": "true"}).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/ui-auth",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=enable_body,
+    )
+    assert status == 303
+    assert headers["location"].startswith("/settings")
+
+    status, headers, _ = call_app(patched_app.app, "GET", "/downloads")
+    assert status == 303
+    assert headers["location"].startswith("/settings?next=%2Fdownloads")
+
+    bad_login = urlencode({"username": "admin", "password": "wrongpass", "next": "/downloads"}).encode()
+    status, _, body = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/login",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=bad_login,
+    )
+    assert status == 401
+    assert "Invalid username or password" in body.decode()
+
+    good_login = urlencode({"username": "admin", "password": "admin123", "next": "/downloads"}).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/login",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=good_login,
+    )
+    assert status == 303
+    assert headers["location"] == "/downloads"
+    cookie_header = headers["set-cookie"]
+    session_token = cookie_header.split(";", 1)[0].split("=", 1)[1]
+
+    status, _, _ = call_app(
+        patched_app.app,
+        "GET",
+        "/downloads",
+        headers=[("Cookie", f"{patched_app.SESSION_COOKIE_NAME}={session_token}")],
+    )
+    assert status == 200
+
+
+def test_settings_rejects_short_password(patched_app):
+    body = urlencode({"username": "admin", "password": "short"}).encode()
+    status, _, response_body = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/credentials",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=body,
+    )
+    assert status == 400
+    assert "Password must be at least 6 characters long" in response_body.decode()
 
 
 def test_concurrent_requests_handle_independent_state(patched_app):
