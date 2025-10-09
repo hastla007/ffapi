@@ -1,13 +1,80 @@
-import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html
+import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Dict, List, Optional, Literal
+from uuid import uuid4
 
 import threading
 
-import requests
+try:
+    import httpx
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal environments
+    import requests
+
+    class _HeadResponse:
+        def __init__(self, response: requests.Response):
+            self._response = response
+            self.status_code = response.status_code
+            self.headers = response.headers
+
+        def raise_for_status(self) -> None:
+            self._response.raise_for_status()
+
+
+    class _StreamResponse(_HeadResponse):
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self._response.close()
+            return False
+
+        async def aiter_bytes(self, chunk_size: int):
+            iterator = self._response.iter_content(chunk_size)
+            while True:
+                try:
+                    chunk = await asyncio.to_thread(next, iterator)
+                except StopIteration:
+                    break
+                yield chunk
+
+
+    class _AsyncClient:
+        def __init__(self, follow_redirects: bool = True):
+            self._session = requests.Session()
+            self._session.trust_env = False
+            self._follow = follow_redirects
+
+        async def head(self, url: str, headers=None, timeout=None):
+            response = await asyncio.to_thread(
+                self._session.head,
+                url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=self._follow,
+            )
+            return _HeadResponse(response)
+
+        async def stream(self, method: str, url: str, headers=None, timeout=None):
+            if method.upper() != "GET":
+                raise ValueError("Only GET is supported by the fallback AsyncClient")
+            response = await asyncio.to_thread(
+                self._session.get,
+                url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=self._follow,
+                stream=True,
+            )
+            return _StreamResponse(response)
+
+        async def aclose(self) -> None:
+            await asyncio.to_thread(self._session.close)
+
+    httpx = types.SimpleNamespace(AsyncClient=_AsyncClient)
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -15,23 +82,228 @@ from pydantic import BaseModel, HttpUrl, field_validator
 
 app = FastAPI()
 
+
+class RateLimiter:
+    def __init__(self, requests_per_minute: int = 60) -> None:
+        self._limits: defaultdict[str, List[datetime]] = defaultdict(list)
+        self._rpm = max(requests_per_minute, 1)
+        self._lock = threading.Lock()
+
+    def check(self, identifier: str) -> bool:
+        now = datetime.utcnow()
+        cutoff = now - timedelta(minutes=1)
+        with self._lock:
+            timestamps = [t for t in self._limits[identifier] if t > cutoff]
+            if len(timestamps) >= self._rpm:
+                self._limits[identifier] = timestamps
+                return False
+            timestamps.append(now)
+            self._limits[identifier] = timestamps
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._limits.clear()
+
+
+@dataclass
+class Settings:
+    PUBLIC_DIR: Path
+    WORK_DIR: Path
+    LOGS_DIR: Path
+    PUBLIC_BASE_URL: Optional[str]
+    RETENTION_DAYS: int
+    MAX_FILE_SIZE_MB: int
+    FFMPEG_TIMEOUT_SECONDS: int
+    MIN_FREE_SPACE_MB: int
+    UPLOAD_CHUNK_SIZE: int
+    PUBLIC_CLEANUP_INTERVAL_SECONDS: int
+    REQUIRE_DURATION_LIMIT: bool
+    RATE_LIMIT_REQUESTS_PER_MINUTE: int
+
+    @classmethod
+    def load(cls) -> "Settings":
+        def env_path(name: str, default: str) -> Path:
+            return Path(os.getenv(name, default))
+
+        def env_int(name: str, default: int) -> int:
+            return int(os.getenv(name, str(default)))
+
+        def env_bool(name: str, default: bool) -> bool:
+            return os.getenv(name, str(default).lower()).lower() == "true"
+
+        retention = env_int("RETENTION_DAYS", 7)
+        if not (1 <= retention <= 365):
+            raise ValueError("RETENTION_DAYS must be 1-365")
+
+        rpm = env_int("RATE_LIMIT_REQUESTS_PER_MINUTE", 60)
+        if rpm < 1:
+            raise ValueError("RATE_LIMIT_REQUESTS_PER_MINUTE must be >= 1")
+
+        return cls(
+            PUBLIC_DIR=env_path("PUBLIC_DIR", "/data/public"),
+            WORK_DIR=env_path("WORK_DIR", "/data/work"),
+            LOGS_DIR=env_path("LOGS_DIR", "/data/logs"),
+            PUBLIC_BASE_URL=os.getenv("PUBLIC_BASE_URL"),
+            RETENTION_DAYS=retention,
+            MAX_FILE_SIZE_MB=env_int("MAX_FILE_SIZE_MB", 2048),
+            FFMPEG_TIMEOUT_SECONDS=env_int("FFMPEG_TIMEOUT_SECONDS", 2 * 60 * 60),
+            MIN_FREE_SPACE_MB=env_int("MIN_FREE_SPACE_MB", 1000),
+            UPLOAD_CHUNK_SIZE=env_int("UPLOAD_CHUNK_SIZE", 1024 * 1024),
+            PUBLIC_CLEANUP_INTERVAL_SECONDS=env_int("PUBLIC_CLEANUP_INTERVAL_SECONDS", 3600),
+            REQUIRE_DURATION_LIMIT=env_bool("REQUIRE_DURATION_LIMIT", False),
+            RATE_LIMIT_REQUESTS_PER_MINUTE=rpm,
+        )
+
+
+settings = Settings.load()
+
 # --------- config ---------
-PUBLIC_DIR = Path(os.getenv("PUBLIC_DIR", "/data/public")).resolve()
+PUBLIC_DIR = settings.PUBLIC_DIR.resolve()
 PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
 
 # Optional dedicated work directory to keep temp files on the same volume
-WORK_DIR = Path(os.getenv("WORK_DIR", "/data/work")).resolve()
+WORK_DIR = settings.WORK_DIR.resolve()
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 # Logs directory for persistent ffmpeg logs
-LOGS_DIR = Path(os.getenv("LOGS_DIR", "/data/logs")).resolve()
+LOGS_DIR = settings.LOGS_DIR.resolve()
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Application log file (captures stdout/stderr)
 APP_LOG_FILE = LOGS_DIR / "application.log"
 
-RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # e.g. "http://10.120.2.5:3000"
+RETENTION_DAYS = settings.RETENTION_DAYS
+PUBLIC_BASE_URL = settings.PUBLIC_BASE_URL  # e.g. "http://10.120.2.5:3000"
+
+MAX_FILE_SIZE_MB = settings.MAX_FILE_SIZE_MB
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+FFMPEG_TIMEOUT_SECONDS = settings.FFMPEG_TIMEOUT_SECONDS
+MIN_FREE_SPACE_MB = settings.MIN_FREE_SPACE_MB
+UPLOAD_CHUNK_SIZE = settings.UPLOAD_CHUNK_SIZE
+PUBLIC_CLEANUP_INTERVAL_SECONDS = settings.PUBLIC_CLEANUP_INTERVAL_SECONDS
+REQUIRE_DURATION_LIMIT = settings.REQUIRE_DURATION_LIMIT
+RATE_LIMITER = RateLimiter(settings.RATE_LIMIT_REQUESTS_PER_MINUTE)
+
+
+class MetricsTracker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._per_endpoint: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: {"success": 0, "failure": 0, "total_duration": 0.0}
+        )
+        self._error_counts: Counter[str] = Counter()
+        self._recent_outcomes: deque[bool] = deque(maxlen=100)
+        self._operation_history: deque[Dict[str, float]] = deque(maxlen=200)
+        self._current_requests = 0
+        self._max_queue_depth = 0
+        self._total_wait_time = 0.0
+        self._wait_samples = 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._per_endpoint.clear()
+            self._error_counts.clear()
+            self._recent_outcomes.clear()
+            self._operation_history.clear()
+            self._current_requests = 0
+            self._max_queue_depth = 0
+            self._total_wait_time = 0.0
+            self._wait_samples = 0
+
+    def request_started(self) -> None:
+        with self._lock:
+            self._current_requests += 1
+            if self._current_requests > self._max_queue_depth:
+                self._max_queue_depth = self._current_requests
+
+    def request_finished(
+        self,
+        path: str,
+        status_code: int,
+        duration: float,
+        wait_time: float,
+        error_key: Optional[str] = None,
+    ) -> None:
+        success = 200 <= status_code < 400
+        with self._lock:
+            stats = self._per_endpoint[path]
+            if success:
+                stats["success"] += 1
+            else:
+                stats["failure"] += 1
+            stats["total_duration"] += duration
+            self._recent_outcomes.append(success)
+            self._operation_history.append(
+                {
+                    "timestamp": time.time(),
+                    "path": path,
+                    "status": status_code,
+                    "duration": duration,
+                }
+            )
+            self._total_wait_time += max(wait_time, 0.0)
+            self._wait_samples += 1
+            if not success:
+                key = error_key or str(status_code)
+                self._error_counts[key] += 1
+
+    def request_completed(self) -> None:
+        with self._lock:
+            if self._current_requests > 0:
+                self._current_requests -= 1
+
+    def snapshot(self) -> Dict[str, object]:
+        with self._lock:
+            per_endpoint: Dict[str, Dict[str, object]] = {}
+            for path, stats in self._per_endpoint.items():
+                total_calls = stats["success"] + stats["failure"]
+                avg_duration = (
+                    stats["total_duration"] / total_calls if total_calls else 0.0
+                )
+                success_rate = (
+                    stats["success"] / total_calls if total_calls else 0.0
+                )
+                per_endpoint[path] = {
+                    "success": int(stats["success"]),
+                    "failure": int(stats["failure"]),
+                    "total": int(total_calls),
+                    "avg_duration_ms": avg_duration * 1000.0,
+                    "success_rate": success_rate,
+                }
+
+            total_recent = len(self._recent_outcomes)
+            recent_successes = sum(1 for outcome in self._recent_outcomes if outcome)
+            queue_avg_wait = (
+                (self._total_wait_time / self._wait_samples)
+                if self._wait_samples
+                else 0.0
+            )
+
+            return {
+                "per_endpoint": per_endpoint,
+                "errors": dict(self._error_counts),
+                "queue": {
+                    "current": self._current_requests,
+                    "max": self._max_queue_depth,
+                    "avg_wait_ms": queue_avg_wait * 1000.0,
+                },
+                "recent": {
+                    "window": total_recent,
+                    "successes": recent_successes,
+                    "failures": total_recent - recent_successes,
+                    "success_rate": (
+                        recent_successes / total_recent if total_recent else None
+                    ),
+                },
+                "history": list(self._operation_history),
+            }
+
+
+METRICS = MetricsTracker()
+
+JOBS: Dict[str, Dict[str, object]] = {}
+JOBS_LOCK = threading.Lock()
 
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "2048"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -167,6 +439,16 @@ async def metrics_middleware(request, call_next):
     path = request.url.path
     arrival = time.perf_counter()
     METRICS.request_started()
+
+    identifier = "unknown"
+    if request.client:
+        identifier = request.client.host or "unknown"
+
+    if not RATE_LIMITER.check(identifier):
+        METRICS.request_finished(path, 429, 0.0, 0.0, "rate_limited")
+        METRICS.request_completed()
+        return PlainTextResponse("Too Many Requests", status_code=429)
+
     processing_start = time.perf_counter()
     wait_time = processing_start - arrival
     try:
@@ -983,6 +1265,28 @@ def documentation():
 
 <div class="endpoint">
   <div class="method post">POST</div>
+  <div class="path">/compose/from-urls/async</div>
+  <div class="desc">Queue video composition as a background job</div>
+  <div class="params">
+    Same parameters as <code>/compose/from-urls</code>
+  </div>
+  <div class="response">Returns: {"job_id": "...", "status_url": "/jobs/{job_id}"}</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-urls/async \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "video_url": "https://example.com/video.mp4",<br>    "duration_ms": 10000<br>  }'</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/jobs/{job_id}</div>
+  <div class="desc">Fetch status details for an asynchronous job</div>
+  <div class="params">
+    <span class="param">job_id</span> - Identifier returned from the async compose endpoint
+  </div>
+  <div class="response">Returns: {"status": "queued|processing|finished|failed", ...}</div>
+  <div class="example">Example:<br>curl http://localhost:3000/jobs/123e4567-e89b-12d3-a456-426614174000</div>
+</div>
+
+<div class="endpoint">
+  <div class="method post">POST</div>
   <div class="path">/compose/from-tracks</div>
   <div class="desc">Compose video from track definitions</div>
   <div class="params">
@@ -1447,16 +1751,21 @@ ALLOWED_FORWARD_HEADERS_LOWER = {
     "cookie", "authorization", "x-n8n-api-key", "ngrok-skip-browser-warning"
 }
 
-def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None, max_retries: int = 3, chunk_size: int = 1024 * 1024):
-    """Download file with retry, resume, and progress tracking.
 
-    Args:
-        url: URL to download from
-        dest: Destination file path
-        headers: Optional HTTP headers to forward
-        max_retries: Number of retry attempts (default: 3)
-        chunk_size: Download chunk size in bytes (default: 1MB)
-    """
+def _make_async_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(follow_redirects=True)
+
+
+async def _download_to(
+    url: str,
+    dest: Path,
+    headers: Optional[Dict[str, str]] = None,
+    max_retries: int = 3,
+    chunk_size: int = 1024 * 1024,
+    client: Optional[httpx.AsyncClient] = None,
+) -> None:
+    """Download file with retry, resume, and progress tracking."""
+
     base_headers: Dict[str, str] = {}
     if headers:
         for k, v in headers.items():
@@ -1467,145 +1776,169 @@ def _download_to(url: str, dest: Path, headers: Optional[Dict[str, str]] = None,
     check_disk_space(dest.parent)
 
     can_resume = True
+    own_client = False
+    session = client
+    if session is None:
+        session = _make_async_client()
+        own_client = True
 
-    for attempt in range(max_retries):
-        try:
-            req_hdr = dict(base_headers)
-            existing_size = dest.stat().st_size if dest.exists() else 0
-
-            if not can_resume and dest.exists():
-                try:
-                    dest.unlink()
-                except Exception as cleanup_exc:
-                    logger.warning("Failed to reset download %s: %s", dest, cleanup_exc)
-                    _flush_logs()
-                existing_size = 0
-
-            use_resume = can_resume and existing_size > 0
-
-            if use_resume:
-                req_hdr['Range'] = f'bytes={existing_size}-'
-                logger.info(f"Resuming download from {existing_size/1024/1024:.1f}MB: {url}")
-
-            # Estimate timeout based on size hints
-            timeout = 600
-            size_hint = None
+    try:
+        for attempt in range(max_retries):
             try:
-                head_headers = dict(req_hdr)
-                head_headers.pop('Range', None)
-                head_resp = requests.head(url, headers=head_headers, timeout=30)
-                head_resp.raise_for_status()
-                if 'content-length' in head_resp.headers:
-                    size_hint = int(head_resp.headers['content-length'])
-            except Exception:
-                size_hint = None
+                req_hdr = dict(base_headers)
+                existing_size = dest.stat().st_size if dest.exists() else 0
 
-            if size_hint is not None:
-                size_mb = size_hint / (1024 * 1024)
-                timeout = max(600, int(size_mb * 10))
-            else:
-                timeout = 3600
-
-            with requests.get(url, headers=req_hdr, stream=True, timeout=timeout) as r:
-                r.raise_for_status()
-
-                # Check if server supports Range requests
-                if use_resume:
-                    if r.status_code == 206:
-                        # Server supports Range, we got partial content
-                        logger.info(f"✓ Server supports resume for: {url}")
-                        mode = 'ab'
-                    elif r.status_code == 200:
-                        # Server doesn't support Range, gave us full file
-                        logger.warning(f"⚠ Server doesn't support resume, downloading from start: {url}")
-                        if dest.exists():
-                            try:
-                                dest.unlink()
-                            except Exception as cleanup_exc:
-                                logger.warning("Failed to remove stale partial %s: %s", dest, cleanup_exc)
-                                _flush_logs()
-                        mode = 'wb'  # Switch to overwrite mode
-                        existing_size = 0
-                        can_resume = False
-                    else:
-                        logger.error(
-                            "Unexpected status %s while resuming download %s", r.status_code, url
-                        )
-                        _flush_logs()
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"Unexpected status {r.status_code} when requesting range",
-                        )
-                else:
-                    mode = 'wb'
-
-                # Get total size
-                if 'content-length' in r.headers:
-                    content_length = int(r.headers['content-length'])
-                    if r.status_code == 206:
-                        # Partial content - add existing size
-                        total_size = existing_size + content_length
-                    else:
-                        # Full content
-                        total_size = content_length
-                else:
-                    total_size = 0
-
-                required_mb = MIN_FREE_SPACE_MB
-                if total_size:
-                    remaining = total_size - existing_size
-                    if remaining < 0:
-                        remaining = 0
-                    remaining_mb = (remaining + 1024 * 1024 - 1) // (1024 * 1024)
-                    required_mb = max(MIN_FREE_SPACE_MB, MIN_FREE_SPACE_MB + remaining_mb)
-                check_disk_space(dest.parent, required_mb=required_mb)
-
-                # Download with progress tracking
-                downloaded = existing_size
-                last_log = downloaded
-
-                with dest.open(mode) as f:
-                    for chunk in r.iter_content(chunk_size):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            # Log progress every 50MB
-                            if downloaded - last_log >= 50 * 1024 * 1024:
-                                if total_size:
-                                    percent = (downloaded / total_size) * 100
-                                    logger.info(f"Download progress: {percent:.0f}% ({downloaded/1024/1024:.0f}MB/{total_size/1024/1024:.0f}MB)")
-                                else:
-                                    logger.info(f"Downloaded: {downloaded/1024/1024:.0f}MB")
-                                last_log = downloaded
-
-                # Verify size if we know what to expect
-                if total_size and downloaded != total_size:
-                    raise Exception(f"Download incomplete: got {downloaded} bytes, expected {total_size}")
-
-                logger.info(f"Download complete: {downloaded/1024/1024:.1f}MB - {url}")
-                return  # Success!
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            if attempt < max_retries - 1:
-                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
-                logger.warning(f"Download failed (attempt {attempt + 1}/{max_retries}): {e}")
-                logger.warning(f"Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-            else:
-                # Final attempt failed
-                logger.error(f"Download failed after {max_retries} attempts: {e}")
-                _flush_logs()
-                # Clean up partial file on final failure
-                if dest.exists():
+                if not can_resume and dest.exists():
                     try:
                         dest.unlink()
                     except Exception as cleanup_exc:
-                        logger.warning("Failed to remove partial download %s: %s", dest, cleanup_exc)
+                        logger.warning("Failed to reset download %s: %s", dest, cleanup_exc)
                         _flush_logs()
+                    existing_size = 0
+
+                use_resume = can_resume and existing_size > 0
+
+                if use_resume:
+                    req_hdr["Range"] = f"bytes={existing_size}-"
+                    logger.info(
+                        "Resuming download from %.1fMB: %s",
+                        existing_size / 1024 / 1024,
+                        url,
+                    )
+
+                timeout = 600
+                size_hint = None
+                try:
+                    head_headers = dict(req_hdr)
+                    head_headers.pop("Range", None)
+                    head_resp = await session.head(url, headers=head_headers, timeout=30)
+                    head_resp.raise_for_status()
+                    if "content-length" in head_resp.headers:
+                        size_hint = int(head_resp.headers["content-length"])
+                except Exception:
+                    size_hint = None
+
+                if size_hint is not None:
+                    size_mb = size_hint / (1024 * 1024)
+                    timeout = max(600, int(size_mb * 10))
+                else:
+                    timeout = 3600
+
+                async with session.stream("GET", url, headers=req_hdr, timeout=timeout) as r:
+                    r.raise_for_status()
+
+                    if use_resume:
+                        if r.status_code == 206:
+                            logger.info("✓ Server supports resume for: %s", url)
+                            mode = "ab"
+                        elif r.status_code == 200:
+                            logger.warning(
+                                "⚠ Server doesn't support resume, downloading from start: %s",
+                                url,
+                            )
+                            if dest.exists():
+                                try:
+                                    dest.unlink()
+                                except Exception as cleanup_exc:
+                                    logger.warning(
+                                        "Failed to remove stale partial %s: %s", dest, cleanup_exc
+                                    )
+                                    _flush_logs()
+                            mode = "wb"
+                            existing_size = 0
+                            can_resume = False
+                        else:
+                            logger.error(
+                                "Unexpected status %s while resuming download %s",
+                                r.status_code,
+                                url,
+                            )
+                            _flush_logs()
+                            raise HTTPException(
+                                status_code=502,
+                                detail=f"Unexpected status {r.status_code} when requesting range",
+                            )
+                    else:
+                        mode = "wb"
+
+                    if "content-length" in r.headers:
+                        content_length = int(r.headers["content-length"])
+                        if r.status_code == 206:
+                            total_size = existing_size + content_length
+                        else:
+                            total_size = content_length
+                    else:
+                        total_size = 0
+
+                    required_mb = MIN_FREE_SPACE_MB
+                    if total_size:
+                        remaining = total_size - existing_size
+                        if remaining < 0:
+                            remaining = 0
+                        remaining_mb = (remaining + 1024 * 1024 - 1) // (1024 * 1024)
+                        required_mb = max(
+                            MIN_FREE_SPACE_MB, MIN_FREE_SPACE_MB + remaining_mb
+                        )
+                    check_disk_space(dest.parent, required_mb=required_mb)
+
+                    downloaded = existing_size
+                    last_log = downloaded
+
+                    with dest.open(mode) as f:
+                        async for chunk in r.aiter_bytes(chunk_size):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+
+                                if downloaded - last_log >= 50 * 1024 * 1024:
+                                    if total_size:
+                                        percent = (downloaded / total_size) * 100
+                                        logger.info(
+                                            "Download progress: %d%% (%.0fMB/%.0fMB)",
+                                            int(percent),
+                                            downloaded / 1024 / 1024,
+                                            total_size / 1024 / 1024,
+                                        )
+                                    else:
+                                        logger.info("Downloaded: %.0fMB", downloaded / 1024 / 1024)
+                                    last_log = downloaded
+
+                    if total_size and downloaded != total_size:
+                        raise Exception(
+                            f"Download incomplete: got {downloaded} bytes, expected {total_size}"
+                        )
+
+                    logger.info(
+                        "Download complete: %.1fMB - %s", downloaded / 1024 / 1024, url
+                    )
+                    return
+
+            except HTTPException:
                 raise
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2**attempt
+                    logger.warning(
+                        "Download failed (attempt %d/%d): %s",
+                        attempt + 1,
+                        max_retries,
+                        e,
+                    )
+                    logger.warning("Retrying in %s seconds...", wait_time)
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error("Download failed after %d attempts: %s", max_retries, e)
+                    _flush_logs()
+                    if dest.exists():
+                        try:
+                            dest.unlink()
+                        except Exception as cleanup_exc:
+                            logger.warning("Failed to remove partial download %s: %s", dest, cleanup_exc)
+                            _flush_logs()
+                    raise
+    finally:
+        if own_client and session is not None:
+            await session.aclose()
 
 
 # ---------- routes ----------
@@ -1733,7 +2066,7 @@ async def compose_from_binaries(
 
 
 @app.post("/video/concat-from-urls")
-def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
+async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
     logger.info(f"Starting concat: {len(job.clips)} clips, {job.width}x{job.height}@{job.fps}fps")
     check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="concat_", dir=str(WORK_DIR)) as workdir:
@@ -1741,7 +2074,7 @@ def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
         norm = []
         for i, url in enumerate(job.clips):
             raw = work / f"in_{i:03d}.bin"
-            _download_to(str(url), raw, None)
+            await _download_to(str(url), raw, None)
             out = work / f"norm_{i:03d}.mp4"
             cmd = [
                 "ffmpeg", "-y",
@@ -1804,19 +2137,20 @@ class ConcatAliasJob(BaseModel):
         return value
 
 @app.post("/video/concat")
-def video_concat_alias(job: ConcatAliasJob, as_json: bool = False):
+async def video_concat_alias(job: ConcatAliasJob, as_json: bool = False):
     clip_list = job.clips or job.urls
     if not clip_list:
         raise HTTPException(status_code=422, detail="Provide 'clips' (preferred) or 'urls' array of video URLs")
     cj = ConcatJob(clips=clip_list, width=job.width, height=job.height, fps=job.fps)
-    return video_concat_from_urls(cj, as_json=as_json)
+    return await video_concat_from_urls(cj, as_json=as_json)
 
 
-@app.post("/compose/from-urls")
-def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
+async def _compose_from_urls_impl(job: ComposeFromUrlsJob) -> Dict[str, str]:
     if job.duration_ms <= 0 or job.duration_ms > 3600000:
         raise HTTPException(status_code=400, detail="invalid duration_ms (1..3600000)")
+
     check_disk_space(WORK_DIR)
+
     with TemporaryDirectory(prefix="cfu_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         v_path = work / "video_in.mp4"
@@ -1825,20 +2159,22 @@ def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
         out_path = work / "output.mp4"
         log_path = work / "ffmpeg.log"
 
-        _download_to(str(job.video_url), v_path, job.headers)
+        await _download_to(str(job.video_url), v_path, job.headers)
         has_audio = False
         has_bgm = False
         if job.audio_url:
-            _download_to(str(job.audio_url), a_path, job.headers)
+            await _download_to(str(job.audio_url), a_path, job.headers)
             has_audio = True
         if job.bgm_url:
-            _download_to(str(job.bgm_url), b_path, job.headers)
+            await _download_to(str(job.bgm_url), b_path, job.headers)
             has_bgm = True
 
         dur_s = f"{job.duration_ms/1000:.3f}"
         inputs = ["-i", str(v_path)]
-        if has_audio: inputs += ["-i", str(a_path)]
-        if has_bgm:   inputs += ["-i", str(b_path)]
+        if has_audio:
+            inputs += ["-i", str(a_path)]
+        if has_bgm:
+            inputs += ["-i", str(b_path)]
 
         maps = ["-map", "0:v:0"]
         cmd = ["ffmpeg", "-y"] + inputs + [
@@ -1848,8 +2184,20 @@ def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
             "-movflags", "+faststart",
         ]
         if has_audio and has_bgm:
-            af = f"[1:a]anull[a1];[2:a]volume={job.bgm_volume}[a2];[a1][a2]amix=inputs=2:normalize=0:duration=shortest[aout]"
-            cmd += ["-filter_complex", af, "-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
+            af = (
+                f"[1:a]anull[a1];[2:a]volume={job.bgm_volume}[a2];"
+                "[a1][a2]amix=inputs=2:normalize=0:duration=shortest[aout]"
+            )
+            cmd += [
+                "-filter_complex",
+                af,
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-ar",
+                "48000",
+            ]
             maps += ["-map", "[aout]"]
         elif has_audio:
             maps += ["-map", "1:a:0"]
@@ -1866,18 +2214,97 @@ def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
         if code != 0 or not out_path.exists():
             logger.error("compose-from-urls failed")
             _flush_logs()
-            return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": cmd, "log": log_path.read_text()})
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "ffmpeg_failed",
+                    "cmd": cmd,
+                    "log": log_path.read_text(),
+                },
+            )
 
         pub = publish_file(out_path, ".mp4")
-        if as_json:
-            return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
-        resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
-        resp.headers["X-File-URL"] = pub["url"]
-        return resp
+        logger.info("compose-from-urls completed: %s", pub["rel"])
+        return pub
+
+
+@app.post("/compose/from-urls")
+async def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
+    pub = await _compose_from_urls_impl(job)
+    if as_json:
+        return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
+    resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
+    resp.headers["X-File-URL"] = pub["url"]
+    return resp
+
+
+async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -> None:
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "processing"
+        JOBS[job_id]["progress"] = 10
+        JOBS[job_id]["started"] = time.time()
+
+    start = time.perf_counter()
+    try:
+        pub = await _compose_from_urls_impl(job)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, (str, dict)) else str(exc.detail)
+        with JOBS_LOCK:
+            JOBS[job_id] = {
+                "status": "failed",
+                "progress": 100,
+                "status_code": exc.status_code,
+                "error": detail,
+            }
+        return
+    except Exception as exc:
+        logger.exception("Async compose job %s failed", job_id)
+        with JOBS_LOCK:
+            JOBS[job_id] = {
+                "status": "failed",
+                "progress": 100,
+                "status_code": 500,
+                "error": str(exc),
+            }
+        return
+
+    duration_ms = (time.perf_counter() - start) * 1000.0
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "finished",
+            "progress": 100,
+            "result": {
+                "file_url": pub["url"],
+                "path": pub["dst"],
+                "rel": pub["rel"],
+            },
+            "duration_ms": duration_ms,
+        }
+
+
+@app.post("/compose/from-urls/async")
+async def compose_from_urls_async(job: ComposeFromUrlsJob):
+    job_id = str(uuid4())
+    with JOBS_LOCK:
+        JOBS[job_id] = {"status": "queued", "progress": 0, "created": time.time()}
+    job_copy = job.model_copy(deep=True)
+    asyncio.create_task(_process_compose_from_urls_job(job_id, job_copy))
+    return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}
+
+
+@app.get("/jobs/{job_id}")
+async def job_status(job_id: str):
+    with JOBS_LOCK:
+        data = JOBS.get(job_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="job_not_found")
+    payload = {"job_id": job_id}
+    payload.update(data)
+    return payload
 
 
 @app.post("/compose/from-tracks")
-def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
+async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
     video_urls: List[str] = []
     audio_urls: List[str] = []
     primary_video_url: Optional[str] = None
@@ -1909,11 +2336,11 @@ def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
     with TemporaryDirectory(prefix="tracks_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         v_in = work / "video.mp4"
-        _download_to(primary_video_url, v_in, None)
+        await _download_to(primary_video_url, v_in, None)
         a_ins: List[Path] = []
         for i, url in enumerate(audio_urls):
             p = work / f"aud_{i:03d}.bin"
-            _download_to(url, p, None)
+            await _download_to(url, p, None)
             a_ins.append(p)
 
         dur_s = f"{max_dur/1000:.3f}"
@@ -1953,14 +2380,14 @@ def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
 
 
 @app.post("/v1/run-ffmpeg-command")
-def run_rendi(job: RendiJob):
+async def run_rendi(job: RendiJob):
     check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="rendi_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
         resolved = {}
         for key, url in job.input_files.items():
             p = work / f"{key}"
-            _download_to(str(url), p, None)
+            await _download_to(str(url), p, None)
             resolved[key] = str(p)
 
         out_paths: Dict[str, Path] = {}

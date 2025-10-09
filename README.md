@@ -16,10 +16,13 @@
 - `/logs/view?path=...` - View individual log file
 - `/ffmpeg` - Display FFmpeg version and container logs (HTML)
 - `/documentation` - Complete API documentation (HTML)
+- `/metrics` - Operational dashboard with per-endpoint metrics
 - `/files/*` - Static file serving
 - `/image/to-mp4-loop` - Convert image to looping video
 - `/compose/from-binaries` - Compose video from uploaded files
 - `/compose/from-urls` - Compose video from URLs
+- `/compose/from-urls/async` - Queue URL composition job
+- `/jobs/{job_id}` - Check asynchronous job status
 - `/compose/from-tracks` - Compose from track definitions
 - `/video/concat-from-urls` - Concatenate videos
 - `/video/concat` - Concat alias (accepts `clips` or `urls`)
@@ -56,7 +59,8 @@ For complete API documentation with all parameters and examples, visit `/documen
 
 **Video Composition:**
 - `/compose/from-binaries` - Compose from uploaded files
-- `/compose/from-urls` - Compose from URLs  
+- `/compose/from-urls` - Compose from URLs
+- `/compose/from-urls/async` - Start background job and poll `/jobs/{job_id}` for results
 - `/compose/from-tracks` - Compose from track definitions
 
 **Video Concatenation:**
@@ -65,6 +69,7 @@ For complete API documentation with all parameters and examples, visit `/documen
 
 **Custom Commands:**
 - `/v1/run-ffmpeg-command` - Run custom FFmpeg command
+- `/jobs/{job_id}` - Fetch asynchronous job status
 
 **Media Inspection:**
 - `/probe/from-urls` - Inspect media from URL
@@ -77,6 +82,12 @@ For complete API documentation with all parameters and examples, visit `/documen
 - `WORK_DIR` - Directory for temporary work files (default: /data/work)
 - `LOGS_DIR` - Directory for FFmpeg logs (default: /data/logs)
 - `RETENTION_DAYS` - Days to keep files before deletion (default: 7)
+- `MAX_FILE_SIZE_MB` - Maximum upload size enforced during streaming (default: 2048)
+- `FFMPEG_TIMEOUT_SECONDS` - Maximum FFmpeg runtime before timeout (default: 7200)
+- `MIN_FREE_SPACE_MB` - Minimum free disk space required before processing (default: 1000)
+- `PUBLIC_CLEANUP_INTERVAL_SECONDS` - Interval between retention sweeps (default: 3600)
+- `REQUIRE_DURATION_LIMIT` - Enforce `-t` or `-frames` on custom FFmpeg commands (default: false)
+- `RATE_LIMIT_REQUESTS_PER_MINUTE` - Requests per minute per client before 429 responses (default: 60)
 
 ### Retention Logic
 Files are automatically cleaned up based on their **actual modification time**, not the folder date. This means:

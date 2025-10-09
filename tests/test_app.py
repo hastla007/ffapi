@@ -8,12 +8,76 @@ import sys
 import time
 from itertools import count
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 from urllib.parse import urlencode
 
 import pytest
 from fastapi import HTTPException, UploadFile
 from starlette.datastructures import Headers
+
+
+class StubHeadResponse:
+    def __init__(self, *, length: int, status_code: int = 200):
+        self.headers = {"content-length": str(length)}
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"status {self.status_code}")
+
+
+class StubStreamResponse:
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        chunks: List[bytes],
+        fail_after_first_chunk: bool = False,
+        headers: dict | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.headers = headers or {"content-length": str(sum(len(c) for c in chunks))}
+        self._chunks = list(chunks)
+        self._fail_after_first = fail_after_first_chunk
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"status {self.status_code}")
+
+    async def aiter_bytes(self, chunk_size: int):
+        for index, chunk in enumerate(self._chunks):
+            yield chunk
+            if self._fail_after_first and index == 0:
+                raise RuntimeError("connection dropped")
+
+
+class StubAsyncClient:
+    def __init__(self, head_responses: List[StubHeadResponse], stream_responses: List[StubStreamResponse]):
+        self.head_responses = list(head_responses)
+        self.stream_responses = list(stream_responses)
+        self.head_calls: List[dict] = []
+        self.stream_calls: List[dict] = []
+        self.head_timeouts: List[float] = []
+        self.stream_timeouts: List[float] = []
+
+    async def head(self, url: str, headers=None, timeout=None):
+        self.head_calls.append(dict(headers or {}))
+        self.head_timeouts.append(timeout)
+        return self.head_responses.pop(0)
+
+    def stream(self, method: str, url: str, headers=None, timeout=None):
+        self.stream_calls.append(dict(headers or {}))
+        self.stream_timeouts.append(timeout)
+        return self.stream_responses.pop(0)
+
+    async def aclose(self):
+        return None
 
 
 class DummyCompletedProcess:
@@ -111,7 +175,7 @@ def patched_app(app_module, monkeypatch, tmp_path):
             dst.write_bytes(b"")
         return {"dst": str(dst), "url": f"http://example.com/{dst.name}", "rel": f"/files/{dst.name}"}
 
-    def fake_download_to(url: str, dest: Path, headers=None, max_retries: int = 3, chunk_size: int = 1024 * 1024):
+    async def fake_download_to(url: str, dest: Path, headers=None, max_retries: int = 3, chunk_size: int = 1024 * 1024, client=None):
         dest_path = Path(dest)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         dest_path.write_bytes(f"downloaded from {url}".encode("utf-8"))
@@ -216,6 +280,7 @@ def patched_app(app_module, monkeypatch, tmp_path):
         directory.mkdir(parents=True, exist_ok=True)
 
     app_module.METRICS.reset()
+    app_module.RATE_LIMITER.reset()
 
     return app_module
 
@@ -276,69 +341,34 @@ def test_concurrent_requests_handle_independent_state(patched_app):
     assert "event.log" in logs_html
 
 
-def test_download_to_clears_range_header_when_resume_not_supported(app_module, monkeypatch, tmp_path):
+def test_download_to_clears_range_header_when_resume_not_supported(app_module, tmp_path):
     dest = tmp_path / "asset.bin"
     dest.write_bytes(b"abcd")
 
-    headers_seen = []
-    head_calls = []
+    client = StubAsyncClient(
+        head_responses=[StubHeadResponse(length=6), StubHeadResponse(length=6)],
+        stream_responses=[
+            StubStreamResponse(status_code=200, chunks=[b"one", b"two"], fail_after_first_chunk=True),
+            StubStreamResponse(status_code=200, chunks=[b"onetwo"], fail_after_first_chunk=False),
+        ],
+    )
 
-    class FakeResponse:
-        def __init__(self, status_code: int, chunks, fail_after_first_chunk: bool):
-            self.status_code = status_code
-            self.headers = {"content-length": str(sum(len(chunk) for chunk in chunks))}
-            self._chunks = list(chunks)
-            self._fail_after_first_chunk = fail_after_first_chunk
+    asyncio.run(
+        app_module._download_to(
+            "https://example.com/file",
+            dest,
+            headers={"Authorization": "token"},
+            max_retries=2,
+            chunk_size=3,
+            client=client,
+        )
+    )
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def raise_for_status(self):
-            return None
-
-        def iter_content(self, chunk_size):
-            for index, chunk in enumerate(self._chunks):
-                yield chunk
-                if self._fail_after_first_chunk and index == 0:
-                    raise RuntimeError("connection dropped")
-
-    class FakeHeadResponse:
-        def __init__(self, length: int):
-            self.headers = {"content-length": str(length)}
-
-        def raise_for_status(self):
-            return None
-
-    responses = [
-        FakeResponse(200, [b"one", b"two"], True),
-        FakeResponse(200, [b"onetwo"], False),
-    ]
-    head_responses = [
-        FakeHeadResponse(6),
-        FakeHeadResponse(6),
-    ]
-
-    def fake_get(url, headers=None, stream=True, timeout=None):
-        headers_seen.append(dict(headers or {}))
-        return responses.pop(0)
-
-    def fake_head(url, headers=None, timeout=None):
-        head_calls.append(dict(headers or {}))
-        return head_responses.pop(0)
-
-    monkeypatch.setattr(app_module.requests, "get", fake_get)
-    monkeypatch.setattr(app_module.requests, "head", fake_head)
-
-    app_module._download_to("https://example.com/file", dest, headers={"Authorization": "token"}, max_retries=2, chunk_size=3)
-
-    assert len(headers_seen) == 2
-    assert "Range" in headers_seen[0]
-    assert "Range" not in headers_seen[1]
-    assert len(head_calls) == 2
-    assert "Range" not in head_calls[0]
+    assert len(client.stream_calls) == 2
+    assert "Range" in client.stream_calls[0]
+    assert "Range" not in client.stream_calls[1]
+    assert len(client.head_calls) == 2
+    assert "Range" not in client.head_calls[0]
     assert dest.read_bytes() == b"onetwo"
 
 
@@ -346,134 +376,70 @@ def test_download_to_scales_timeout_and_disk_check(app_module, monkeypatch, tmp_
     dest = tmp_path / "large.bin"
 
     total_bytes = 70 * 1024 * 1024
-    timeouts = []
     disk_checks = []
 
     def fake_check_disk_space(path: Path, required_mb: int = 0):
         path.mkdir(parents=True, exist_ok=True)
         disk_checks.append(required_mb)
 
-    class HeadResponse:
-        def __init__(self):
-            self.headers = {"content-length": str(total_bytes)}
-
-        def raise_for_status(self):
-            return None
-
-    class StreamResponse:
-        def __init__(self):
-            self.status_code = 200
-            self.headers = {"content-length": str(total_bytes)}
-            self._remaining = total_bytes
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def raise_for_status(self):
-            return None
-
-        def iter_content(self, chunk_size):
-            remaining = self._remaining
-            while remaining > 0:
-                size = min(chunk_size, remaining)
-                remaining -= size
-                yield b"x" * size
-
-    def fake_head(url, headers=None, timeout=None):
-        return HeadResponse()
-
-    def fake_get(url, headers=None, stream=True, timeout=None):
-        timeouts.append(timeout)
-        return StreamResponse()
-
     monkeypatch.setattr(app_module, "check_disk_space", fake_check_disk_space)
-    monkeypatch.setattr(app_module.requests, "head", fake_head)
-    monkeypatch.setattr(app_module.requests, "get", fake_get)
+    client = StubAsyncClient(
+        head_responses=[StubHeadResponse(length=total_bytes)],
+        stream_responses=[
+            StubStreamResponse(
+                status_code=200,
+                chunks=[b"x" * (1024 * 1024)] * 70,
+                fail_after_first_chunk=False,
+                headers={"content-length": str(total_bytes)},
+            )
+        ],
+    )
 
-    app_module._download_to("https://example.com/large.bin", dest, chunk_size=1024 * 1024)
+    asyncio.run(
+        app_module._download_to(
+            "https://example.com/large.bin",
+            dest,
+            chunk_size=1024 * 1024,
+            client=client,
+        )
+    )
 
-    assert timeouts == [700]
+    assert client.stream_timeouts == [700]
     assert disk_checks[-1] == 70
 
 
-def test_download_to_appends_when_resume_supported(app_module, monkeypatch, tmp_path):
+def test_download_to_appends_when_resume_supported(app_module, tmp_path):
     dest = tmp_path / "resume.bin"
     dest.write_bytes(b"old")
 
-    class HeadResponse:
-        headers = {"content-length": "6"}
+    client = StubAsyncClient(
+        head_responses=[StubHeadResponse(length=6)],
+        stream_responses=[
+            StubStreamResponse(
+                status_code=206,
+                chunks=[b"new"],
+                fail_after_first_chunk=False,
+                headers={"content-length": "3"},
+            )
+        ],
+    )
 
-        def raise_for_status(self):
-            return None
+    asyncio.run(
+        app_module._download_to(
+            "https://example.com/resume.bin",
+            dest,
+            chunk_size=1024,
+            client=client,
+        )
+    )
 
-    class StreamResponse:
-        def __init__(self):
-            self.status_code = 206
-            self.headers = {"content-length": "3"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def raise_for_status(self):
-            return None
-
-        def iter_content(self, chunk_size):
-            yield b"new"
-
-    def fake_head(url, headers=None, timeout=None):
-        return HeadResponse()
-
-    def fake_get(url, headers=None, stream=True, timeout=None):
-        assert headers.get("Range") == "bytes=3-"
-        return StreamResponse()
-
-    monkeypatch.setattr(app_module.requests, "head", fake_head)
-    monkeypatch.setattr(app_module.requests, "get", fake_get)
-
-    app_module._download_to("https://example.com/resume.bin", dest, chunk_size=1024)
-
+    assert client.stream_calls[0]["Range"] == "bytes=3-"
     assert dest.read_bytes() == b"oldnew"
 
 
 def test_download_to_removes_partial_before_full_restart(app_module, monkeypatch, tmp_path):
     dest = tmp_path / "resume.bin"
     dest.write_bytes(b"stale-data")
-
-    class HeadResponse:
-        headers = {"content-length": "6"}
-
-        def raise_for_status(self):
-            return None
-
-    class StreamResponse:
-        def __init__(self):
-            self.status_code = 200
-            self.headers = {"content-length": "6"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def raise_for_status(self):
-            return None
-
-        def iter_content(self, chunk_size):
-            yield b"result"
-
-    def fake_head(url, headers=None, timeout=None):
-        return HeadResponse()
-
-    def fake_get(url, headers=None, stream=True, timeout=None):
-        assert headers.get("Range") == f"bytes={len('stale-data')}-"
-        return StreamResponse()
 
     unlink_calls: list[Path] = []
     original_unlink = app_module.Path.unlink
@@ -484,80 +450,86 @@ def test_download_to_removes_partial_before_full_restart(app_module, monkeypatch
         return original_unlink(self, *args, **kwargs)
 
     monkeypatch.setattr(app_module.Path, "unlink", spy_unlink, raising=False)
-    monkeypatch.setattr(app_module.requests, "head", fake_head)
-    monkeypatch.setattr(app_module.requests, "get", fake_get)
 
-    app_module._download_to("https://example.com/resume.bin", dest, chunk_size=1024)
+    client = StubAsyncClient(
+        head_responses=[StubHeadResponse(length=6)],
+        stream_responses=[
+            StubStreamResponse(
+                status_code=200,
+                chunks=[b"result"],
+                headers={"content-length": "6"},
+            )
+        ],
+    )
 
+    asyncio.run(
+        app_module._download_to(
+            "https://example.com/resume.bin",
+            dest,
+            chunk_size=1024,
+            client=client,
+        )
+    )
+
+    assert client.stream_calls[0]["Range"] == f"bytes={len('stale-data')}-"
     assert unlink_calls == [dest]
     assert dest.read_bytes() == b"result"
 
 
-def test_download_to_fails_on_unexpected_resume_status(app_module, monkeypatch, tmp_path):
+def test_download_to_fails_on_unexpected_resume_status(app_module, tmp_path):
     dest = tmp_path / "resume.bin"
     dest.write_bytes(b"old")
 
-    class HeadResponse:
-        headers = {"content-length": "6"}
-
-        def raise_for_status(self):
-            return None
-
-    class StreamResponse:
-        def __init__(self):
-            self.status_code = 204
-            self.headers = {"content-length": "0"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def raise_for_status(self):
-            return None
-
-        def iter_content(self, chunk_size):
-            raise AssertionError("should not iterate on unexpected status")
-
-    def fake_head(url, headers=None, timeout=None):
-        return HeadResponse()
-
-    def fake_get(url, headers=None, stream=True, timeout=None):
-        assert headers.get("Range") == "bytes=3-"
-        return StreamResponse()
-
-    monkeypatch.setattr(app_module.requests, "head", fake_head)
-    monkeypatch.setattr(app_module.requests, "get", fake_get)
+    client = StubAsyncClient(
+        head_responses=[StubHeadResponse(length=6)],
+        stream_responses=[
+            StubStreamResponse(
+                status_code=204,
+                chunks=[],
+                headers={"content-length": "0"},
+            )
+        ],
+    )
 
     with pytest.raises(HTTPException) as exc:
-        app_module._download_to("https://example.com/resume.bin", dest, chunk_size=1024)
+        asyncio.run(
+            app_module._download_to(
+                "https://example.com/resume.bin",
+                dest,
+                chunk_size=1024,
+                client=client,
+            )
+        )
 
     assert exc.value.status_code == 502
     assert dest.read_bytes() == b"old"
 
 
-def test_download_to_removes_partial_file_on_final_failure(app_module, monkeypatch, tmp_path):
+def test_download_to_removes_partial_file_on_final_failure(app_module, tmp_path):
     dest = tmp_path / "broken.bin"
     dest.write_bytes(b"partial")
 
-    class HeadResponse:
-        headers = {}
-
-        def raise_for_status(self):
-            return None
-
-    def fake_head(url, headers=None, timeout=None):
-        return HeadResponse()
-
-    def fake_get(url, headers=None, stream=True, timeout=None):
-        raise RuntimeError("network down")
-
-    monkeypatch.setattr(app_module.requests, "head", fake_head)
-    monkeypatch.setattr(app_module.requests, "get", fake_get)
+    client = StubAsyncClient(
+        head_responses=[StubHeadResponse(length=0)],
+        stream_responses=[
+            StubStreamResponse(
+                status_code=200,
+                chunks=[b"partial"],
+                fail_after_first_chunk=True,
+                headers={"content-length": "7"},
+            )
+        ],
+    )
 
     with pytest.raises(RuntimeError):
-        app_module._download_to("https://example.com/broken.bin", dest, max_retries=1)
+        asyncio.run(
+            app_module._download_to(
+                "https://example.com/broken.bin",
+                dest,
+                max_retries=1,
+                client=client,
+            )
+        )
 
     assert not dest.exists()
 
@@ -684,6 +656,54 @@ def test_metrics_dashboard_reports_activity(patched_app):
     assert "Operational Metrics" in html
     assert "/downloads" in html
     assert "Recent Success Rate" in html
+
+
+def test_rate_limiter_blocks_excess_requests(patched_app, monkeypatch):
+    monkeypatch.setattr(patched_app.RATE_LIMITER, "_rpm", 1)
+    patched_app.RATE_LIMITER.reset()
+
+    first_status, _, _ = call_app(patched_app.app, "GET", "/health")
+    assert first_status == 200
+
+    second_status, _, body = call_app(patched_app.app, "GET", "/health")
+    assert second_status == 429
+    assert b"Too Many Requests" in body
+
+    patched_app.RATE_LIMITER.reset()
+
+
+def test_async_compose_job_lifecycle(patched_app):
+    payload = {
+        "video_url": "https://example.com/video.mp4",
+        "audio_url": "https://example.com/audio.mp3",
+        "duration_ms": 5000,
+        "width": 640,
+        "height": 360,
+        "fps": 24,
+    }
+
+    with patched_app.JOBS_LOCK:
+        patched_app.JOBS.clear()
+
+    status, _, body = call_app(
+        patched_app.app,
+        "POST",
+        "/compose/from-urls/async",
+        headers=[("content-type", "application/json")],
+        body=json.dumps(payload).encode("utf-8"),
+    )
+    assert status == 200
+    data = json.loads(body.decode())
+    job_id = data["job_id"]
+
+    job = patched_app.ComposeFromUrlsJob(**payload)
+    asyncio.run(patched_app._process_compose_from_urls_job(job_id, job))
+
+    status, _, body = call_app(patched_app.app, "GET", f"/jobs/{job_id}")
+    assert status == 200
+    job_info = json.loads(body.decode())
+    assert job_info["status"] == "finished"
+    assert job_info["result"]["file_url"].startswith("http://example.com/")
 
 
 def test_static_file_serving(patched_app):
@@ -845,7 +865,7 @@ def test_compose_from_urls_as_json(patched_app):
         fps=25,
         bgm_volume=0.2,
     )
-    result = patched_app.compose_from_urls(job, as_json=True)
+    result = asyncio.run(patched_app.compose_from_urls(job, as_json=True))
     assert result["ok"] is True
 
 
@@ -867,7 +887,7 @@ def test_compose_from_tracks_as_json(patched_app):
         height=720,
         fps=30,
     )
-    result = patched_app.compose_from_tracks(job, as_json=True)
+    result = asyncio.run(patched_app.compose_from_tracks(job, as_json=True))
     assert result["ok"] is True
 
 
@@ -885,7 +905,7 @@ def test_compose_from_tracks_requires_valid_video_keyframe(patched_app):
         fps=24,
     )
     with pytest.raises(patched_app.HTTPException) as exc:
-        patched_app.compose_from_tracks(job, as_json=True)
+        asyncio.run(patched_app.compose_from_tracks(job, as_json=True))
     assert exc.value.status_code == 400
 
 
@@ -903,7 +923,7 @@ def test_compose_from_tracks_rejects_non_positive_duration(patched_app):
         fps=24,
     )
     with pytest.raises(patched_app.HTTPException) as exc:
-        patched_app.compose_from_tracks(job, as_json=True)
+        asyncio.run(patched_app.compose_from_tracks(job, as_json=True))
     assert exc.value.status_code == 400
 
 
@@ -917,20 +937,20 @@ def test_video_concat_from_urls_as_json(patched_app):
         height=1080,
         fps=30,
     )
-    result = patched_app.video_concat_from_urls(job, as_json=True)
+    result = asyncio.run(patched_app.video_concat_from_urls(job, as_json=True))
     assert result["ok"] is True
 
 
 def test_video_concat_alias_requires_clips(patched_app):
     job = patched_app.ConcatAliasJob(width=640, height=360, fps=30)
     with pytest.raises(patched_app.HTTPException) as exc:
-        patched_app.video_concat_alias(job)
+        asyncio.run(patched_app.video_concat_alias(job))
     assert exc.value.status_code == 422
 
 
 def test_video_concat_alias_with_clips(patched_app):
     job = patched_app.ConcatAliasJob(clips=["https://example.com/1.mp4", "https://example.com/2.mp4"], width=854, height=480, fps=30)
-    result = patched_app.video_concat_alias(job, as_json=True)
+    result = asyncio.run(patched_app.video_concat_alias(job, as_json=True))
     assert result["ok"] is True
 
 
@@ -940,7 +960,7 @@ def test_run_ffmpeg_command_returns_outputs(patched_app):
         output_files={"out": "result.mp4"},
         ffmpeg_command="-i {{video}} -t 1 {{out}}",
     )
-    result = patched_app.run_rendi(job)
+    result = asyncio.run(patched_app.run_rendi(job))
     assert result["ok"] is True
     assert "out" in result["outputs"]
 
@@ -952,7 +972,7 @@ def test_run_ffmpeg_command_rejects_dangerous_patterns(patched_app):
         ffmpeg_command="-i {{video}} -f lavfi -t 1 {{out}}",
     )
     with pytest.raises(patched_app.HTTPException) as exc:
-        patched_app.run_rendi(job)
+        asyncio.run(patched_app.run_rendi(job))
     assert exc.value.status_code == 400
     assert exc.value.detail["error"] == "forbidden_pattern"
 
@@ -965,7 +985,7 @@ def test_run_ffmpeg_command_requires_duration_limit(patched_app, monkeypatch):
         ffmpeg_command="-i {{video}} {{out}}",
     )
     with pytest.raises(patched_app.HTTPException) as exc:
-        patched_app.run_rendi(job)
+        asyncio.run(patched_app.run_rendi(job))
     assert exc.value.status_code == 400
     assert exc.value.detail["error"] == "missing_limit"
 
