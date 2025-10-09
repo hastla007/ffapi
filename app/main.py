@@ -906,7 +906,7 @@ def nav_context(active: Optional[str] = None) -> Dict[str, Any]:
 
 def fallback_top_bar_html(active: Optional[str] = None, *, indent: str = "      ") -> str:
     lines = ['<div class="top-bar">']
-    lines.append('  <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>')
+    lines.append('  <a class="brand" href="/" aria-label="FFAPI home"><span class="ff">ff</span><span class="api">api</span></a>')
     lines.append('  <nav class="main-nav">')
     for href, label in NAV_LINKS:
         class_attr = ' class="active"' if active == href else ""
@@ -947,14 +947,15 @@ def login_template_response(
       <title>Settings Login</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 400px; margin: 0 auto; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; text-align: center; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; text-align: center; text-decoration: none; display: inline-flex; gap: 2px; align-items: center; justify-content: center; color: #000; }}
+        .brand:focus, .brand:hover {{ text-decoration: none; color: #000; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
         form {{ display: flex; flex-direction: column; gap: 12px; }}
         label {{ font-weight: 600; }}
         input {{ padding: 10px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; }}
-        button {{ padding: 10px; background: #0066cc; color: #fff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }}
-        button:hover {{ background: #0053a3; }}
+        button {{ padding: 10px; background: #28a745; color: #fff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }}
+        button:hover {{ background: #1f7a34; }}
         .alert {{ padding: 10px; border-radius: 4px; font-size: 14px; margin-bottom: 16px; }}
         .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
         .help {{ font-size: 13px; color: #555; text-align: center; margin-top: 12px; }}
@@ -962,7 +963,7 @@ def login_template_response(
       </style>
     </head>
     <body>
-      <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
+      <a class=\"brand\" href=\"/\" aria-label=\"FFAPI home\"><span class=\"ff\">ff</span><span class=\"api\">api</span></a>
       {alert}
       <form method=\"post\" action=\"/settings/login\">
         {csrf_field}
@@ -1239,19 +1240,21 @@ def settings_template_response(
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
         .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; text-decoration: none; display: inline-flex; align-items: center; gap: 2px; color: #000; }}
+        .brand:focus, .brand:hover {{ text-decoration: none; color: #000; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
         .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
-        .main-nav a {{ color: #0066cc; text-decoration: none; }}
-        .main-nav a:hover {{ text-decoration: underline; }}
+        .main-nav a {{ padding: 8px 14px; border-radius: 6px; background: #e2e8f0; color: #6b7280; text-decoration: none; font-weight: 600; transition: background 0.15s ease, color 0.15s ease; }}
+        .main-nav a:hover {{ background: #d1d5db; color: #000; }}
+        .main-nav a.active {{ background: #28a745; color: #fff; }}
         h2 {{ margin-top: 32px; }}
         section {{ background: #f7f9fc; padding: 20px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.08); margin-bottom: 24px; }}
         form {{ margin-top: 12px; }}
         label {{ display: block; font-weight: 600; margin-bottom: 6px; }}
         input {{ padding: 10px; font-size: 14px; border: 1px solid #ccd5e0; border-radius: 4px; width: 100%; box-sizing: border-box; }}
-        button {{ padding: 10px 16px; background: #0066cc; color: #fff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }}
-        button:hover {{ background: #0053a3; }}
+        button {{ padding: 10px 16px; background: #28a745; color: #fff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }}
+        button:hover {{ background: #1f7a34; }}
         button.secondary {{ background: #9aa5b1; }}
         button.secondary:hover {{ background: #7c8794; }}
         .half-width {{ width: 50%; }}
@@ -1264,7 +1267,7 @@ def settings_template_response(
         .alert {{ padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }}
         .alert.success {{ background: #e8f5e9; color: #256029; border: 1px solid #c8e6c9; }}
         .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
-        .alert.info {{ background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }}
+        .alert.info {{ background: #eff6ff; color: #1f7a34; border: 1px solid #bfdbfe; }}
         .alert.info ul {{ margin: 8px 0 0; padding-left: 20px; }}
         .alert.info li {{ font-family: 'Courier New', monospace; margin-bottom: 4px; }}
         .storage-table {{ margin-top: 20px; background: #fff; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; overflow: hidden; }}
@@ -1290,7 +1293,7 @@ def settings_template_response(
         .whitelist-card button {{ width: fit-content; }}
         .whitelist-header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }}
         .credentials-grid label {{ margin-bottom: 0; }}
-        .twofactor-card .status-pill {{ background: #e0f2fe; color: #0369a1; }}
+        .twofactor-card .status-pill {{ background: #e0f2fe; color: #1f7a34; }}
         .twofactor-card .status-pill.enabled {{ background: #e8f5e9; color: #256029; }}
         .secret-box {{ background: #f1f5f9; border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }}
         .secret-box span {{ font-size: 12px; color: #526079; text-transform: uppercase; letter-spacing: 0.1em; }}
@@ -1312,7 +1315,7 @@ def settings_template_response(
         .backup-table {{ width: 100%; border-collapse: collapse; }}
         .backup-table th, .backup-table td {{ padding: 8px 10px; font-size: 13px; border-bottom: 1px solid #e2e8f0; text-align: left; }}
         .backup-table td code {{ font-size: 13px; }}
-        .backup-table .status {{ display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 999px; font-weight: 600; background: #e0f2fe; color: #0369a1; }}
+        .backup-table .status {{ display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 999px; font-weight: 600; background: #e0f2fe; color: #1f7a34; }}
         .backup-table .status.used {{ background: #f8f0f0; color: #b91c1c; }}
         .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
         .field-card {{ background: #f9fbff; padding: 12px; border-radius: 8px; box-shadow: inset 0 0 0 1px #d6e2f1; display: grid; gap: 8px; }}
@@ -1808,19 +1811,21 @@ def api_keys_template_response(
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
         .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; text-decoration: none; display: inline-flex; align-items: center; gap: 2px; color: #000; }}
+        .brand:focus, .brand:hover {{ text-decoration: none; color: #000; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
         .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
-        .main-nav a {{ color: #0066cc; text-decoration: none; }}
-        .main-nav a:hover {{ text-decoration: underline; }}
+        .main-nav a {{ padding: 8px 14px; border-radius: 6px; background: #e2e8f0; color: #6b7280; text-decoration: none; font-weight: 600; transition: background 0.15s ease, color 0.15s ease; }}
+        .main-nav a:hover {{ background: #d1d5db; color: #000; }}
+        .main-nav a.active {{ background: #28a745; color: #fff; }}
         h2 {{ margin-top: 32px; }}
         section {{ background: #f7f9fc; padding: 20px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.08); margin-bottom: 24px; }}
         form {{ margin-top: 12px; }}
         label {{ display: block; font-weight: 600; margin-bottom: 6px; }}
         input {{ padding: 10px; font-size: 14px; border: 1px solid #ccd5e0; border-radius: 4px; width: 100%; box-sizing: border-box; }}
-        button {{ padding: 10px 16px; background: #0066cc; color: #fff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }}
-        button:hover {{ background: #0053a3; }}
+        button {{ padding: 10px 16px; background: #28a745; color: #fff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }}
+        button:hover {{ background: #1f7a34; }}
         button.secondary {{ background: #9aa5b1; }}
         button.secondary:hover {{ background: #7c8794; }}
         .alert {{ padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }}
@@ -3105,23 +3110,25 @@ def downloads(
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
         .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; text-decoration: none; display: inline-flex; align-items: center; gap: 2px; color: #000; }}
+        .brand:focus, .brand:hover {{ text-decoration: none; color: #000; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
         .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
-        .main-nav a {{ color: #0066cc; text-decoration: none; }}
-        .main-nav a:hover {{ text-decoration: underline; }}
+        .main-nav a {{ padding: 8px 14px; border-radius: 6px; background: #e2e8f0; color: #6b7280; text-decoration: none; font-weight: 600; transition: background 0.15s ease, color 0.15s ease; }}
+        .main-nav a:hover {{ background: #d1d5db; color: #000; }}
+        .main-nav a.active {{ background: #28a745; color: #fff; }}
         table {{ border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 2px rgba(15,23,42,0.08); }}
         th, td {{ border-bottom: 1px solid #e2e8f0; padding: 12px 14px; font-size: 14px; vertical-align: top; }}
         th {{ text-align: left; background: #f8fafc; color: #1f2937; }}
         a {{ text-decoration: none; color: #0f172a; }}
         .filters {{ display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }}
         .filters input[type="text"] {{ flex: 1; padding: 10px; border: 1px solid #cbd5f5; border-radius: 6px; }}
-        .filters button {{ padding: 10px 16px; background: #0066cc; color: #fff; border: none; border-radius: 6px; cursor: pointer; }}
-        .filters button:hover {{ background: #0053a3; }}
+        .filters button {{ padding: 10px 16px; background: #28a745; color: #fff; border: none; border-radius: 6px; cursor: pointer; }}
+        .filters button:hover {{ background: #1f7a34; }}
         .summary {{ margin-bottom: 12px; font-size: 14px; color: #475569; }}
         .pagination {{ display: flex; gap: 12px; align-items: center; margin-top: 16px; font-size: 14px; color: #475569; }}
-        .pager-link {{ color: #0369a1; }}
+        .pager-link {{ color: #1f7a34; }}
         .file-entry {{ display: flex; gap: 12px; align-items: center; }}
         .thumb-image {{ width: 96px; height: 54px; object-fit: cover; border-radius: 4px; border: 1px solid #cbd5f5; background: #f8fafc; }}
         .thumb-placeholder {{ display: inline-flex; width: 96px; height: 54px; align-items: center; justify-content: center; border: 1px dashed #cbd5f5; border-radius: 4px; color: #94a3b8; font-size: 12px; }}
@@ -3275,18 +3282,20 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
         .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; text-decoration: none; display: inline-flex; align-items: center; gap: 2px; color: #000; }}
+        .brand:focus, .brand:hover {{ text-decoration: none; color: #000; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
         .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
-        .main-nav a {{ color: #0066cc; text-decoration: none; }}
-        .main-nav a:hover {{ text-decoration: underline; }}
+        .main-nav a {{ padding: 8px 14px; border-radius: 6px; background: #e2e8f0; color: #6b7280; text-decoration: none; font-weight: 600; transition: background 0.15s ease, color 0.15s ease; }}
+        .main-nav a:hover {{ background: #d1d5db; color: #000; }}
+        .main-nav a.active {{ background: #28a745; color: #fff; }}
         table {{ border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 2px rgba(15,23,42,0.08); }}
         th, td {{ border-bottom: 1px solid #e2e8f0; padding: 12px 14px; font-size: 14px; }}
         th {{ text-align: left; background: #f8fafc; color: #1f2937; }}
         a {{ text-decoration: none; color: #0f172a; }}
         .pagination {{ display: flex; gap: 12px; align-items: center; margin-top: 16px; font-size: 14px; color: #475569; }}
-        .pager-link {{ color: #0369a1; }}
+        .pager-link {{ color: #1f7a34; }}
       </style>
     </head>
     <body>
@@ -3396,14 +3405,16 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
         .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; text-decoration: none; display: inline-flex; align-items: center; gap: 2px; color: #000; }}
+        .brand:focus, .brand:hover {{ text-decoration: none; color: #000; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
         pre {{ background: #f5f5f5; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; line-height: 1.4; }}
         h3 {{ margin-top: 30px; margin-bottom: 10px; }}
         .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
-        .main-nav a {{ color: #0066cc; text-decoration: none; }}
-        .main-nav a:hover {{ text-decoration: underline; }}
+        .main-nav a {{ padding: 8px 14px; border-radius: 6px; background: #e2e8f0; color: #6b7280; text-decoration: none; font-weight: 600; transition: background 0.15s ease, color 0.15s ease; }}
+        .main-nav a:hover {{ background: #d1d5db; color: #000; }}
+        .main-nav a.active {{ background: #28a745; color: #fff; }}
         .section {{ margin-bottom: 40px; }}
         .logs {{
           height: 600px;
@@ -3414,7 +3425,7 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
         }}
         .controls {{ margin-bottom: 15px; }}
         .btn {{
-          background: #0066cc;
+          background: #28a745;
           color: white;
           padding: 8px 16px;
           border: none;
@@ -3778,33 +3789,35 @@ def documentation(request: Request):
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
         .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; text-decoration: none; display: inline-flex; align-items: center; gap: 2px; color: #000; }}
+        .brand:focus, .brand:hover {{ text-decoration: none; color: #000; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
         h2 {{ margin-bottom: 10px; }}
-        h4 {{ margin-top: 30px; margin-bottom: 15px; color: #333; border-bottom: 2px solid #0066cc; padding-bottom: 5px; }}
+        h4 {{ margin-top: 30px; margin-bottom: 15px; color: #333; border-bottom: 2px solid #28a745; padding-bottom: 5px; }}
         .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
-        .main-nav a {{ color: #0066cc; text-decoration: none; }}
-        .main-nav a:hover {{ text-decoration: underline; }}
+        .main-nav a {{ padding: 8px 14px; border-radius: 6px; background: #e2e8f0; color: #6b7280; text-decoration: none; font-weight: 600; transition: background 0.15s ease, color 0.15s ease; }}
+        .main-nav a:hover {{ background: #d1d5db; color: #000; }}
+        .main-nav a.active {{ background: #28a745; color: #fff; }}
         .intro {{
           background: #f0f7ff;
           padding: 20px;
           border-radius: 8px;
           margin-bottom: 30px;
-          border-left: 4px solid #0066cc;
+          border-left: 4px solid #28a745;
         }}
         .intro p {{ margin: 8px 0; line-height: 1.6; }}
 
         .endpoint {{
           background: #f9f9f9;
-          border-left: 4px solid #0066cc;
+          border-left: 4px solid #28a745;
           padding: 12px 15px;
           margin-bottom: 12px;
           border-radius: 4px;
         }}
         .method {{
           display: inline-block;
-          background: #0066cc;
+          background: #28a745;
           color: white;
           padding: 3px 10px;
           border-radius: 3px;
@@ -3836,7 +3849,7 @@ def documentation(request: Request):
         }}
         .param {{
           font-family: 'Courier New', monospace;
-          color: #0066cc;
+          color: #28a745;
           font-weight: bold;
         }}
         .response {{
@@ -4526,15 +4539,17 @@ def metrics_dashboard(request: Request):
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
         .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; text-decoration: none; display: inline-flex; align-items: center; gap: 2px; color: #000; }}
+        .brand:focus, .brand:hover {{ text-decoration: none; color: #000; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
         table {{ border-collapse: collapse; width: 100%; margin-bottom: 30px; }}
         th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
         th {{ text-align: left; background: #fafafa; }}
         .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
-        .main-nav a {{ color: #0066cc; text-decoration: none; }}
-        .main-nav a:hover {{ text-decoration: underline; }}
+        .main-nav a {{ padding: 8px 14px; border-radius: 6px; background: #e2e8f0; color: #6b7280; text-decoration: none; font-weight: 600; transition: background 0.15s ease, color 0.15s ease; }}
+        .main-nav a:hover {{ background: #d1d5db; color: #000; }}
+        .main-nav a.active {{ background: #28a745; color: #fff; }}
         .cards {{ display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 30px; }}
         .card {{
           flex: 1 1 240px;
@@ -5768,11 +5783,11 @@ def jobs_history(
             .brand .ff {{ color: #28a745; }}
             .brand .api {{ color: #000; }}
             .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
-            .main-nav a {{ color: #0066cc; text-decoration: none; font-weight: 500; }}
+            .main-nav a {{ color: #28a745; text-decoration: none; font-weight: 500; }}
             .main-nav a:hover {{ text-decoration: underline; }}
             .filters {{ margin-bottom: 16px; display: flex; gap: 12px; flex-wrap: wrap; }}
             .filter-link {{ padding: 6px 12px; border-radius: 4px; background: #f0f0f0; text-decoration: none; color: #333; }}
-            .filter-link.active {{ background: #0066cc; color: white; }}
+            .filter-link.active {{ background: #28a745; color: white; }}
             table {{ border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }}
             th, td {{ border-bottom: 1px solid #e2e8f0; padding: 12px 14px; font-size: 14px; text-align: left; }}
             th {{ background: #f8fafc; color: #1f2937; }}
@@ -5781,7 +5796,7 @@ def jobs_history(
             .status.success {{ background: #e8f5e9; color: #256029; }}
             .status.error {{ background: #fdecea; color: #b3261e; }}
             .status.warning {{ background: #fff3cd; color: #856404; }}
-            .status.info {{ background: #e0f2fe; color: #0369a1; }}
+            .status.info {{ background: #e0f2fe; color: #1f7a34; }}
             .pagination {{ margin-top: 16px; color: #666; }}
         </style>
     </head>

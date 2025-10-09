@@ -30,6 +30,16 @@
         font-size: 32px;
         font-weight: 700;
         margin: 0;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        color: #111827;
+      }
+      .brand:focus,
+      .brand:hover {
+        text-decoration: none;
+        color: #111827;
       }
       .brand .ff {
         color: #28a745;
@@ -49,16 +59,17 @@
         padding: 8px 14px;
         border-radius: 6px;
         background: #e2e8f0;
-        color: #1e3a8a;
+        color: #6b7280;
         text-decoration: none;
         font-weight: 600;
         transition: background 0.15s ease, color 0.15s ease;
       }
       .main-nav a:hover {
-        background: #cbd5f5;
+        background: #d1d5db;
+        color: #000;
       }
       .main-nav a.active {
-        background: #1d4ed8;
+        background: #28a745;
         color: #fff;
       }
       .page-content {
@@ -72,7 +83,7 @@
   </head>
   <body class="{{ body_class or '' }}">
     <header class="top-bar">
-      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
+      <a class="brand" href="/" aria-label="FFAPI home"><span class="ff">ff</span><span class="api">api</span></a>
       {% if nav_links %}
         {% include "components/nav.html" %}
       {% endif %}
