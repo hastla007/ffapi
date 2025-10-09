@@ -257,6 +257,7 @@ SESSION_TTL_SECONDS = 3600
 TOTP_STEP_SECONDS = 30
 TOTP_DIGITS = 6
 TOTP_RATE_LIMIT = 5
+TOTP_WINDOW = 1
 BACKUP_CODE_LENGTH = 10
 BACKUP_CODE_GROUP_SIZE = 5
 BACKUP_CODE_COUNT = 10
@@ -295,7 +296,7 @@ def generate_totp_code(secret: str, for_time: Optional[int] = None) -> str:
     return _totp_at(secret_bytes, counter)
 
 
-def verify_totp_code(secret: str, code: str, window: int = 1) -> bool:
+def verify_totp_code(secret: str, code: str, window: int = TOTP_WINDOW) -> bool:
     code = code.strip()
     if not code.isdigit() or len(code) != TOTP_DIGITS:
         return False
@@ -584,7 +585,7 @@ class UIAuthManager:
         except Exception:
             return False
         now_counter = int(time.time() // TOTP_STEP_SECONDS)
-        for offset in range(-1, 2):
+        for offset in range(-TOTP_WINDOW, TOTP_WINDOW + 1):
             expected = _totp_at(secret_bytes, now_counter + offset)
             if secrets.compare_digest(expected, code):
                 with self._lock:
@@ -1600,20 +1601,36 @@ def render_api_keys_page(
 REQUEST_ID_CTX: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
 
 
-def cleanup_old_jobs(max_age_seconds: int = 3600) -> None:
+def cleanup_old_jobs(max_age_seconds: int = 3600, max_total_jobs: int = 1000) -> None:
     cutoff = time.time() - max_age_seconds
     with JOBS_LOCK:
         to_remove: List[str] = []
-        for job_id, data in JOBS.items():
+        for job_id, data in list(JOBS.items()):
             created = data.get("created")
             status = data.get("status")
             if created is None:
                 to_remove.append(job_id)
                 continue
-            if created < cutoff and status in {"finished", "failed"}:
+            if status in {"finished", "failed"} and created < cutoff:
                 to_remove.append(job_id)
         for job_id in to_remove:
             JOBS.pop(job_id, None)
+
+        if max_total_jobs > 0 and len(JOBS) > max_total_jobs:
+            finished_jobs = sorted(
+                (
+                    (job_id, data.get("created", 0.0))
+                    for job_id, data in JOBS.items()
+                    if data.get("status") in {"finished", "failed"}
+                ),
+                key=lambda item: item[1] or 0.0,
+            )
+            excess = len(JOBS) - max_total_jobs
+            for job_id, _ in finished_jobs:
+                if excess <= 0:
+                    break
+                JOBS.pop(job_id, None)
+                excess -= 1
 
 
 class JobProgressReporter:
@@ -2349,8 +2366,8 @@ def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
         if thumb_path.exists():
             try:
                 thumb_path.unlink()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to remove thumbnail %s: %s", thumb_path, exc)
         return None
     finally:
         if temp_log.exists():
@@ -2362,8 +2379,8 @@ def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
         if thumb_path.exists():
             try:
                 thumb_path.unlink()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to remove thumbnail %s: %s", thumb_path, exc)
         return None
     return thumb_path
 
@@ -2531,6 +2548,8 @@ async def _periodic_rate_limiter_cleanup():
 def publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None) -> Dict[str, str]:
     """Move a finished file into PUBLIC_DIR/YYYYMMDD/ and return URLs/paths.
        Uses shutil.move to be cross-device safe (works across Docker volumes/Windows)."""
+    if not ext or not re.fullmatch(r"\.[A-Za-z0-9]+", ext):
+        raise ValueError(f"Invalid file extension: {ext}")
     check_disk_space(PUBLIC_DIR)
     now = datetime.now(timezone.utc)
     day = now.strftime("%Y%m%d")
@@ -3802,8 +3821,12 @@ async def settings_update_performance(request: Request):
 
     rpm = parse_int("rate_limit_rpm", 1, 100000)
     timeout_minutes = parse_float("ffmpeg_timeout_minutes", 1, 720)
-    chunk_mb = parse_float("upload_chunk_mb", 0.1, 512)
+    chunk_mb = parse_float("upload_chunk_mb", 0.0, 512)
     max_file_mb = parse_int("max_file_size_mb", 1, 8192)
+
+    if chunk_mb is not None and chunk_mb < 0.001:
+        errors.append("Upload chunk size must be at least 0.001 MB")
+        chunk_mb = None
 
     if errors or rpm is None or timeout_minutes is None or chunk_mb is None or max_file_mb is None:
         storage = storage_management_snapshot()

@@ -242,6 +242,14 @@ def test_request_id_preserved_from_header(app_module):
     assert headers["x-request-id"] == provided
 
 
+def test_publish_file_rejects_invalid_extension(app_module, tmp_path):
+    src = tmp_path / "source.bin"
+    src.write_bytes(b"data")
+
+    with pytest.raises(ValueError):
+        app_module.publish_file(src, "bad")
+
+
 @pytest.fixture(scope="session")
 def app_module(tmp_path_factory: pytest.TempPathFactory):
     base = tmp_path_factory.mktemp("data")
@@ -923,6 +931,29 @@ def test_performance_settings_rejects_bad_values(patched_app):
     assert "Rate Limit Rpm must be between 1 and 100000" in html
     assert patched_app.RATE_LIMITER.current_limit() == original_rpm
     assert patched_app.settings.RATE_LIMIT_REQUESTS_PER_MINUTE == original_rpm
+
+
+def test_performance_settings_rejects_tiny_upload_chunk(patched_app):
+    original_chunk = patched_app.UPLOAD_CHUNK_SIZE
+    body = urlencode(
+        {
+            "rate_limit_rpm": "60",
+            "ffmpeg_timeout_minutes": "15",
+            "upload_chunk_mb": "0.0005",
+            "max_file_size_mb": "5",
+        }
+    ).encode()
+    status, _, response_body = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/performance",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=body,
+    )
+    assert status == 400
+    html = response_body.decode()
+    assert "Upload chunk size must be at least 0.001 MB" in html
+    assert patched_app.UPLOAD_CHUNK_SIZE == original_chunk
 
 
 def test_api_keys_page_shows_controls(patched_app):
@@ -2098,6 +2129,28 @@ def test_cleanup_old_jobs_removes_finished_entries(patched_app):
         assert "fresh" in patched_app.JOBS
         assert "active" in patched_app.JOBS
         assert "malformed" not in patched_app.JOBS
+
+
+def test_cleanup_old_jobs_enforces_max_total(patched_app):
+    with patched_app.JOBS_LOCK:
+        patched_app.JOBS.clear()
+        now = time.time()
+        for index in range(8):
+            patched_app.JOBS[f"finished-{index}"] = {
+                "status": "finished",
+                "created": now - index,
+            }
+        patched_app.JOBS["processing"] = {"status": "processing", "created": now}
+
+    patched_app.cleanup_old_jobs(max_age_seconds=10_000, max_total_jobs=5)
+
+    with patched_app.JOBS_LOCK:
+        assert "processing" in patched_app.JOBS
+        assert len(patched_app.JOBS) <= 5
+        remaining_finished = [
+            key for key, data in patched_app.JOBS.items() if data.get("status") == "finished"
+        ]
+        assert set(remaining_finished).issubset({"finished-0", "finished-1", "finished-2", "finished-3"})
 
 
 def test_rate_limiter_cleanup_removes_stale_identifiers(patched_app):
