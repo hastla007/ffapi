@@ -9,6 +9,7 @@ services:
       WORK_DIR: "/data/work"
       LOGS_DIR: "/data/logs"
       RETENTION_DAYS: "7"
+      REQUIRE_DURATION_LIMIT: "false"
     volumes:
       - ./public:/data/public
       - ./work:/data/work
