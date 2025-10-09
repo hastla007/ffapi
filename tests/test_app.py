@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import time
+from http.cookies import SimpleCookie
 from itertools import count
 from pathlib import Path
 from typing import List, Tuple
@@ -127,12 +128,90 @@ async def _call_app(app, method: str, path: str, *, headers=None, body: bytes = 
 
     await app(scope, receive, send)
 
-    headers_dict = {k.decode("latin-1"): v.decode("latin-1") for k, v in response_headers}
+    headers_dict: dict[str, str] = {}
+    set_cookies: List[str] = []
+    for key_bytes, value_bytes in response_headers:
+        key = key_bytes.decode("latin-1")
+        value = value_bytes.decode("latin-1")
+        if key.lower() == "set-cookie":
+            set_cookies.append(value)
+        else:
+            headers_dict[key] = value
+    if set_cookies:
+        headers_dict["set-cookie"] = "\n".join(set_cookies)
     return response_status or 500, headers_dict, bytes(response_body)
 
 
 def call_app(app, method: str, path: str, *, headers=None, body: bytes = b"", query: str = "") -> Tuple[int, dict, bytes]:
     return asyncio.run(_call_app(app, method, path, headers=headers, body=body, query=query))
+
+
+def extract_csrf_token(html: str) -> str:
+    marker = 'name="csrf_token" value="'
+    start = html.find(marker)
+    if start == -1:
+        raise AssertionError("CSRF token not found in HTML response")
+    start += len(marker)
+    end = html.find('"', start)
+    if end == -1:
+        raise AssertionError("Malformed CSRF token field")
+    return html[start:end]
+
+
+def update_cookie_jar(jar: dict[str, str], headers: dict) -> None:
+    set_cookie = headers.get("set-cookie")
+    if not set_cookie:
+        return
+    cookie = SimpleCookie()
+    if isinstance(set_cookie, str):
+        parts = [p for p in set_cookie.split("\n") if p]
+    else:
+        parts = []
+    for part in parts:
+        cookie.load(part)
+    for key, morsel in cookie.items():
+        jar[key] = morsel.value
+
+
+def build_cookie_header(jar: dict[str, str]) -> str:
+    return "; ".join(f"{k}={v}" for k, v in jar.items()) if jar else ""
+
+
+def fetch_csrf_token(app, jar: dict[str, str], path: str = "/settings", query: str = "") -> str:
+    headers = []
+    cookie_header = build_cookie_header(jar)
+    if cookie_header:
+        headers.append(("Cookie", cookie_header))
+    status, response_headers, body = call_app(app, "GET", path, headers=headers, query=query)
+    assert status == 200
+    update_cookie_jar(jar, response_headers)
+    return extract_csrf_token(body.decode("utf-8"))
+
+
+def post_form(app, path: str, data: dict[str, str], jar: dict[str, str]):
+    headers = [("Content-Type", "application/x-www-form-urlencoded")]
+    cookie_header = build_cookie_header(jar)
+    if cookie_header:
+        headers.append(("Cookie", cookie_header))
+    status, response_headers, body = call_app(
+        app,
+        "POST",
+        path,
+        headers=headers,
+        body=urlencode(data).encode("utf-8"),
+    )
+    update_cookie_jar(jar, response_headers)
+    return status, response_headers, body
+
+
+def get_with_cookies(app, path: str, jar: dict[str, str], query: str = ""):
+    headers = []
+    cookie_header = build_cookie_header(jar)
+    if cookie_header:
+        headers.append(("Cookie", cookie_header))
+    status, response_headers, body = call_app(app, "GET", path, headers=headers, query=query)
+    update_cookie_jar(jar, response_headers)
+    return status, response_headers, body
 
 
 def test_security_headers_and_generated_request_id(app_module):
@@ -188,6 +267,7 @@ def app_module(tmp_path_factory: pytest.TempPathFactory):
         del sys.modules[module_name]
     module = importlib.import_module(module_name)
     module.UI_AUTH.reset()
+    module.csrf_protect.validate_csrf = lambda submitted, cookie: None
     return module
 
 
@@ -388,86 +468,84 @@ def test_settings_page_shows_auth_retention_and_storage_sections(patched_app):
 
 
 def test_dashboard_requires_login_when_enabled(patched_app):
-    enable_body = urlencode({"require_login": "true"}).encode()
-    status, headers, _ = call_app(
+    jar: dict[str, str] = {}
+    csrf_token = fetch_csrf_token(patched_app.app, jar)
+    status, headers, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/ui-auth",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=enable_body,
+        {"require_login": "true", "csrf_token": csrf_token},
+        jar,
     )
     assert status == 303
     assert headers["location"].startswith("/settings")
 
-    status, headers, _ = call_app(patched_app.app, "GET", "/downloads")
+    status, headers, _ = get_with_cookies(patched_app.app, "/downloads", jar)
     assert status == 303
     assert headers["location"].startswith("/settings?next=%2Fdownloads")
 
-    bad_login = urlencode({"username": "admin", "password": "wrongpass", "next": "/downloads"}).encode()
-    status, _, body = call_app(
+    login_csrf = fetch_csrf_token(
+        patched_app.app, jar, path="/settings", query="next=%2Fdownloads"
+    )
+    status, _, body = post_form(
         patched_app.app,
-        "POST",
         "/settings/login",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=bad_login,
+        {
+            "username": "admin",
+            "password": "wrongpass",
+            "next": "/downloads",
+            "csrf_token": login_csrf,
+        },
+        jar,
     )
     assert status == 401
-    assert "Invalid username or password" in body.decode()
+    body_text = body.decode()
+    assert "Invalid username or password" in body_text
+    login_csrf = extract_csrf_token(body_text)
 
-    good_login = urlencode({"username": "admin", "password": "admin123", "next": "/downloads"}).encode()
-    status, headers, _ = call_app(
+    status, headers, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/login",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=good_login,
+        {
+            "username": "admin",
+            "password": "admin123",
+            "next": "/downloads",
+            "csrf_token": login_csrf,
+        },
+        jar,
     )
     assert status == 303
     assert headers["location"] == "/downloads"
-    cookie_header = headers["set-cookie"]
-    session_token = cookie_header.split(";", 1)[0].split("=", 1)[1]
 
-    status, _, _ = call_app(
-        patched_app.app,
-        "GET",
-        "/downloads",
-        headers=[("Cookie", f"{patched_app.SESSION_COOKIE_NAME}={session_token}")],
-    )
+    status, _, _ = get_with_cookies(patched_app.app, "/downloads", jar)
     assert status == 200
 
 
 def test_two_factor_toggle_requires_valid_code(patched_app):
-    enable_body = urlencode({"require_login": "true"}).encode()
-    status, _, _ = call_app(
+    jar: dict[str, str] = {}
+    csrf_token = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/ui-auth",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=enable_body,
+        {"require_login": "true", "csrf_token": csrf_token},
+        jar,
     )
     assert status == 303
 
-    login_body = urlencode({"username": "admin", "password": "admin123"}).encode()
-    status, headers, _ = call_app(
+    login_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/login",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=login_body,
+        {"username": "admin", "password": "admin123", "csrf_token": login_csrf},
+        jar,
     )
     assert status == 303
-    session_cookie = headers["set-cookie"].split(";", 1)[0]
 
-    bad_enable = urlencode({"action": "enable", "code": "000000"}).encode()
-    status, headers, _ = call_app(
+    settings_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, headers, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/two-factor",
-        headers=[
-            ("Content-Type", "application/x-www-form-urlencoded"),
-            ("Cookie", session_cookie),
-        ],
-        body=bad_enable,
+        {"action": "enable", "code": "000000", "csrf_token": settings_csrf},
+        jar,
     )
     assert status == 303
     assert "error=Invalid+authentication+code" in headers["location"]
@@ -475,16 +553,12 @@ def test_two_factor_toggle_requires_valid_code(patched_app):
 
     secret = patched_app.UI_AUTH.get_two_factor_secret()
     code = patched_app.generate_totp_code(secret)
-    good_enable = urlencode({"action": "enable", "code": code}).encode()
-    status, headers, _ = call_app(
+    settings_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, headers, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/two-factor",
-        headers=[
-            ("Content-Type", "application/x-www-form-urlencoded"),
-            ("Cookie", session_cookie),
-        ],
-        body=good_enable,
+        {"action": "enable", "code": code, "csrf_token": settings_csrf},
+        jar,
     )
     assert status == 303
     assert "message=Two-factor+authentication+enabled" in headers["location"]
@@ -492,97 +566,95 @@ def test_two_factor_toggle_requires_valid_code(patched_app):
 
 
 def test_login_requires_totp_when_two_factor_enabled(patched_app):
-    enable_body = urlencode({"require_login": "true"}).encode()
-    status, _, _ = call_app(
+    jar: dict[str, str] = {}
+    csrf_token = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/ui-auth",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=enable_body,
+        {"require_login": "true", "csrf_token": csrf_token},
+        jar,
     )
     assert status == 303
 
-    login_body = urlencode({"username": "admin", "password": "admin123"}).encode()
-    status, headers, _ = call_app(
+    login_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/login",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=login_body,
+        {"username": "admin", "password": "admin123", "csrf_token": login_csrf},
+        jar,
     )
     assert status == 303
-    session_cookie = headers["set-cookie"].split(";", 1)[0]
 
     secret = patched_app.UI_AUTH.get_two_factor_secret()
     code = patched_app.generate_totp_code(secret)
-    enable_two_factor = urlencode({"action": "enable", "code": code}).encode()
-    status, headers, _ = call_app(
+    settings_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/two-factor",
-        headers=[
-            ("Content-Type", "application/x-www-form-urlencoded"),
-            ("Cookie", session_cookie),
-        ],
-        body=enable_two_factor,
+        {"action": "enable", "code": code, "csrf_token": settings_csrf},
+        jar,
     )
     assert status == 303
     assert patched_app.UI_AUTH.is_two_factor_enabled()
 
-    status, _, _ = call_app(
+    logout_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/logout",
-        headers=[("Cookie", session_cookie)],
+        {"csrf_token": logout_csrf},
+        jar,
     )
     assert status == 303
 
-    password_only = urlencode({"username": "admin", "password": "admin123", "next": "/downloads"}).encode()
-    status, _, body = call_app(
+    login_csrf = fetch_csrf_token(
+        patched_app.app, jar, path="/settings", query="next=%2Fdownloads"
+    )
+    status, _, body = post_form(
         patched_app.app,
-        "POST",
         "/settings/login",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=password_only,
+        {
+            "username": "admin",
+            "password": "admin123",
+            "next": "/downloads",
+            "csrf_token": login_csrf,
+        },
+        jar,
     )
     assert status == 401
     html = body.decode()
     assert "Authentication code required" in html
     assert "name=\"totp\"" in html
+    login_csrf = extract_csrf_token(html)
 
-    wrong_totp = urlencode(
+    status, _, body = post_form(
+        patched_app.app,
+        "/settings/login",
         {
             "username": "admin",
             "password": "admin123",
             "totp": "000000",
             "next": "/downloads",
-        }
-    ).encode()
-    status, _, body = call_app(
-        patched_app.app,
-        "POST",
-        "/settings/login",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=wrong_totp,
+            "csrf_token": login_csrf,
+        },
+        jar,
     )
     assert status == 401
-    assert "Invalid authentication code" in body.decode()
+    html = body.decode()
+    assert "Invalid authentication code" in html
+    login_csrf = extract_csrf_token(html)
 
     final_code = patched_app.generate_totp_code(patched_app.UI_AUTH.get_two_factor_secret())
-    full_login = urlencode(
+    status, headers, _ = post_form(
+        patched_app.app,
+        "/settings/login",
         {
             "username": "admin",
             "password": "admin123",
             "totp": final_code,
             "next": "/downloads",
-        }
-    ).encode()
-    status, headers, _ = call_app(
-        patched_app.app,
-        "POST",
-        "/settings/login",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=full_login,
+            "csrf_token": login_csrf,
+        },
+        jar,
     )
     assert status == 303
     assert headers["location"] == "/downloads"
@@ -739,53 +811,46 @@ def test_api_keys_page_shows_controls(patched_app):
 
 
 def test_api_keys_toggle_requires_login_when_ui_auth_enabled(patched_app):
-    enable_body = urlencode({"require_login": "true"}).encode()
-    status, _, _ = call_app(
+    jar: dict[str, str] = {}
+    csrf_token = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/ui-auth",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=enable_body,
+        {"require_login": "true", "csrf_token": csrf_token},
+        jar,
     )
     assert status == 303
 
-    status, headers, _ = call_app(patched_app.app, "GET", "/api-keys")
+    status, headers, _ = get_with_cookies(patched_app.app, "/api-keys", jar)
     assert status == 303
     assert headers["location"].startswith("/settings?next=%2Fapi-keys")
 
-    toggle_body = urlencode({"require_api_key": "true"}).encode()
-    status, headers, _ = call_app(
+    login_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, headers, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/api-auth",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=toggle_body,
+        {"require_api_key": "true", "csrf_token": login_csrf},
+        jar,
     )
     assert status == 303
     assert headers["location"].startswith("/settings?error=")
     assert patched_app.API_KEYS.is_required() is False
 
-    login_body = urlencode({"username": "admin", "password": "admin123"}).encode()
-    status, headers, _ = call_app(
+    login_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/login",
-        headers=[("Content-Type", "application/x-www-form-urlencoded")],
-        body=login_body,
+        {"username": "admin", "password": "admin123", "csrf_token": login_csrf},
+        jar,
     )
     assert status == 303
-    session_cookie = headers["set-cookie"].split(";", 1)[0]
 
-    toggle_body = urlencode({"require_api_key": "true"}).encode()
-    status, headers, _ = call_app(
+    settings_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, headers, _ = post_form(
         patched_app.app,
-        "POST",
         "/settings/api-auth",
-        headers=[
-            ("Content-Type", "application/x-www-form-urlencoded"),
-            ("Cookie", session_cookie),
-        ],
-        body=toggle_body,
+        {"require_api_key": "true", "csrf_token": settings_csrf},
+        jar,
     )
     assert status == 303
     assert headers["location"].startswith("/settings?message=")

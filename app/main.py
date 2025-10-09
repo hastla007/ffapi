@@ -6,12 +6,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Literal
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode, quote, parse_qs
 from uuid import uuid4
 
 import threading
 
 import importlib.util
+
+try:  # pragma: no cover - optional dependency
+    import bcrypt
+except ModuleNotFoundError:  # pragma: no cover - test fallback
+    bcrypt = None
 
 if importlib.util.find_spec("httpx") is not None:
     import httpx  # type: ignore
@@ -85,6 +90,8 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl, field_validator
+
+from fastapi_csrf_protect import CsrfProtect, CsrfProtectException
 
 app = FastAPI()
 
@@ -219,6 +226,7 @@ SESSION_TTL_SECONDS = 3600
 
 TOTP_STEP_SECONDS = 30
 TOTP_DIGITS = 6
+TOTP_RATE_LIMIT = 5
 
 
 def _generate_totp_secret(length: int = 20) -> str:
@@ -258,9 +266,27 @@ def verify_totp_code(secret: str, code: str, window: int = 1) -> bool:
         return False
     now_counter = int(time.time() // TOTP_STEP_SECONDS)
     for offset in range(-window, window + 1):
-        if _totp_at(secret_bytes, now_counter + offset) == code:
+        expected = _totp_at(secret_bytes, now_counter + offset)
+        if secrets.compare_digest(expected, code):
             return True
     return False
+
+
+class CsrfSettings(BaseModel):
+    secret_key: str = os.getenv("CSRF_SECRET_KEY", secrets.token_urlsafe(32))
+    cookie_name: str = os.getenv("CSRF_COOKIE_NAME", "csrftoken")
+    header_name: str = "X-CSRF-Token"
+    cookie_secure: bool = os.getenv("CSRF_COOKIE_SECURE", "false").lower() == "true"
+    cookie_samesite: str = os.getenv("CSRF_COOKIE_SAMESITE", "Lax")
+    time_limit: int = int(os.getenv("CSRF_TIME_LIMIT_SECONDS", "3600"))
+
+
+@CsrfProtect.load_config
+def _load_csrf_config() -> CsrfSettings:
+    return CsrfSettings()
+
+
+csrf_protect = CsrfProtect()
 DEFAULT_UI_USERNAME = "admin"
 DEFAULT_UI_PASSWORD = "admin123"
 
@@ -274,9 +300,15 @@ class UIAuthManager:
         self._sessions: Dict[str, float] = {}
         self.two_factor_enabled = False
         self._totp_secret = _generate_totp_secret()
+        self._totp_attempts: Dict[str, List[float]] = {}
 
     def _hash(self, password: str) -> str:
-        return hashlib.sha256(password.encode("utf-8")).hexdigest()
+        if bcrypt is not None:
+            salt = bcrypt.gensalt()
+            hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
+            return f"bcrypt${hashed.decode('utf-8')}"
+        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return f"sha256${digest}"
 
     def reset(self) -> None:
         with self._lock:
@@ -286,12 +318,14 @@ class UIAuthManager:
             self._sessions.clear()
             self.two_factor_enabled = False
             self._totp_secret = _generate_totp_secret()
+            self._totp_attempts.clear()
 
     def set_require_login(self, enabled: bool) -> None:
         with self._lock:
             self.require_login = enabled
             if not enabled:
                 self._sessions.clear()
+                self._totp_attempts.clear()
 
     def set_credentials(self, username: str, password: str) -> None:
         username = username.strip()
@@ -308,6 +342,7 @@ class UIAuthManager:
             # Enabling new credentials invalidates existing second-factor sessions
             self.two_factor_enabled = False
             self._totp_secret = _generate_totp_secret()
+            self._totp_attempts.clear()
 
     def verify(self, username: str, password: str) -> bool:
         with self._lock:
@@ -315,8 +350,21 @@ class UIAuthManager:
             expected_hash = self._password_hash
         if not secrets.compare_digest(expected_user, username):
             return False
-        provided_hash = self._hash(password)
-        return secrets.compare_digest(expected_hash, provided_hash)
+        if expected_hash.startswith("bcrypt$"):
+            if bcrypt is None:
+                return False
+            stored_hash = expected_hash.split("$", 1)[1].encode("utf-8")
+            try:
+                return bcrypt.checkpw(password.encode("utf-8"), stored_hash)
+            except ValueError:
+                return False
+        if expected_hash.startswith("sha256$"):
+            digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            return secrets.compare_digest(expected_hash.split("$", 1)[1], digest)
+        if "$" not in expected_hash:
+            digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            return secrets.compare_digest(expected_hash, digest)
+        return False
 
     def create_session(self) -> str:
         token = secrets.token_hex(16)
@@ -363,6 +411,7 @@ class UIAuthManager:
             self.two_factor_enabled = enabled
             if not enabled:
                 self._sessions.clear()
+                self._totp_attempts.clear()
 
     def regenerate_two_factor_secret(self) -> str:
         secret = _generate_totp_secret()
@@ -370,6 +419,7 @@ class UIAuthManager:
             self._totp_secret = secret
             self.two_factor_enabled = False
             self._sessions.clear()
+            self._totp_attempts.clear()
         return secret
 
     def is_two_factor_enabled(self) -> bool:
@@ -377,11 +427,66 @@ class UIAuthManager:
             return self.two_factor_enabled
 
     def verify_totp(self, code: str) -> bool:
-        secret = self.get_two_factor_secret()
-        return verify_totp_code(secret, code)
+        username = self.get_username()
+        now = time.time()
+        with self._lock:
+            attempts = [t for t in self._totp_attempts.get(username, []) if t > now - 60]
+            if len(attempts) >= TOTP_RATE_LIMIT:
+                self._totp_attempts[username] = attempts
+                return False
+            attempts.append(now)
+            self._totp_attempts[username] = attempts
+            secret = self._totp_secret
+        code = code.strip()
+        if not code.isdigit() or len(code) != TOTP_DIGITS:
+            return False
+        try:
+            secret_bytes = _normalize_base32(secret)
+        except Exception:
+            return False
+        now_counter = int(time.time() // TOTP_STEP_SECONDS)
+        for offset in range(-1, 2):
+            expected = _totp_at(secret_bytes, now_counter + offset)
+            if secrets.compare_digest(expected, code):
+                with self._lock:
+                    self._totp_attempts.pop(username, None)
+                return True
+        return False
+
+    def cleanup_expired_sessions(self) -> None:
+        cutoff = time.time()
+        with self._lock:
+            expired_sessions = [token for token, expiry in self._sessions.items() if expiry < cutoff]
+            for token in expired_sessions:
+                self._sessions.pop(token, None)
+            # Trim stale attempt counters to avoid unbounded growth
+            recent_cutoff = cutoff - 60
+            for key in list(self._totp_attempts.keys()):
+                recent = [ts for ts in self._totp_attempts[key] if ts > recent_cutoff]
+                if recent:
+                    self._totp_attempts[key] = recent
+                else:
+                    self._totp_attempts.pop(key, None)
 
 
 UI_AUTH = UIAuthManager()
+
+
+def ensure_csrf_token(request: Request) -> str:
+    existing = request.cookies.get(csrf_protect.cookie_name)
+    if existing:
+        try:
+            csrf_protect.validate_token(existing)
+            return existing
+        except CsrfProtectException:
+            pass
+    token = csrf_protect.generate_csrf()
+    request.state._csrf_token_to_set = token
+    return token
+
+
+def csrf_hidden_input(token: str) -> str:
+    return f'<input type="hidden" name="csrf_token" value="{html.escape(token, quote=True)}" />'
 
 
 class APIKeyManager:
@@ -546,7 +651,7 @@ def storage_management_snapshot() -> Dict[str, Any]:
     }
 
 
-def render_login_page(next_path: str, error: Optional[str] = None) -> str:
+def render_login_page(next_path: str, csrf_token: str, error: Optional[str] = None) -> str:
     alert = ""
     if error:
         alert = f"<div class=\"alert error\">{html.escape(error)}</div>"
@@ -557,6 +662,7 @@ def render_login_page(next_path: str, error: Optional[str] = None) -> str:
         <label for=\"totp\">Authentication code</label>
         <input id=\"totp\" name=\"totp\" type=\"text\" inputmode=\"numeric\" pattern=\"\\d*\" autocomplete=\"one-time-code\" required />
         """
+    csrf_field = csrf_hidden_input(csrf_token)
     return f"""
     <!doctype html>
     <html>
@@ -582,6 +688,7 @@ def render_login_page(next_path: str, error: Optional[str] = None) -> str:
       <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
       {alert}
       <form method=\"post\" action=\"/settings/login\">
+        {csrf_field}
         <input type=\"hidden\" name=\"next\" value=\"{html.escape(next_path, quote=True)}\" />
         <label for=\"username\">Username</label>
         <input id=\"username\" name=\"username\" type=\"text\" autocomplete=\"username\" required />
@@ -602,6 +709,7 @@ def render_settings_page(
     error: Optional[str] = None,
     *,
     authenticated: bool,
+    csrf_token: str,
 ) -> str:
     total_used_mb = storage["total_bytes"] / (1024 * 1024) if storage["total_bytes"] else 0.0
     active_files = storage["active_files"]
@@ -624,10 +732,13 @@ def render_settings_page(
     checkbox_state = "checked" if require_login else ""
     disabled_class = "" if require_login else " is-disabled"
     disabled_attr = "" if require_login else " disabled"
+    csrf_field = csrf_hidden_input(csrf_token)
+
     logout_button = ""
     if require_login and authenticated:
-        logout_button = """
+        logout_button = f"""
         <form method=\"post\" action=\"/settings/logout\">
+          {csrf_field}
           <button type=\"submit\" class=\"secondary\">Log out</button>
         </form>
         """
@@ -691,10 +802,12 @@ def render_settings_page(
         two_factor_actions = f"""
             <div class=\"twofactor-actions\">
               <form method=\"post\" action=\"/settings/two-factor\">
+                {csrf_field}
                 <input type=\"hidden\" name=\"action\" value=\"disable\" />
                 <button type=\"submit\" class=\"secondary\"{two_factor_disabled_attr}>Disable two-factor</button>
               </form>
               <form method=\"post\" action=\"/settings/two-factor\">
+                {csrf_field}
                 <input type=\"hidden\" name=\"action\" value=\"regenerate\" />
                 <button type=\"submit\" class=\"secondary\"{two_factor_disabled_attr}>Generate new secret</button>
               </form>
@@ -704,6 +817,7 @@ def render_settings_page(
         two_factor_actions = f"""
             <div class=\"twofactor-actions\">
               <form method=\"post\" action=\"/settings/two-factor\">
+                {csrf_field}
                 <input type=\"hidden\" name=\"action\" value=\"enable\" />
                 <label for=\"totp_code\">Authentication code</label>
                 <input id=\"totp_code\" name=\"code\" type=\"text\" inputmode=\"numeric\" pattern=\"\\d*\" placeholder=\"123456\"{two_factor_disabled_attr} />
@@ -711,6 +825,7 @@ def render_settings_page(
                 <button type=\"submit\"{two_factor_disabled_attr}>Enable two-factor</button>
               </form>
               <form method=\"post\" action=\"/settings/two-factor\">
+                {csrf_field}
                 <input type=\"hidden\" name=\"action\" value=\"regenerate\" />
                 <button type=\"submit\" class=\"secondary\"{two_factor_disabled_attr}>Generate new secret</button>
               </form>
@@ -802,6 +917,7 @@ def render_settings_page(
             <span class="status-pill">{status_text}</span>
             <p>{auth_note}</p>
             <form method="post" action="/settings/ui-auth">
+              {csrf_field}
               <label class="checkbox-row" for="require_login">
                 <input type="checkbox" id="require_login" name="require_login" value="true" {checkbox_state} />
                 <span>Require login for dashboard pages</span>
@@ -812,6 +928,7 @@ def render_settings_page(
             <div class="credentials-block{disabled_class}">
               <h4>Update credentials</h4>
               <form method="post" action="/settings/credentials">
+                {csrf_field}
                 <div class="credentials-grid">
                   <label for="username">Username</label>
                   <input id="username" name="username" type="text" value="{html.escape(UI_AUTH.username, quote=True)}" required{disabled_attr} />
@@ -842,6 +959,7 @@ def render_settings_page(
         <span class="status-pill">{api_status_html}</span>
         <p>{api_note_text}</p>
         <form method="post" action="/settings/api-auth">
+          {csrf_field}
           <label class="checkbox-row" for="require_api_key_settings">
             <input type="checkbox" id="require_api_key_settings" name="require_api_key" value="true" {api_checkbox_state} />
             <span>Require API key for API requests</span>
@@ -854,6 +972,7 @@ def render_settings_page(
       <section>
         <h2>Retention Settings</h2>
         <form method="post" action="/settings/retention" class="retention-form">
+          {csrf_field}
           <label for="retention_hours">Default retention (hours)</label>
           <input
               id="retention_hours"
@@ -900,6 +1019,7 @@ def render_settings_page(
       <section>
         <h2>Performance Settings</h2>
           <form method="post" action="/settings/performance" class="performance-form">
+            {csrf_field}
             <div class="form-grid">
               <div class="field-card">
                 <label for="rate_limit_rpm">Rate limit (requests/minute)</label>
@@ -974,6 +1094,7 @@ def render_api_keys_page(
     message: Optional[str] = None,
     error: Optional[str] = None,
     new_key: Optional[str] = None,
+    csrf_token: str,
 ) -> str:
     alert_blocks: List[str] = []
     if message:
@@ -994,6 +1115,7 @@ def render_api_keys_page(
 
     disabled_class = "" if require_key else " is-disabled"
     disabled_attr = "" if require_key else " disabled"
+    csrf_field = csrf_hidden_input(csrf_token)
 
     def format_timestamp(epoch: Optional[float]) -> str:
         if not epoch:
@@ -1014,6 +1136,7 @@ def render_api_keys_page(
               <td>{last_used}</td>
               <td>
                 <form method="post" action="/api-keys/revoke">
+                  {csrf_field}
                   <input type="hidden" name="key_id" value="{key_id}" />
                   <button type="submit" class="secondary"{disabled}>Revoke</button>
                 </form>
@@ -1025,6 +1148,7 @@ def render_api_keys_page(
                 last_used=html.escape(last_used),
                 key_id=html.escape(str(item["id"]), quote=True),
                 disabled=disabled_attr,
+                csrf_field=csrf_field,
             )
         )
 
@@ -1114,6 +1238,7 @@ def render_api_keys_page(
           <p>{note_html}</p>
           {settings_notice}
           <form method="post" action="/api-keys/generate">
+            {csrf_field}
             <button type="submit"{disabled_attr}>Generate new key</button>
           </form>
           <table>
@@ -1338,6 +1463,38 @@ async def metrics_middleware(request, call_next):
 
 
 @app.middleware("http")
+async def csrf_middleware(request: Request, call_next):
+    content_type = request.headers.get("content-type", "")
+    content_type = content_type.split(";", 1)[0].strip().lower()
+    should_validate = (
+        request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and content_type == "application/x-www-form-urlencoded"
+    )
+    if should_validate:
+        body_bytes = await request.body()
+        parsed = parse_qs(body_bytes.decode("utf-8")) if body_bytes else {}
+        token_list = parsed.get("csrf_token")
+        token = token_list[0] if token_list else None
+        cookie_token = request.cookies.get(csrf_protect.cookie_name)
+        try:
+            csrf_protect.validate_csrf(token, cookie_token)
+        except CsrfProtectException as exc:
+            return JSONResponse({"detail": exc.message}, status_code=exc.status_code)
+
+        async def receive():
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+
+        request._receive = receive
+    response = await call_next(request)
+    token_to_set = getattr(request.state, "_csrf_token_to_set", None)
+    if token_to_set:
+        csrf_protect.set_csrf_cookie(response, token_to_set)
+    elif not request.cookies.get(csrf_protect.cookie_name):
+        csrf_protect.set_csrf_cookie(response, csrf_protect.generate_csrf())
+    return response
+
+
+@app.middleware("http")
 async def security_headers_middleware(request, call_next):
     response = await call_next(request)
     response.headers.setdefault(
@@ -1421,6 +1578,7 @@ async def startup_event():
     if PUBLIC_CLEANUP_INTERVAL_SECONDS > 0:
         asyncio.create_task(_periodic_public_cleanup())
         asyncio.create_task(_periodic_jobs_cleanup())
+    asyncio.create_task(_periodic_session_cleanup())
     _flush_logs()
 
 
@@ -1754,6 +1912,25 @@ async def _periodic_jobs_cleanup():
             logger.warning("Periodic jobs cleanup failed: %s", exc)
         try:
             await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise
+
+
+async def _periodic_session_cleanup():
+    """Periodically reap expired UI authentication sessions."""
+    try:
+        await asyncio.sleep(1800)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            UI_AUTH.cleanup_expired_sessions()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Session cleanup failed: %s", exc)
+        try:
+            await asyncio.sleep(1800)
         except asyncio.CancelledError:
             raise
 
@@ -2512,15 +2689,18 @@ def settings_page(
     authed = is_authenticated(request)
     next_target = next or "/settings"
     if UI_AUTH.require_login and not authed:
-        html_content = render_login_page(next_target, error or None)
+        csrf_token = ensure_csrf_token(request)
+        html_content = render_login_page(next_target, csrf_token, error or None)
         return HTMLResponse(html_content)
 
     storage = storage_management_snapshot()
+    csrf_token = ensure_csrf_token(request)
     html_content = render_settings_page(
         storage,
         message or None,
         error or None,
         authenticated=authed,
+        csrf_token=csrf_token,
     )
     return HTMLResponse(html_content)
 
@@ -2538,10 +2718,12 @@ async def settings_login(request: Request):
     if UI_AUTH.verify(username, password):
         if UI_AUTH.is_two_factor_enabled():
             if not totp_code:
-                html_content = render_login_page(next_path, "Authentication code required")
+                csrf_token = ensure_csrf_token(request)
+                html_content = render_login_page(next_path, csrf_token, "Authentication code required")
                 return HTMLResponse(html_content, status_code=401)
             if not UI_AUTH.verify_totp(totp_code):
-                html_content = render_login_page(next_path, "Invalid authentication code")
+                csrf_token = ensure_csrf_token(request)
+                html_content = render_login_page(next_path, csrf_token, "Invalid authentication code")
                 return HTMLResponse(html_content, status_code=401)
         token = UI_AUTH.create_session()
         response = RedirectResponse(url=next_path, status_code=303)
@@ -2554,7 +2736,8 @@ async def settings_login(request: Request):
         )
         return response
 
-    html_content = render_login_page(next_path, "Invalid username or password")
+    csrf_token = ensure_csrf_token(request)
+    html_content = render_login_page(next_path, csrf_token, "Invalid username or password")
     return HTMLResponse(html_content, status_code=401)
 
 
@@ -2632,10 +2815,12 @@ async def settings_update_credentials(request: Request):
         UI_AUTH.set_credentials(username, password)
     except ValueError as exc:
         storage = storage_management_snapshot()
+        csrf_token = ensure_csrf_token(request)
         html_content = render_settings_page(
             storage,
             error=str(exc),
             authenticated=authed,
+            csrf_token=csrf_token,
         )
         return HTMLResponse(html_content, status_code=400)
 
@@ -2705,10 +2890,12 @@ async def settings_update_retention(request: Request):
     raw_hours = str(form.get("retention_hours", "")).strip()
     if not raw_hours:
         storage = storage_management_snapshot()
+        csrf_token = ensure_csrf_token(request)
         html_content = render_settings_page(
             storage,
             error="Retention hours are required",
             authenticated=authed,
+            csrf_token=csrf_token,
         )
         return HTMLResponse(html_content, status_code=400)
 
@@ -2716,19 +2903,23 @@ async def settings_update_retention(request: Request):
         hours = float(raw_hours)
     except ValueError:
         storage = storage_management_snapshot()
+        csrf_token = ensure_csrf_token(request)
         html_content = render_settings_page(
             storage,
             error="Retention hours must be a number",
             authenticated=authed,
+            csrf_token=csrf_token,
         )
         return HTMLResponse(html_content, status_code=400)
 
     if hours < 1 or hours > 24 * 365:
         storage = storage_management_snapshot()
+        csrf_token = ensure_csrf_token(request)
         html_content = render_settings_page(
             storage,
             error="Retention must be between 1 hour and 8760 hours (365 days)",
             authenticated=authed,
+            csrf_token=csrf_token,
         )
         return HTMLResponse(html_content, status_code=400)
 
@@ -2804,10 +2995,12 @@ async def settings_update_performance(request: Request):
 
     if errors or rpm is None or timeout_minutes is None or chunk_mb is None or max_file_mb is None:
         storage = storage_management_snapshot()
+        csrf_token = ensure_csrf_token(request)
         html_content = render_settings_page(
             storage,
             error="; ".join(errors) if errors else "Invalid performance settings",
             authenticated=authed,
+            csrf_token=csrf_token,
         )
         return HTMLResponse(html_content, status_code=400)
 
@@ -2844,32 +3037,16 @@ def api_keys_page(
         return redirect
 
     new_key_value = API_KEYS.consume_plaintext(new_key_id) if new_key_id else None
+    csrf_token = ensure_csrf_token(request)
     html_content = render_api_keys_page(
         keys=API_KEYS.list_keys(),
         require_key=API_KEYS.is_required(),
         message=message or None,
         error=error or None,
         new_key=new_key_value,
+        csrf_token=csrf_token,
     )
     return HTMLResponse(html_content)
-
-
-@app.post("/api-keys/require")
-async def api_keys_toggle(request: Request):
-    redirect = ensure_dashboard_access(request)
-    if redirect:
-        return redirect
-
-    form = await request.form()
-    raw_value = form.get("require_api_key")
-    enable = False
-    if raw_value is not None:
-        enable = str(raw_value).lower() in {"true", "1", "on", "yes"}
-    API_KEYS.set_require_key(enable)
-    message = "API authentication enabled" if enable else "API authentication disabled"
-    query = urlencode({"message": message})
-    return RedirectResponse(url=f"/api-keys?{query}", status_code=303)
-
 
 @app.post("/api-keys/generate")
 async def api_keys_generate(request: Request):
