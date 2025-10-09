@@ -10,6 +10,7 @@ from itertools import count
 from pathlib import Path
 from typing import List, Tuple
 from urllib.parse import urlencode
+from unittest.mock import Mock
 
 import pytest
 from fastapi import HTTPException, UploadFile
@@ -668,6 +669,27 @@ def test_rate_limiter_blocks_excess_requests(patched_app, monkeypatch):
     second_status, _, body = call_app(patched_app.app, "GET", "/health")
     assert second_status == 429
     assert b"Too Many Requests" in body
+
+    patched_app.RATE_LIMITER.reset()
+
+
+def test_rate_limited_requests_complete_once(patched_app, monkeypatch):
+    patched_app.METRICS.reset()
+    patched_app.RATE_LIMITER.reset()
+
+    original_completed = patched_app.METRICS.request_completed
+    mock_completed = Mock(side_effect=lambda: original_completed())
+
+    monkeypatch.setattr(patched_app.RATE_LIMITER, "check", lambda identifier: False)
+    monkeypatch.setattr(patched_app.METRICS, "request_completed", mock_completed)
+
+    status, _, body = call_app(patched_app.app, "GET", "/health")
+    assert status == 429
+    assert b"Too Many Requests" in body
+    assert mock_completed.call_count == 1
+
+    snapshot = patched_app.METRICS.snapshot()
+    assert snapshot["queue"]["current"] == 0
 
     patched_app.RATE_LIMITER.reset()
 

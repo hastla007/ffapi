@@ -349,25 +349,28 @@ async def metrics_middleware(request, call_next):
         identifier = request.client.host or "unknown"
 
     RATE_LIMITER.cleanup_old_identifiers()
-    if not RATE_LIMITER.check(identifier):
-        METRICS.request_finished(path, 429, 0.0, 0.0, "rate_limited")
-        METRICS.request_completed()
-        return PlainTextResponse("Too Many Requests", status_code=429)
-
-    processing_start = time.perf_counter()
-    wait_time = processing_start - arrival
+    wait_time = 0.0
+    processing_start: Optional[float] = None
     try:
+        if not RATE_LIMITER.check(identifier):
+            METRICS.request_finished(path, 429, 0.0, wait_time, "rate_limited")
+            return PlainTextResponse("Too Many Requests", status_code=429)
+
+        processing_start = time.perf_counter()
+        wait_time = processing_start - arrival
         response = await call_next(request)
         duration = time.perf_counter() - processing_start
         METRICS.request_finished(path, response.status_code, duration, wait_time)
         return response
     except HTTPException as exc:
-        duration = time.perf_counter() - processing_start
+        now = time.perf_counter()
+        duration = now - processing_start if processing_start is not None else 0.0
         detail = exc.detail if isinstance(exc.detail, str) else exc.__class__.__name__
         METRICS.request_finished(path, exc.status_code, duration, wait_time, detail)
         raise
     except Exception as exc:
-        duration = time.perf_counter() - processing_start
+        now = time.perf_counter()
+        duration = now - processing_start if processing_start is not None else 0.0
         METRICS.request_finished(path, 500, duration, wait_time, exc.__class__.__name__)
         raise
     finally:
