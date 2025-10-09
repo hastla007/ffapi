@@ -834,7 +834,9 @@ def test_settings_page_enables_credentials_when_authentication_required(patched_
 
 
 def test_settings_rejects_short_password(patched_app):
-    body = urlencode({"username": "admin", "password": "short"}).encode()
+    body = urlencode(
+        {"username": "admin", "password": "short", "password_confirm": "short"}
+    ).encode()
     status, _, response_body = call_app(
         patched_app.app,
         "POST",
@@ -844,6 +846,25 @@ def test_settings_rejects_short_password(patched_app):
     )
     assert status == 400
     assert "Password must be at least 6 characters long" in response_body.decode()
+
+
+def test_settings_rejects_mismatched_password_confirmation(patched_app):
+    body = urlencode(
+        {
+            "username": "admin",
+            "password": "longenough",
+            "password_confirm": "different",
+        }
+    ).encode()
+    status, _, response_body = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/credentials",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=body,
+    )
+    assert status == 400
+    assert "Passwords do not match" in response_body.decode()
 
 
 def test_retention_settings_update_changes_value(patched_app):

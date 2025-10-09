@@ -48,6 +48,12 @@
     button.secondary:hover {
       background: #7c8794;
     }
+    .half-width {
+      width: 50%;
+    }
+    .api-auth-form button {
+      margin-top: 20px;
+    }
     button:disabled,
     button[disabled] {
       cursor: not-allowed;
@@ -182,6 +188,16 @@
       font-size: 18px;
       letter-spacing: 2px;
       font-weight: 600;
+    }
+    .retention-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .retention-actions .help-text {
+      margin: 0;
     }
     .qr-wrapper {
       margin: 12px 0;
@@ -450,6 +466,8 @@
               <input id="username" name="username" type="text" value="{{ ui_username }}" required {% if ui_disabled %}disabled{% endif %} />
               <label for="password">New password</label>
               <input id="password" name="password" type="password" placeholder="Enter a new password" required {% if ui_disabled %}disabled{% endif %} />
+              <label for="password_confirm">Confirm new password</label>
+              <input id="password_confirm" name="password_confirm" type="password" placeholder="Re-enter the new password" required {% if ui_disabled %}disabled{% endif %} />
             </div>
             <button type="submit"{% if ui_disabled %} disabled{% endif %}>Update credentials</button>
           </form>
@@ -538,15 +556,15 @@
       <h2>API Authentication</h2>
       <span class="status-pill">{{ api_auth.status_text }}</span>
       <p>{{ api_auth.note }}</p>
-      <form method="post" action="/settings/api-auth">
-        {{ csrf_field|safe }}
-        <label class="checkbox-row" for="require_api_key_settings">
-          <input type="checkbox" id="require_api_key_settings" name="require_api_key" value="true" {% if api_auth.enabled %}checked{% endif %} />
-          <span>Require API key for API requests</span>
-        </label>
+        <form method="post" action="/settings/api-auth" class="api-auth-form">
+          {{ csrf_field|safe }}
+          <label class="checkbox-row" for="require_api_key_settings">
+            <input type="checkbox" id="require_api_key_settings" name="require_api_key" value="true" {% if api_auth.enabled %}checked{% endif %} />
+            <span>Require API key for API requests</span>
+          </label>
         <button type="submit">Save API authentication</button>
-        <p class="help-text">{{ api_auth.help_text }}</p>
-      </form>
+          <p class="help-text">{{ api_auth.help_text }}</p>
+        </form>
     </section>
 
     <section>
@@ -558,9 +576,11 @@
             <span class="tooltiptext">Hours files remain available before cleanup runs.</span>
           </span>
         </label>
-        <input id="retention_hours" name="retention_hours" type="number" min="1" max="8760" step="0.5" value="{{ retention.hours_value }}" required />
-        <span class="help-text">Equivalent to {{ retention.days_text }} day(s).</span>
-        <button type="submit" style="margin-top: 16px;">Update retention</button>
+        <input id="retention_hours" name="retention_hours" type="number" min="1" max="8760" step="0.5" value="{{ retention.hours_value }}" required class="half-width" />
+        <div class="retention-actions">
+          <button type="submit" style="margin-top: 16px;">Update retention</button>
+          <span class="help-text">Equivalent to {{ retention.days_text }} day(s).</span>
+        </div>
       </form>
       <div class="storage-table">
         <h3>Storage Management</h3>
@@ -602,7 +622,7 @@
                 <span class="tooltiptext">Maximum requests per client IP per minute.</span>
               </span>
             </label>
-            <input id="rate_limit_rpm" name="rate_limit_rpm" type="number" min="1" max="100000" step="1" value="{{ performance.rate_limit }}" required />
+            <input id="rate_limit_rpm" name="rate_limit_rpm" type="number" min="1" max="100000" step="1" value="{{ performance.rate_limit }}" required class="half-width" />
             <span class="help-text">Requests allowed per minute.</span>
           </div>
           <div class="field-card">
@@ -611,7 +631,7 @@
                 <span class="tooltiptext">Terminate jobs exceeding this processing time.</span>
               </span>
             </label>
-            <input id="ffmpeg_timeout_minutes" name="ffmpeg_timeout_minutes" type="number" min="1" max="720" step="1" value="{{ performance.ffmpeg_timeout }}" required />
+            <input id="ffmpeg_timeout_minutes" name="ffmpeg_timeout_minutes" type="number" min="1" max="720" step="1" value="{{ performance.ffmpeg_timeout }}" required class="half-width" />
             <span class="help-text">Maximum processing duration.</span>
           </div>
           <div class="field-card">
@@ -620,7 +640,7 @@
                 <span class="tooltiptext">Size of each streamed upload chunk.</span>
               </span>
             </label>
-            <input id="upload_chunk_mb" name="upload_chunk_mb" type="number" min="0.1" max="512" step="0.1" value="{{ performance.upload_chunk }}" required />
+            <input id="upload_chunk_mb" name="upload_chunk_mb" type="number" min="0.1" max="512" step="0.1" value="{{ performance.upload_chunk }}" required class="half-width" />
             <span class="help-text">Per-stream read buffer.</span>
           </div>
           <div class="field-card">
@@ -629,7 +649,7 @@
                 <span class="tooltiptext">Largest upload accepted by the server.</span>
               </span>
             </label>
-            <input id="max_file_size_mb" name="max_file_size_mb" type="number" min="1" max="8192" step="1" value="{{ performance.max_file_size }}" required />
+            <input id="max_file_size_mb" name="max_file_size_mb" type="number" min="1" max="8192" step="1" value="{{ performance.max_file_size }}" required class="half-width" />
             <span class="help-text">Maximum upload size.</span>
           </div>
         </div>

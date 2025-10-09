@@ -1143,6 +1143,8 @@ def settings_template_response(
         button:hover {{ background: #0053a3; }}
         button.secondary {{ background: #9aa5b1; }}
         button.secondary:hover {{ background: #7c8794; }}
+        .half-width {{ width: 50%; }}
+        .api-auth-form button {{ margin-top: 20px; }}
         .checkbox-row {{ display: flex; align-items: center; gap: 10px; font-weight: 600; }}
         .checkbox-row input {{ width: auto; margin: 0; transform: scale(1.2); }}
         .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-top: 16px; }}
@@ -1200,6 +1202,8 @@ def settings_template_response(
         .retention-form button, .performance-form button {{ margin-top: 16px; }}
         .field-card label {{ margin-bottom: 0; display: flex; align-items: center; gap: 6px; }}
         .tooltip {{ position: relative; display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; background: #e2e8f0; color: #1e293b; font-size: 12px; font-weight: 600; cursor: help; }}
+        .retention-actions {{ display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 16px; }}
+        .retention-actions .help-text {{ margin: 0; }}
         .tooltip:focus-visible {{ outline: 2px solid #2563eb; outline-offset: 2px; }}
         .tooltip .tooltiptext {{ visibility: hidden; opacity: 0; width: 220px; background: #1e293b; color: #f8fafc; text-align: left; border-radius: 6px; padding: 8px 10px; position: absolute; z-index: 10; bottom: 125%; left: 50%; transform: translateX(-50%); transition: opacity 0.2s ease-in-out; box-shadow: 0 8px 16px rgba(15, 23, 42, 0.25); }}
         .tooltip:hover .tooltiptext, .tooltip:focus .tooltiptext {{ visibility: visible; opacity: 1; }}
@@ -1237,6 +1241,8 @@ def settings_template_response(
                   <input id="username" name="username" type="text" value="{html.escape(UI_AUTH.username, quote=True)}" required{disabled_attr} />
                   <label for="password">New password</label>
                   <input id="password" name="password" type="password" placeholder="Enter a new password" required{disabled_attr} />
+                  <label for="password_confirm">Confirm new password</label>
+                  <input id="password_confirm" name="password_confirm" type="password" placeholder="Re-enter the new password" required{disabled_attr} />
                 </div>
                 <button type="submit"{disabled_attr}>Update credentials</button>
               </form>
@@ -1263,7 +1269,7 @@ def settings_template_response(
         <h2>API Authentication</h2>
         <span class="status-pill">{api_status_html}</span>
         <p>{api_note_text}</p>
-        <form method="post" action="/settings/api-auth">
+        <form method="post" action="/settings/api-auth" class="api-auth-form">
           {csrf_field}
           <label class="checkbox-row" for="require_api_key_settings">
             <input type="checkbox" id="require_api_key_settings" name="require_api_key" value="true" {api_checkbox_state} />
@@ -1292,9 +1298,12 @@ def settings_template_response(
               step="0.5"
               value="{retention_hours_value}"
               required
+              class="half-width"
             />
-            <span class="help-text">Equivalent to {retention_days_text} day(s).</span>
-            <button type="submit">Update retention</button>
+            <div class="retention-actions">
+              <button type="submit">Update retention</button>
+              <span class="help-text">Equivalent to {retention_days_text} day(s).</span>
+            </div>
         </form>
         <div class="storage-table">
           <h3>Storage Management</h3>
@@ -1345,6 +1354,7 @@ def settings_template_response(
                   step="1"
                   value="{rate_limit_value}"
                   required
+                  class="half-width"
                 />
                 <span class="help-text">Requests allowed per minute.</span>
               </div>
@@ -1363,6 +1373,7 @@ def settings_template_response(
                   step="1"
                   value="{ffmpeg_timeout_value}"
                   required
+                  class="half-width"
                 />
                 <span class="help-text">Maximum processing duration.</span>
               </div>
@@ -1381,6 +1392,7 @@ def settings_template_response(
                   step="0.1"
                   value="{upload_chunk_value}"
                   required
+                  class="half-width"
                 />
                 <span class="help-text">Per-stream read buffer.</span>
               </div>
@@ -1399,6 +1411,7 @@ def settings_template_response(
                   step="1"
                   value="{max_file_size_value}"
                   required
+                  class="half-width"
                 />
                 <span class="help-text">Maximum upload size.</span>
               </div>
@@ -3873,6 +3886,7 @@ async def settings_update_credentials(request: Request):
     form = await request.form()
     username = str(form.get("username", ""))
     password = str(form.get("password", ""))
+    password_confirm = str(form.get("password_confirm", ""))
     authed = is_authenticated(request)
     if UI_AUTH.require_login and not authed:
         response = RedirectResponse(
@@ -3881,6 +3895,18 @@ async def settings_update_credentials(request: Request):
         )
         response.delete_cookie(SESSION_COOKIE_NAME)
         return response
+
+    if password != password_confirm:
+        storage = storage_management_snapshot()
+        csrf_token = ensure_csrf_token(request)
+        return settings_template_response(
+            request,
+            storage,
+            error="Passwords do not match",
+            authenticated=authed,
+            csrf_token=csrf_token,
+            status_code=400,
+        )
 
     try:
         UI_AUTH.set_credentials(username, password)
