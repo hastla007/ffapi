@@ -1289,6 +1289,28 @@ def documentation():
 
 <div class="endpoint">
   <div class="method post">POST</div>
+  <div class="path">/compose/from-urls/async</div>
+  <div class="desc">Queue video composition as a background job</div>
+  <div class="params">
+    Same parameters as <code>/compose/from-urls</code>
+  </div>
+  <div class="response">Returns: {"job_id": "...", "status_url": "/jobs/{job_id}"}</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-urls/async \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "video_url": "https://example.com/video.mp4",<br>    "duration_ms": 10000<br>  }'</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/jobs/{job_id}</div>
+  <div class="desc">Fetch status details for an asynchronous job</div>
+  <div class="params">
+    <span class="param">job_id</span> - Identifier returned from the async compose endpoint
+  </div>
+  <div class="response">Returns: {"status": "queued|processing|finished|failed", ...}</div>
+  <div class="example">Example:<br>curl http://localhost:3000/jobs/123e4567-e89b-12d3-a456-426614174000</div>
+</div>
+
+<div class="endpoint">
+  <div class="method post">POST</div>
   <div class="path">/compose/from-tracks</div>
   <div class="desc">Compose video from track definitions</div>
   <div class="params">
