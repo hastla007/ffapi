@@ -4104,6 +4104,73 @@ class ComposeFromUrlsJob(BaseModel):
         elif self.duration is not None:
             self.duration_ms = int(self.duration * 1000)
 
+    @field_validator("duration", mode="before")
+    @classmethod
+    def parse_duration(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError as exc:
+                raise ValueError(f"duration must be a valid number, got '{value}'") from exc
+        return float(value)
+
+    @field_validator("duration")
+    @classmethod
+    def validate_duration_seconds(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None:
+            if not (0.001 <= value <= 3600.0):
+                raise ValueError("duration must be 0.001-3600 seconds")
+        return value
+
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        if not (1 <= value <= 7680):
+            raise ValueError(f"Dimension must be 1-7680, got {value}")
+        return value
+
+    @field_validator("fps")
+    @classmethod
+    def validate_fps(cls, value: int) -> int:
+        if not (1 <= value <= 240):
+            raise ValueError(f"FPS must be 1-240, got {value}")
+        return value
+
+    @field_validator("bgm_volume")
+    @classmethod
+    def validate_volume(cls, value: float) -> float:
+        if not (0.0 <= value <= 5.0):
+            raise ValueError(f"bgm_volume must be between 0 and 5, got {value}")
+        return value
+
+    @field_validator("duration_ms")
+    @classmethod
+    def validate_duration_ms(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None:
+            if not (1 <= value <= 3_600_000):
+                raise ValueError("duration_ms must be 1-3600000")
+        return value
+
+    @field_validator("video_url", "audio_url", "bgm_url", mode="before")
+    @classmethod
+    def validate_url_scheme(cls, value):
+        if value is None:
+            return value
+        value_str = str(value)
+        if not value_str.startswith(("http://", "https://")):
+            raise ValueError("Only http:// and https:// URLs are supported")
+        return value
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.duration is None and self.duration_ms is None:
+            self.duration_ms = 30000
+        elif self.duration is not None and self.duration_ms is not None:
+            raise ValueError("Provide either 'duration' or 'duration_ms', not both")
+        elif self.duration is not None:
+            self.duration_ms = int(self.duration * 1000)
+
 
 class Keyframe(BaseModel):
     url: Optional[HttpUrl] = None
