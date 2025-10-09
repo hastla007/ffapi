@@ -299,6 +299,7 @@ def app_module(tmp_path_factory: pytest.TempPathFactory):
     module._FFMPEG_VERSION_CACHE = None
     module.UI_AUTH.reset()
     module.PROBE_CACHE.clear()
+    module.LOGIN_RATE_LIMITER.reset()
     module.csrf_protect.validate_csrf = lambda submitted, cookie: None
     module.API_WHITELIST.reset()
     return module
@@ -433,6 +434,7 @@ def patched_app(app_module, monkeypatch, tmp_path):
 
     app_module.METRICS.reset()
     app_module.RATE_LIMITER.reset()
+    app_module.LOGIN_RATE_LIMITER.reset()
     app_module.UI_AUTH.reset()
     app_module.API_KEYS.reset()
     app_module.API_WHITELIST.reset()
@@ -480,7 +482,9 @@ def test_downloads_page_escapes_special_characters(patched_app):
     status, _, body = call_app(patched_app.app, "GET", "/downloads")
     assert status == 200
     html = body.decode()
-    assert "&lt;img src=x onerror=alert(&#x27;xss&#x27;)&gt;.mp4" in html
+    expected = "&lt;img src=x onerror=alert(&#x27;xss&#x27;)&gt;.mp4"
+    alternate = expected.replace("&#x27;", "&#39;")
+    assert expected in html or alternate in html
     assert "onerror" in html
     assert "<img" not in html.split("Generated Files", 1)[1]
 
@@ -800,6 +804,40 @@ def test_login_requires_totp_when_two_factor_enabled(patched_app):
     assert headers["location"] == "/downloads"
     statuses_after = patched_app.UI_AUTH.get_backup_code_status()
     assert any(item["used"] for item in statuses_after)
+
+
+def test_login_rate_limiter_blocks_repeated_attempts(patched_app):
+    jar: dict[str, str] = {}
+    patched_app.LOGIN_RATE_LIMITER.reset()
+    csrf_token = fetch_csrf_token(patched_app.app, jar)
+
+    login_csrf = csrf_token
+    for _ in range(5):
+        status, _, body = post_form(
+            patched_app.app,
+            "/settings/login",
+            {
+                "username": "admin",
+                "password": "wrong",
+                "csrf_token": login_csrf,
+            },
+            jar,
+        )
+        assert status == 401
+        login_csrf = extract_csrf_token(body.decode("utf-8"))
+
+    status, _, body = post_form(
+        patched_app.app,
+        "/settings/login",
+        {
+            "username": "admin",
+            "password": "wrong",
+            "csrf_token": login_csrf,
+        },
+        jar,
+    )
+    assert status == 429
+    assert "Too many login attempts" in body.decode("utf-8")
 
 
 def test_settings_shows_backup_codes_alert(patched_app):

@@ -187,19 +187,19 @@
       align-items: center;
       gap: 6px;
       padding: 6px 10px;
-      background: #e8f5e9;
-      color: #256029;
+      background: #e2e8f0;
+      color: #1f2937;
       border-radius: 999px;
       font-weight: 600;
       width: fit-content;
     }
-    .status-pill.disabled {
-      background: #e2e8f0;
-      color: #475569;
+    .status-pill.enabled {
+      background: #e8f5e9;
+      color: #256029;
     }
-    .twofactor-card .status-pill {
-      background: #e0f2fe;
-      color: #1f7a34;
+    .status-pill.disabled {
+      background: #fdecea;
+      color: #b3261e;
     }
     .twofactor-card .status-pill.enabled {
       background: #e8f5e9;
@@ -476,7 +476,7 @@
     <div class="auth-row">
       <div class="auth-card toggle-card">
         <h3>Access control</h3>
-        <span class="status-pill">{{ status_text }}</span>
+      <span class="status-pill {{ 'enabled' if require_login else 'disabled' }}">{{ status_text }}</span>
         <p>{{ auth_note }}</p>
         <form method="post" action="/settings/ui-auth">
           {{ csrf_field|safe }}
@@ -510,7 +510,7 @@
       </div>
       <div class="auth-card twofactor-card{% if ui_disabled %} is-disabled{% endif %}">
         <h3>Two-factor authentication</h3>
-        <span class="status-pill{% if two_factor.enabled %} enabled{% endif %}">{{ two_factor.status_text }}</span>
+        <span class="status-pill {{ two_factor.status_class }}">{{ two_factor.status_text }}</span>
         <p>{{ two_factor.note }}</p>
         <div class="secret-box">
           <span>Secret</span>
@@ -589,7 +589,7 @@
   <div class="settings-row">
     <section>
       <h2>API Authentication</h2>
-      <span class="status-pill">{{ api_auth.status_text }}</span>
+      <span class="status-pill {{ 'enabled' if api_auth.enabled else 'disabled' }}">{{ api_auth.status_text }}</span>
       <p>{{ api_auth.note }}</p>
         <form method="post" action="/settings/api-auth" class="api-auth-form">
           {{ csrf_field|safe }}
@@ -603,7 +603,7 @@
         <div class="whitelist-card{% if api_whitelist.disabled %} is-disabled{% endif %}">
           <div class="whitelist-header">
             <h3>API IP whitelist</h3>
-            <span class="status-pill {% if api_whitelist.status_class %}{{ api_whitelist.status_class }}{% endif %}">{{ api_whitelist.status_text }}</span>
+            <span class="status-pill {{ api_whitelist.status_class }}">{{ api_whitelist.status_text }}</span>
           </div>
           <p>{{ api_whitelist.note }}</p>
           <form method="post" action="/settings/api-whitelist" class="whitelist-form">

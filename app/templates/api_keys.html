@@ -76,10 +76,18 @@
       align-items: center;
       gap: 6px;
       padding: 6px 10px;
-      background: #e8f5e9;
-      color: #256029;
+      background: #e2e8f0;
+      color: #1f2937;
       border-radius: 999px;
       font-weight: 600;
+    }
+    .status-pill.enabled {
+      background: #e8f5e9;
+      color: #256029;
+    }
+    .status-pill.disabled {
+      background: #fdecea;
+      color: #b3261e;
     }
     .help-text {
       font-size: 13px;
@@ -158,7 +166,7 @@
     <div class="api-card keys-card{{ disabled_class }}">
       <div class="api-card-header">
         <h3>Authentication status</h3>
-        <span class="status-pill">{{ status_text }}</span>
+        <span class="status-pill {{ 'enabled' if require_key else 'disabled' }}">{{ status_text }}</span>
       </div>
       <p>{{ note_text }}</p>
       {% if not require_key %}

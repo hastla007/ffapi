@@ -251,6 +251,7 @@ UPLOAD_CHUNK_SIZE = settings.UPLOAD_CHUNK_SIZE
 PUBLIC_CLEANUP_INTERVAL_SECONDS = settings.PUBLIC_CLEANUP_INTERVAL_SECONDS
 REQUIRE_DURATION_LIMIT = settings.REQUIRE_DURATION_LIMIT
 RATE_LIMITER = RateLimiter(settings.RATE_LIMIT_REQUESTS_PER_MINUTE)
+LOGIN_RATE_LIMITER = RateLimiter(5)
 
 _FFMPEG_VERSION_CACHE: Optional[Dict[str, Optional[str]]] = None
 
@@ -1038,6 +1039,7 @@ def settings_template_response(
     alerts = "".join(alert_blocks)
     require_login = UI_AUTH.require_login
     status_text = "Enabled" if require_login else "Disabled"
+    status_class = "enabled" if require_login else "disabled"
     auth_note = (
         "Dashboard pages currently require sign-in."
         if require_login
@@ -1083,6 +1085,7 @@ def settings_template_response(
     quota_text = html.escape(quota_display)
     api_require_key = API_KEYS.is_required()
     api_status_text = "Enabled" if api_require_key else "Disabled"
+    api_status_class = "enabled" if api_require_key else "disabled"
     api_note = (
         "API requests currently require a valid key."
         if api_require_key
@@ -1146,7 +1149,7 @@ def settings_template_response(
         )
     two_factor_disabled_attr = disabled_attr
     two_factor_card_class = disabled_class
-    two_factor_status_class = "status-pill enabled" if two_factor_enabled else "status-pill"
+    two_factor_status_class = "enabled" if two_factor_enabled else "disabled"
     backup_generation_disabled = two_factor_disabled_attr or ("" if two_factor_enabled else " disabled")
     backup_download_disabled = two_factor_disabled_attr or (
         " disabled" if not backup_status else ""
@@ -1293,7 +1296,6 @@ def settings_template_response(
         .whitelist-card button {{ width: fit-content; }}
         .whitelist-header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }}
         .credentials-grid label {{ margin-bottom: 0; }}
-        .twofactor-card .status-pill {{ background: #e0f2fe; color: #1f7a34; }}
         .twofactor-card .status-pill.enabled {{ background: #e8f5e9; color: #256029; }}
         .secret-box {{ background: #f1f5f9; border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }}
         .secret-box span {{ font-size: 12px; color: #526079; text-transform: uppercase; letter-spacing: 0.1em; }}
@@ -1301,8 +1303,9 @@ def settings_template_response(
         .twofactor-actions {{ display: flex; flex-direction: column; gap: 12px; margin-top: 4px; align-items: flex-start; }}
         .twofactor-actions form {{ margin: 0; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }}
         .twofactor-actions button {{ width: fit-content; }}
-        .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e8f5e9; color: #256029; border-radius: 999px; font-weight: 600; width: fit-content; }}
-        .status-pill.disabled {{ background: #e2e8f0; color: #475569; }}
+        .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e2e8f0; color: #1f2937; border-radius: 999px; font-weight: 600; width: fit-content; }}
+        .status-pill.enabled {{ background: #e8f5e9; color: #256029; }}
+        .status-pill.disabled {{ background: #fdecea; color: #b3261e; }}
         .help-text {{ font-size: 13px; color: #526079; }}
         .qr-wrapper {{ margin: 12px 0; }}
         .qr-image {{ width: 140px; height: 140px; image-rendering: pixelated; border: 1px solid #d1d9e6; border-radius: 8px; padding: 8px; background: #fff; }}
@@ -1341,7 +1344,7 @@ def settings_template_response(
         <div class="auth-row">
           <div class="auth-card toggle-card">
             <h3>Access control</h3>
-            <span class="status-pill">{status_text}</span>
+        <span class="status-pill {status_class}">{status_text}</span>
             <p>{auth_note}</p>
             <form method="post" action="/settings/ui-auth">
               {csrf_field}
@@ -1370,7 +1373,7 @@ def settings_template_response(
           </div>
           <div class="auth-card twofactor-card{two_factor_card_class}">
             <h3>Two-factor authentication</h3>
-            <span class="{two_factor_status_class}">{two_factor_status_text}</span>
+            <span class="status-pill {two_factor_status_class}">{two_factor_status_text}</span>
             <p>{two_factor_note_text}</p>
             <div class="secret-box">
               <span>Secret</span>
@@ -1387,7 +1390,7 @@ def settings_template_response(
       <div class="settings-row">
       <section>
         <h2>API Authentication</h2>
-        <span class="status-pill">{api_status_html}</span>
+        <span class="status-pill {api_status_class}">{api_status_html}</span>
         <p>{api_note_text}</p>
         <form method="post" action="/settings/api-auth" class="api-auth-form">
           {csrf_field}
@@ -1642,6 +1645,7 @@ def settings_template_response(
         "csrf_field": csrf_field,
         "require_login": require_login,
         "status_text": status_text,
+        "status_class": status_class,
         "auth_note": auth_note,
         "checkbox_checked": require_login,
         "logout_allowed": bool(require_login and authenticated),
@@ -1650,7 +1654,7 @@ def settings_template_response(
         "two_factor": {
             "enabled": two_factor_enabled,
             "status_text": two_factor_status_text,
-            "status_class": "enabled" if two_factor_enabled else "",
+            "status_class": "enabled" if two_factor_enabled else "disabled",
             "note": two_factor_note,
             "secret": grouped_secret,
             "otpauth_uri": otpauth_uri_value,
@@ -1681,6 +1685,7 @@ def settings_template_response(
         "api_auth": {
             "enabled": api_require_key,
             "status_text": api_status_text,
+            "status_class": api_status_class,
             "note": api_note,
             "help_text": "Clients must provide X-API-Key header or api_key query when enabled.",
         },
@@ -1729,6 +1734,7 @@ def api_keys_template_response(
         )
 
     status_text = "Enabled" if require_key else "Disabled"
+    status_class = "enabled" if require_key else "disabled"
     note_text = (
         "API endpoints currently require a valid key in the X-API-Key header or api_key parameter."
         if require_key
@@ -1838,7 +1844,9 @@ def api_keys_template_response(
         .api-card form {{ margin-top: 0; display: flex; flex-direction: column; gap: 12px; }}
         .api-card button {{ width: fit-content; }}
         .api-card.is-disabled {{ opacity: 0.5; }}
-        .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e8f5e9; color: #256029; border-radius: 999px; font-weight: 600; width: fit-content; }}
+        .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e2e8f0; color: #1f2937; border-radius: 999px; font-weight: 600; width: fit-content; }}
+        .status-pill.enabled {{ background: #e8f5e9; color: #256029; }}
+        .status-pill.disabled {{ background: #fdecea; color: #b3261e; }}
         .help-text {{ font-size: 13px; color: #526079; }}
         table {{ width: 100%; border-collapse: collapse; }}
         th, td {{ padding: 10px 12px; border-bottom: 1px solid #e5edf6; font-size: 14px; text-align: left; }}
@@ -1858,7 +1866,7 @@ def api_keys_template_response(
         <div class="api-card keys-card{disabled_class}">
           <div class="api-card-header">
             <h3>Authentication status</h3>
-            <span class="status-pill">{html.escape(status_text)}</span>
+            <span class="status-pill {status_class}">{html.escape(status_text)}</span>
           </div>
           <p>{html.escape(note_text)}</p>
           {settings_notice}
@@ -1918,6 +1926,7 @@ def api_keys_template_response(
         "new_key": new_key,
         "require_key": require_key,
         "status_text": status_text,
+        "status_class": status_class,
         "note_text": note_text,
         "keys": key_rows,
         "csrf_field": csrf_field,
@@ -2876,6 +2885,7 @@ async def _periodic_rate_limiter_cleanup():
     while True:
         try:
             RATE_LIMITER.cleanup_old_identifiers()
+            LOGIN_RATE_LIMITER.cleanup_old_identifiers()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -3944,6 +3954,17 @@ async def settings_login(request: Request):
     next_path = str(form.get("next", "/settings")) or "/settings"
     if not next_path.startswith("/"):
         next_path = "/settings"
+
+    client_ip = request.client.host if request.client else "unknown"
+    if not LOGIN_RATE_LIMITER.check(client_ip):
+        csrf_token = ensure_csrf_token(request)
+        return login_template_response(
+            request,
+            next_path,
+            csrf_token,
+            error="Too many login attempts. Try again later.",
+            status_code=429,
+        )
 
     if UI_AUTH.verify(username, password):
         if UI_AUTH.is_two_factor_enabled():
