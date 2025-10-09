@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal
 from uuid import uuid4
 
 import threading
@@ -1252,6 +1252,7 @@ def documentation():
     <span class="param">video_url</span> - Video URL (required)<br>
     <span class="param">audio_url</span> - Audio URL (optional)<br>
     <span class="param">bgm_url</span> - Background music URL (optional)<br>
+    <span class="param">duration</span> - Duration in seconds (0.001-3600, optional)<br>
     <span class="param">duration_ms</span> - Duration in milliseconds (1-3600000, default: 30000)<br>
     <span class="param">width</span> - Output width in pixels (default: 1920)<br>
     <span class="param">height</span> - Output height in pixels (default: 1080)<br>
@@ -1261,7 +1262,29 @@ def documentation():
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
   <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
-  <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-urls \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "video_url": "https://example.com/video.mp4",<br>    "audio_url": "https://example.com/audio.mp3",<br>    "bgm_url": "https://example.com/music.mp3",<br>    "duration_ms": 20000,<br>    "width": 1280,<br>    "height": 720,<br>    "fps": 30,<br>    "bgm_volume": 0.3,<br>    "as_json": true<br>  }'</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-urls \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "video_url": "https://example.com/video.mp4",<br>    "audio_url": "https://example.com/audio.mp3",<br>    "bgm_url": "https://example.com/music.mp3",<br>    "duration": 20.0,<br>    "width": 1280,<br>    "height": 720,<br>    "fps": 30,<br>    "bgm_volume": 0.3,<br>    "as_json": true<br>  }'</div>
+</div>
+
+<div class="endpoint">
+  <div class="method post">POST</div>
+  <div class="path">/compose/from-urls/async</div>
+  <div class="desc">Queue video composition as a background job</div>
+  <div class="params">
+    Same parameters as <code>/compose/from-urls</code>
+  </div>
+  <div class="response">Returns: {"job_id": "...", "status_url": "/jobs/{job_id}"}</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-urls/async \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "video_url": "https://example.com/video.mp4",<br>    "duration_ms": 10000<br>  }'</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/jobs/{job_id}</div>
+  <div class="desc">Fetch status details for an asynchronous job</div>
+  <div class="params">
+    <span class="param">job_id</span> - Identifier returned from the async compose endpoint
+  </div>
+  <div class="response">Returns: {"status": "queued|processing|finished|failed", ...}</div>
+  <div class="example">Example:<br>curl http://localhost:3000/jobs/123e4567-e89b-12d3-a456-426614174000</div>
 </div>
 
 <div class="endpoint">
@@ -1711,12 +1734,33 @@ class ComposeFromUrlsJob(BaseModel):
     video_url: HttpUrl
     audio_url: Optional[HttpUrl] = None
     bgm_url: Optional[HttpUrl] = None
-    duration_ms: int = 30000
+    duration: Optional[float] = None
+    duration_ms: Optional[int] = None
     width: int = 1920
     height: int = 1080
     fps: int = 30
     bgm_volume: float = 0.3
     headers: Optional[Dict[str, str]] = None  # forwarded header subset
+
+    @field_validator("duration", mode="before")
+    @classmethod
+    def parse_duration(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError as exc:
+                raise ValueError(f"duration must be a valid number, got '{value}'") from exc
+        return float(value)
+
+    @field_validator("duration")
+    @classmethod
+    def validate_duration_seconds(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None:
+            if not (0.001 <= value <= 3600.0):
+                raise ValueError("duration must be 0.001-3600 seconds")
+        return value
 
     @field_validator("width", "height")
     @classmethod
@@ -1741,9 +1785,10 @@ class ComposeFromUrlsJob(BaseModel):
 
     @field_validator("duration_ms")
     @classmethod
-    def validate_duration(cls, value: int) -> int:
-        if not (1 <= value <= 3_600_000):
-            raise ValueError("duration_ms must be 1-3600000")
+    def validate_duration_ms(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None:
+            if not (1 <= value <= 3_600_000):
+                raise ValueError("duration_ms must be 1-3600000")
         return value
 
     @field_validator("video_url", "audio_url", "bgm_url", mode="before")
@@ -1755,6 +1800,14 @@ class ComposeFromUrlsJob(BaseModel):
         if not value_str.startswith(("http://", "https://")):
             raise ValueError("Only http:// and https:// URLs are supported")
         return value
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.duration is None and self.duration_ms is None:
+            self.duration_ms = 30000
+        elif self.duration is not None and self.duration_ms is not None:
+            raise ValueError("Provide either 'duration' or 'duration_ms', not both")
+        elif self.duration is not None:
+            self.duration_ms = int(self.duration * 1000)
 
 
 class Keyframe(BaseModel):

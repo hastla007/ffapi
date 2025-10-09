@@ -984,6 +984,31 @@ def test_compose_from_urls_as_json(patched_app):
     assert result["ok"] is True
 
 
+def test_compose_from_urls_accepts_duration_seconds(patched_app):
+    job = patched_app.ComposeFromUrlsJob(
+        video_url="https://example.com/video.mp4",
+        duration=12.5,
+    )
+    assert job.duration_ms == 12500
+
+
+def test_compose_from_urls_parses_string_duration(patched_app):
+    job = patched_app.ComposeFromUrlsJob(
+        video_url="https://example.com/video.mp4",
+        duration="2.75",
+    )
+    assert job.duration_ms == 2750
+
+
+def test_compose_from_urls_rejects_both_duration_fields(patched_app):
+    with pytest.raises(ValidationError):
+        patched_app.ComposeFromUrlsJob(
+            video_url="https://example.com/video.mp4",
+            duration=5.0,
+            duration_ms=5000,
+        )
+
+
 def test_compose_from_urls_rejects_non_http_urls(patched_app):
     with pytest.raises(ValidationError):
         patched_app.ComposeFromUrlsJob(video_url="ftp://example.com/video.mp4")
