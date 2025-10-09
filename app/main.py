@@ -1,4 +1,4 @@
-import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types
+import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -9,9 +9,13 @@ from uuid import uuid4
 
 import threading
 
-try:
-    import httpx
-except ModuleNotFoundError:  # pragma: no cover - fallback for minimal environments
+import importlib.util
+
+if importlib.util.find_spec("httpx") is not None:
+    import httpx  # type: ignore
+    HAS_HTTPX = True
+else:  # pragma: no cover - minimal environments without httpx
+    HAS_HTTPX = False
     import requests
 
     class _HeadResponse:
@@ -185,133 +189,8 @@ PUBLIC_CLEANUP_INTERVAL_SECONDS = settings.PUBLIC_CLEANUP_INTERVAL_SECONDS
 REQUIRE_DURATION_LIMIT = settings.REQUIRE_DURATION_LIMIT
 RATE_LIMITER = RateLimiter(settings.RATE_LIMIT_REQUESTS_PER_MINUTE)
 
-
-class MetricsTracker:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._per_endpoint: Dict[str, Dict[str, float]] = defaultdict(
-            lambda: {"success": 0, "failure": 0, "total_duration": 0.0}
-        )
-        self._error_counts: Counter[str] = Counter()
-        self._recent_outcomes: deque[bool] = deque(maxlen=100)
-        self._operation_history: deque[Dict[str, float]] = deque(maxlen=200)
-        self._current_requests = 0
-        self._max_queue_depth = 0
-        self._total_wait_time = 0.0
-        self._wait_samples = 0
-
-    def reset(self) -> None:
-        with self._lock:
-            self._per_endpoint.clear()
-            self._error_counts.clear()
-            self._recent_outcomes.clear()
-            self._operation_history.clear()
-            self._current_requests = 0
-            self._max_queue_depth = 0
-            self._total_wait_time = 0.0
-            self._wait_samples = 0
-
-    def request_started(self) -> None:
-        with self._lock:
-            self._current_requests += 1
-            if self._current_requests > self._max_queue_depth:
-                self._max_queue_depth = self._current_requests
-
-    def request_finished(
-        self,
-        path: str,
-        status_code: int,
-        duration: float,
-        wait_time: float,
-        error_key: Optional[str] = None,
-    ) -> None:
-        success = 200 <= status_code < 400
-        with self._lock:
-            stats = self._per_endpoint[path]
-            if success:
-                stats["success"] += 1
-            else:
-                stats["failure"] += 1
-            stats["total_duration"] += duration
-            self._recent_outcomes.append(success)
-            self._operation_history.append(
-                {
-                    "timestamp": time.time(),
-                    "path": path,
-                    "status": status_code,
-                    "duration": duration,
-                }
-            )
-            self._total_wait_time += max(wait_time, 0.0)
-            self._wait_samples += 1
-            if not success:
-                key = error_key or str(status_code)
-                self._error_counts[key] += 1
-
-    def request_completed(self) -> None:
-        with self._lock:
-            if self._current_requests > 0:
-                self._current_requests -= 1
-
-    def snapshot(self) -> Dict[str, object]:
-        with self._lock:
-            per_endpoint: Dict[str, Dict[str, object]] = {}
-            for path, stats in self._per_endpoint.items():
-                total_calls = stats["success"] + stats["failure"]
-                avg_duration = (
-                    stats["total_duration"] / total_calls if total_calls else 0.0
-                )
-                success_rate = (
-                    stats["success"] / total_calls if total_calls else 0.0
-                )
-                per_endpoint[path] = {
-                    "success": int(stats["success"]),
-                    "failure": int(stats["failure"]),
-                    "total": int(total_calls),
-                    "avg_duration_ms": avg_duration * 1000.0,
-                    "success_rate": success_rate,
-                }
-
-            total_recent = len(self._recent_outcomes)
-            recent_successes = sum(1 for outcome in self._recent_outcomes if outcome)
-            queue_avg_wait = (
-                (self._total_wait_time / self._wait_samples)
-                if self._wait_samples
-                else 0.0
-            )
-
-            return {
-                "per_endpoint": per_endpoint,
-                "errors": dict(self._error_counts),
-                "queue": {
-                    "current": self._current_requests,
-                    "max": self._max_queue_depth,
-                    "avg_wait_ms": queue_avg_wait * 1000.0,
-                },
-                "recent": {
-                    "window": total_recent,
-                    "successes": recent_successes,
-                    "failures": total_recent - recent_successes,
-                    "success_rate": (
-                        recent_successes / total_recent if total_recent else None
-                    ),
-                },
-                "history": list(self._operation_history),
-            }
-
-
-METRICS = MetricsTracker()
-
 JOBS: Dict[str, Dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
-
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "2048"))
-MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", str(2 * 60 * 60)))
-MIN_FREE_SPACE_MB = int(os.getenv("MIN_FREE_SPACE_MB", "1000"))
-UPLOAD_CHUNK_SIZE = 1024 * 1024
-PUBLIC_CLEANUP_INTERVAL_SECONDS = int(os.getenv("PUBLIC_CLEANUP_INTERVAL_SECONDS", "3600"))
-REQUIRE_DURATION_LIMIT = os.getenv("REQUIRE_DURATION_LIMIT", "false").lower() == "true"
 
 
 class MetricsTracker:
@@ -483,6 +362,7 @@ except (AttributeError, io.UnsupportedOperation):
 
 # Create file handler with line buffering to avoid manual flush storms
 file_stream = open(APP_LOG_FILE, "a", encoding="utf-8", buffering=1)
+atexit.register(file_stream.close)
 file_handler = logging.StreamHandler(file_stream)
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
@@ -515,9 +395,6 @@ logger.info(f"LOGS_DIR: {LOGS_DIR}")
 logger.info(f"RETENTION_DAYS: {RETENTION_DAYS}")
 logger.info(f"PUBLIC_BASE_URL: {PUBLIC_BASE_URL or 'Not set'}")
 logger.info("="*60)
-
-# Force flush
-file_handler.flush()
 
 # Startup event to log when server is ready
 @app.on_event("startup")
