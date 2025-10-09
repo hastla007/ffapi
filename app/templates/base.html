@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>{{ title or "FFAPI Ultimate" }}</title>
+    <style>
+      :root {
+        color-scheme: light;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 0 auto;
+        padding: 24px;
+        max-width: {{ max_width or "1200px" }};
+        background: #f8fafc;
+        color: #111827;
+      }
+      .top-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-bottom: 24px;
+      }
+      .brand {
+        font-size: 32px;
+        font-weight: 700;
+        margin: 0;
+      }
+      .brand .ff {
+        color: #28a745;
+      }
+      .brand .api {
+        color: #111827;
+      }
+      .main-nav {
+        margin: 0;
+        margin-left: auto;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        justify-content: flex-end;
+      }
+      .main-nav a {
+        padding: 8px 14px;
+        border-radius: 6px;
+        background: #e2e8f0;
+        color: #1e3a8a;
+        text-decoration: none;
+        font-weight: 600;
+        transition: background 0.15s ease, color 0.15s ease;
+      }
+      .main-nav a:hover {
+        background: #cbd5f5;
+      }
+      .main-nav a.active {
+        background: #1d4ed8;
+        color: #fff;
+      }
+      .page-content {
+        background: #fff;
+        border-radius: 12px;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+        padding: 24px;
+      }
+    </style>
+    {% block head_extra %}{% endblock %}
+  </head>
+  <body class="{{ body_class or '' }}">
+    <header class="top-bar">
+      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
+      {% if nav_links %}
+        {% include "components/nav.html" %}
+      {% endif %}
+    </header>
+    <div class="page-content">
+      {% block content %}{% endblock %}
+    </div>
+  </body>
+</html>
