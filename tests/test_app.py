@@ -16,6 +16,8 @@ from unittest.mock import Mock
 import pytest
 from fastapi import HTTPException, UploadFile
 from starlette.datastructures import Headers
+from starlette.requests import Request
+from starlette.templating import _TemplateResponse
 from pydantic import ValidationError
 
 
@@ -975,6 +977,51 @@ def test_performance_settings_rejects_tiny_upload_chunk(patched_app):
     html = response_body.decode()
     assert "Upload chunk size must be at least 0.001 MB" in html
     assert patched_app.UPLOAD_CHUNK_SIZE == original_chunk
+
+
+def test_api_keys_page_returns_template_response(app_module):
+    original_templates = app_module.templates
+    if app_module.templates is None:
+        class DummyTemplate:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def render(self, context: dict) -> str:  # pragma: no cover - simple stub
+                return ""
+
+        class DummyTemplates:
+            def TemplateResponse(self, name: str, context: dict, status_code: int = 200):
+                return _TemplateResponse(DummyTemplate(name), context, status_code=status_code)
+
+        app_module.templates = DummyTemplates()
+
+    app_module.UI_AUTH.reset()
+    app_module.API_KEYS.reset()
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/api-keys",
+        "raw_path": b"/api-keys",
+        "query_string": b"",
+        "headers": [],
+        "client": ("testclient", 123),
+        "server": ("testserver", 80),
+    }
+
+    async def receive():  # pragma: no cover - Request requires awaitable
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    try:
+        request = Request(scope, receive)
+        response = app_module.api_keys_page(request)
+        assert isinstance(response, _TemplateResponse)
+        assert getattr(response.template, "name", None) == "api_keys.html"
+    finally:
+        app_module.templates = original_templates
 
 
 def test_api_keys_page_shows_controls(patched_app):

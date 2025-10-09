@@ -109,8 +109,9 @@ else:  # pragma: no cover - minimal environments without httpx
             await asyncio.to_thread(self._session.close)
 
     httpx = types.SimpleNamespace(AsyncClient=_AsyncClient)
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, HttpUrl, field_validator
@@ -232,6 +233,12 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Application log file (captures stdout/stderr)
 APP_LOG_FILE = LOGS_DIR / "application.log"
+
+TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+try:
+    templates: Optional[Jinja2Templates] = Jinja2Templates(directory=str(TEMPLATES_DIR))
+except AssertionError:  # pragma: no cover - environments without Jinja2
+    templates = None
 
 RETENTION_DAYS = settings.RETENTION_DAYS
 PUBLIC_BASE_URL = settings.PUBLIC_BASE_URL  # e.g. "http://10.120.2.5:3000"
@@ -804,7 +811,16 @@ NAV_LINKS: Tuple[Tuple[str, str], ...] = (
 )
 
 
-def render_nav(active: Optional[str] = None, *, indent: str = "      ") -> str:
+def nav_context(active: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "nav_links": [
+            {"href": href, "label": label} for href, label in NAV_LINKS
+        ],
+        "active_path": active,
+    }
+
+
+def fallback_nav_html(active: Optional[str] = None, *, indent: str = "      ") -> str:
     lines = ['<nav class="main-nav">']
     for href, label in NAV_LINKS:
         class_attr = ' class="active"' if active == href else ""
@@ -813,22 +829,30 @@ def render_nav(active: Optional[str] = None, *, indent: str = "      ") -> str:
     return "\n".join(f"{indent}{line}" for line in lines)
 
 
-def render_login_page(next_path: str, csrf_token: str, error: Optional[str] = None) -> str:
-    alert = ""
-    if error:
-        alert = f"<div class=\"alert error\">{html.escape(error)}</div>"
-    require_code = UI_AUTH.is_two_factor_enabled()
-    code_field = ""
-    if require_code:
-        code_field = """
+def login_template_response(
+    request: Request,
+    next_path: str,
+    csrf_token: str,
+    *,
+    error: Optional[str] = None,
+    status_code: int = 200,
+):
+    if templates is None:
+        alert = ""
+        if error:
+            alert = f"<div class=\"alert error\">{html.escape(error)}</div>"
+        require_code = UI_AUTH.is_two_factor_enabled()
+        code_field = ""
+        if require_code:
+            code_field = """
         <label for=\"totp\">Authentication code</label>
         <input id=\"totp\" name=\"totp\" type=\"text\" inputmode=\"numeric\" pattern=\"\\d*\" autocomplete=\"one-time-code\" />
         <label for=\"backup_code\">Backup code (optional)</label>
         <input id=\"backup_code\" name=\"backup_code\" type=\"text\" autocomplete=\"one-time-code\" placeholder=\"ABCDE-12345\" />
         <p class=\"help-text\">Enter a 6-digit authenticator code or one of your backup codes.</p>
         """
-    csrf_field = csrf_hidden_input(csrf_token)
-    return f"""
+        csrf_field = csrf_hidden_input(csrf_token)
+        html_content = f"""
     <!doctype html>
     <html>
     <head>
@@ -867,9 +891,26 @@ def render_login_page(next_path: str, csrf_token: str, error: Optional[str] = No
     </body>
     </html>
     """
+        return HTMLResponse(html_content, status_code=status_code)
+
+    context = {
+        "request": request,
+        "title": "Settings Login",
+        "body_class": "login-page",
+        "nav_links": [],
+        "active_path": None,
+        "csrf_field": csrf_hidden_input(csrf_token),
+        "next_path": next_path,
+        "error": error,
+        "require_code": UI_AUTH.is_two_factor_enabled(),
+        "default_username": DEFAULT_UI_USERNAME,
+        "default_password": DEFAULT_UI_PASSWORD,
+    }
+    return templates.TemplateResponse("login.html", context, status_code=status_code)
 
 
-def render_settings_page(
+def settings_template_response(
+    request: Request,
     storage: Dict[str, Any],
     message: Optional[str] = None,
     error: Optional[str] = None,
@@ -878,7 +919,8 @@ def render_settings_page(
     csrf_token: str,
     backup_codes: Optional[List[str]] = None,
     backup_status: Optional[List[Dict[str, Any]]] = None,
-) -> str:
+    status_code: int = 200,
+) -> Response:
     total_used_mb = storage["total_bytes"] / (1024 * 1024) if storage["total_bytes"] else 0.0
     active_files = storage["active_files"]
     expired_files = storage["expired_files"]
@@ -1073,8 +1115,8 @@ def render_settings_page(
             </div>
     """
 
-    nav_html = render_nav("/settings")
-    return f"""
+    nav_html = fallback_nav_html("/settings")
+    html_content = f"""
     <!doctype html>
     <html>
     <head>
@@ -1412,35 +1454,98 @@ def render_settings_page(
     </html>
     """
 
+    if templates is None:
+        return HTMLResponse(html_content, status_code=status_code)
 
-def render_api_keys_page(
+    alert_items: List[Dict[str, Any]] = []
+    if message:
+        alert_items.append({"type": "success", "text": message})
+    if error:
+        alert_items.append({"type": "error", "text": error})
+    if backup_codes:
+        alert_items.append({"type": "info", "backup_codes": backup_codes})
+
+    backup_rows_context = []
+    for idx, item in enumerate(backup_status, start=1):
+        last_four = item.get("last_four", "????")
+        masked = f"\u2022\u2022\u2022\u2022-{last_four}"
+        backup_rows_context.append(
+            {
+                "index": idx,
+                "masked": masked,
+                "status_text": "Used" if item.get("used") else "Unused",
+                "status_class": "used" if item.get("used") else "unused",
+            }
+        )
+
+    context = {
+        "request": request,
+        "title": "Settings",
+        "body_class": "settings-page",
+        "max_width": "1400px",
+        **nav_context("/settings"),
+        "alerts": alert_items,
+        "csrf_field": csrf_field,
+        "require_login": require_login,
+        "status_text": status_text,
+        "auth_note": auth_note,
+        "checkbox_checked": require_login,
+        "logout_allowed": bool(require_login and authenticated),
+        "ui_username": UI_AUTH.username,
+        "ui_disabled": not require_login,
+        "two_factor": {
+            "enabled": two_factor_enabled,
+            "status_text": two_factor_status_text,
+            "status_class": "enabled" if two_factor_enabled else "",
+            "note": two_factor_note,
+            "secret": grouped_secret,
+            "otpauth_uri": otpauth_uri_value,
+            "qr_data_uri": qr_data_uri,
+            "disabled": not require_login,
+            "backup_card_disabled": not two_factor_enabled,
+            "download_enabled": bool(require_login and backup_status),
+            "generate_enabled": bool(require_login and two_factor_enabled),
+            "backup_rows": backup_rows_context,
+        },
+        "storage": {
+            "total_used_text": f"{format_number(total_used_mb)} MB",
+            "active_files_text": str(active_files),
+            "expired_files_text": str(expired_files),
+            "quota_text": quota_display,
+            "retention_days_text": retention_days_display,
+        },
+        "retention": {
+            "hours_value": retention_hours_display,
+            "days_text": retention_days_display,
+        },
+        "performance": {
+            "rate_limit": rate_limit_rpm,
+            "ffmpeg_timeout": ffmpeg_timeout_display,
+            "upload_chunk": upload_chunk_display,
+            "max_file_size": MAX_FILE_SIZE_MB,
+        },
+        "api_auth": {
+            "enabled": api_require_key,
+            "status_text": api_status_text,
+            "note": api_note,
+            "help_text": "Clients must provide X-API-Key header or api_key query when enabled.",
+        },
+    }
+
+    return templates.TemplateResponse("settings.html", context, status_code=status_code)
+
+
+def api_keys_template_response(
+    request: Request,
     *,
     keys: List[Dict[str, Any]],
     require_key: bool,
+    csrf_token: str,
     message: Optional[str] = None,
     error: Optional[str] = None,
     new_key: Optional[str] = None,
-    csrf_token: str,
-) -> str:
-    alert_blocks: List[str] = []
-    if message:
-        alert_blocks.append(f"<div class=\"alert success\">{html.escape(message)}</div>")
-    if error:
-        alert_blocks.append(f"<div class=\"alert error\">{html.escape(error)}</div>")
-    if new_key:
-        alert_blocks.append(
-            """
-            <div class="alert success">
-              <strong>New API key generated</strong>
-              <p>Copy this value now — it will not be shown again.</p>
-              <code>{key}</code>
-            </div>
-            """.format(key=html.escape(new_key)),
-        )
-    alerts = "".join(alert_blocks)
-
-    disabled_class = "" if require_key else " is-disabled"
-    disabled_attr = "" if require_key else " disabled"
+    status_code: int = 200,
+) -> Response:
     csrf_field = csrf_hidden_input(csrf_token)
 
     def format_timestamp(epoch: Optional[float]) -> str:
@@ -1449,42 +1554,15 @@ def render_api_keys_page(
         dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
         return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    rows = []
+    key_rows: List[Dict[str, str]] = []
     for item in keys:
-        prefix = html.escape(item["prefix"])
-        created = format_timestamp(item.get("created"))
-        last_used = format_timestamp(item.get("last_used"))
-        rows.append(
-            """
-            <tr>
-              <td>{display}&hellip;</td>
-              <td>{created}</td>
-              <td>{last_used}</td>
-              <td>
-                <form method="post" action="/api-keys/revoke">
-                  {csrf_field}
-                  <input type="hidden" name="key_id" value="{key_id}" />
-                  <button type="submit" class="secondary" onclick="return confirm('Are you sure you want to revoke this API key?')"{disabled}>Revoke</button>
-                </form>
-              </td>
-            </tr>
-            """.format(
-                display=prefix,
-                created=html.escape(created),
-                last_used=html.escape(last_used),
-                key_id=html.escape(str(item["id"]), quote=True),
-                disabled=disabled_attr,
-                csrf_field=csrf_field,
-            )
-        )
-
-    if not rows:
-        rows.append(
-            """
-            <tr>
-              <td colspan="4">No API keys yet</td>
-            </tr>
-            """
+        key_rows.append(
+            {
+                "prefix": str(item.get("prefix", "")),
+                "created": format_timestamp(item.get("created")),
+                "last_used": format_timestamp(item.get("last_used")),
+                "id": str(item.get("id", "")),
+            }
         )
 
     status_text = "Enabled" if require_key else "Disabled"
@@ -1493,16 +1571,75 @@ def render_api_keys_page(
         if require_key
         else "API endpoints are open; enable authentication to restrict access."
     )
-    status_html = html.escape(status_text)
-    note_html = html.escape(note_text)
-    settings_notice = ""
-    if not require_key:
-        settings_notice = (
-            "<p class=\"help-text\">Enable API authentication in <a href=\"/settings\">Settings</a> before generating keys.</p>"
-        )
 
-    nav_html = render_nav("/api-keys")
-    return f"""
+    if templates is None:
+        alert_blocks: List[str] = []
+        if message:
+            alert_blocks.append(
+                f"<div class=\"alert success\">{html.escape(message)}</div>"
+            )
+        if error:
+            alert_blocks.append(
+                f"<div class=\"alert error\">{html.escape(error)}</div>"
+            )
+        if new_key:
+            alert_blocks.append(
+                """
+                <div class="alert success">
+                  <strong>New API key generated</strong>
+                  <p>Copy this value now — it will not be shown again.</p>
+                  <code>{key}</code>
+                </div>
+                """.format(key=html.escape(new_key))
+            )
+        alerts_html = "".join(alert_blocks)
+
+        disabled_class = "" if require_key else " is-disabled"
+        disabled_attr = "" if require_key else " disabled"
+
+        rows_html: List[str] = []
+        for row in key_rows:
+            rows_html.append(
+                """
+                <tr>
+                  <td>{display}&hellip;</td>
+                  <td>{created}</td>
+                  <td>{last_used}</td>
+                  <td>
+                    <form method="post" action="/api-keys/revoke">
+                      {csrf_field}
+                      <input type="hidden" name="key_id" value="{key_id}" />
+                      <button type="submit" class="secondary" onclick="return confirm('Are you sure you want to revoke this API key?')"{disabled}>Revoke</button>
+                    </form>
+                  </td>
+                </tr>
+                """.format(
+                    display=html.escape(row["prefix"]),
+                    created=html.escape(row["created"]),
+                    last_used=html.escape(row["last_used"]),
+                    key_id=html.escape(row["id"], quote=True),
+                    disabled=disabled_attr,
+                    csrf_field=csrf_field,
+                )
+            )
+
+        if not rows_html:
+            rows_html.append(
+                """
+                <tr>
+                  <td colspan="4">No API keys yet</td>
+                </tr>
+                """
+            )
+
+        settings_notice = ""
+        if not require_key:
+            settings_notice = (
+                "<p class=\"help-text\">Enable API authentication in <a href=\"/settings\">Settings</a> before generating keys.</p>"
+            )
+
+        nav_html = fallback_nav_html("/api-keys")
+        html_content = f"""
     <!doctype html>
     <html>
     <head>
@@ -1549,16 +1686,16 @@ def render_api_keys_page(
     <body>
       <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
 {nav_html}
-      {alerts}
+      {alerts_html}
 
       <section>
         <h2>API Keys</h2>
         <div class="api-card keys-card{disabled_class}">
           <div class="api-card-header">
             <h3>Authentication status</h3>
-            <span class="status-pill">{status_html}</span>
+            <span class="status-pill">{html.escape(status_text)}</span>
           </div>
-          <p>{note_html}</p>
+          <p>{html.escape(note_text)}</p>
           {settings_notice}
           <form method="post" action="/api-keys/generate">
             {csrf_field}
@@ -1569,7 +1706,7 @@ def render_api_keys_page(
               <tr><th>Key</th><th>Created</th><th>Last used</th><th></th></tr>
             </thead>
             <tbody>
-              {''.join(rows)}
+              {''.join(rows_html)}
             </tbody>
           </table>
         </div>
@@ -1604,6 +1741,25 @@ def render_api_keys_page(
     </body>
     </html>
     """
+        return HTMLResponse(html_content, status_code=status_code)
+
+    context = {
+        "request": request,
+        "title": "API Keys",
+        "body_class": "api-keys-page",
+        **nav_context("/api-keys"),
+        "message": message,
+        "error": error,
+        "new_key": new_key,
+        "require_key": require_key,
+        "status_text": status_text,
+        "note_text": note_text,
+        "keys": key_rows,
+        "csrf_field": csrf_field,
+    }
+    return templates.TemplateResponse(
+        "api_keys.html", context, status_code=status_code
+    )
 
 
 REQUEST_ID_CTX: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
@@ -2739,7 +2895,7 @@ def downloads(
     )
     search_value = html.escape(search, quote=True)
 
-    nav_html = render_nav("/downloads")
+    nav_html = fallback_nav_html("/downloads")
     html_content = f"""
     <!doctype html>
     <html>
@@ -2875,7 +3031,7 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
         else ""
     )
 
-    nav_html = render_nav("/logs")
+    nav_html = fallback_nav_html("/logs")
     html_content = f"""
     <!doctype html>
     <html>
@@ -2980,7 +3136,7 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
     app_logs_safe = html.escape(app_logs)
     log_info_safe = html.escape(log_info)
 
-    nav_html = render_nav("/ffmpeg")
+    nav_html = fallback_nav_html("/ffmpeg")
     html_content = f"""
     <!doctype html>
     <html>
@@ -3360,12 +3516,15 @@ def documentation(request: Request):
 </div>
 """
 
-    nav_html = render_nav("/documentation")
-    html_content = f"""
+    base_url = PUBLIC_BASE_URL or "http://localhost:3000"
+    retention_days = str(RETENTION_DAYS)
+    if templates is None:
+        nav_html = fallback_nav_html("/documentation")
+        html_content = f"""
     <!doctype html>
     <html>
     <head>
-      <meta charset="utf-8" />
+      <meta charset=\"utf-8\" />
       <title>API Documentation</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
@@ -3377,15 +3536,15 @@ def documentation(request: Request):
         .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
         .main-nav a {{ color: #0066cc; text-decoration: none; }}
         .main-nav a:hover {{ text-decoration: underline; }}
-        .intro {{ 
-          background: #f0f7ff; 
-          padding: 20px; 
-          border-radius: 8px; 
-          margin-bottom: 30px; 
+        .intro {{
+          background: #f0f7ff;
+          padding: 20px;
+          border-radius: 8px;
+          margin-bottom: 30px;
           border-left: 4px solid #0066cc;
         }}
         .intro p {{ margin: 8px 0; line-height: 1.6; }}
-        
+
         .endpoint {{
           background: #f9f9f9;
           border-left: 4px solid #0066cc;
@@ -3450,22 +3609,33 @@ def documentation(request: Request):
       </style>
     </head>
     <body>
-      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
+      <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
 {nav_html}
       <h2>FFAPI Ultimate - API Documentation</h2>
-      
-      <div class="intro">
-        <p><strong>Base URL:</strong> {os.getenv("PUBLIC_BASE_URL") or "http://localhost:3000"}</p>
+
+      <div class=\"intro\">
+        <p><strong>Base URL:</strong> {base_url}</p>
         <p><strong>Response Formats:</strong> Most endpoints support both file responses and JSON (via <code>as_json=true</code> parameter)</p>
-        <p><strong>File Retention:</strong> Generated files are kept for {os.getenv("RETENTION_DAYS", "7")} days</p>
+        <p><strong>File Retention:</strong> Generated files are kept for {retention_days} days</p>
         <p><strong>Output Location:</strong> All generated files are available at <code>/files/{{date}}/{{filename}}</code></p>
       </div>
-      
+
       {api_docs}
     </body>
     </html>
     """
-    return HTMLResponse(html_content)
+        return HTMLResponse(html_content)
+
+    context = {
+        "request": request,
+        "title": "API Documentation",
+        "max_width": "1400px",
+        **nav_context("/documentation"),
+        "base_url": base_url,
+        "retention_days": retention_days,
+        "api_docs": api_docs,
+    }
+    return templates.TemplateResponse("documentation.html", context)
 
 
 @app.get("/settings", response_class=HTMLResponse)
@@ -3479,14 +3649,19 @@ def settings_page(
     next_target = next or "/settings"
     if UI_AUTH.require_login and not authed:
         csrf_token = ensure_csrf_token(request)
-        html_content = render_login_page(next_target, csrf_token, error or None)
-        return HTMLResponse(html_content)
+        return login_template_response(
+            request,
+            next_target,
+            csrf_token,
+            error=error or None,
+        )
 
     storage = storage_management_snapshot()
     csrf_token = ensure_csrf_token(request)
     backup_codes = UI_AUTH.pop_pending_backup_codes()
     backup_status = UI_AUTH.get_backup_code_status()
-    html_content = render_settings_page(
+    return settings_template_response(
+        request,
         storage,
         message or None,
         error or None,
@@ -3495,7 +3670,6 @@ def settings_page(
         backup_codes=backup_codes,
         backup_status=backup_status,
     )
-    return HTMLResponse(html_content)
 
 
 @app.post("/settings/login")
@@ -3513,8 +3687,13 @@ async def settings_login(request: Request):
         if UI_AUTH.is_two_factor_enabled():
             if not totp_code and not backup_code:
                 csrf_token = ensure_csrf_token(request)
-                html_content = render_login_page(next_path, csrf_token, "Authentication or backup code required")
-                return HTMLResponse(html_content, status_code=401)
+                return login_template_response(
+                    request,
+                    next_path,
+                    csrf_token,
+                    error="Authentication or backup code required",
+                    status_code=401,
+                )
             second_factor_ok = False
             if totp_code:
                 second_factor_ok = UI_AUTH.verify_totp(totp_code)
@@ -3525,8 +3704,13 @@ async def settings_login(request: Request):
                     second_factor_ok = UI_AUTH.verify_backup_code(totp_code)
             if not second_factor_ok:
                 csrf_token = ensure_csrf_token(request)
-                html_content = render_login_page(next_path, csrf_token, "Invalid authentication or backup code")
-                return HTMLResponse(html_content, status_code=401)
+                return login_template_response(
+                    request,
+                    next_path,
+                    csrf_token,
+                    error="Invalid authentication or backup code",
+                    status_code=401,
+                )
         token = UI_AUTH.create_session()
         response = RedirectResponse(url=next_path, status_code=303)
         response.set_cookie(
@@ -3539,8 +3723,13 @@ async def settings_login(request: Request):
         return response
 
     csrf_token = ensure_csrf_token(request)
-    html_content = render_login_page(next_path, csrf_token, "Invalid username or password")
-    return HTMLResponse(html_content, status_code=401)
+    return login_template_response(
+        request,
+        next_path,
+        csrf_token,
+        error="Invalid username or password",
+        status_code=401,
+    )
 
 
 @app.post("/settings/logout")
@@ -3618,13 +3807,14 @@ async def settings_update_credentials(request: Request):
     except ValueError as exc:
         storage = storage_management_snapshot()
         csrf_token = ensure_csrf_token(request)
-        html_content = render_settings_page(
+        return settings_template_response(
+            request,
             storage,
             error=str(exc),
             authenticated=authed,
             csrf_token=csrf_token,
+            status_code=400,
         )
-        return HTMLResponse(html_content, status_code=400)
 
     query = urlencode({"message": "Credentials updated"})
     response = RedirectResponse(url=f"/settings?{query}", status_code=303)
@@ -3700,37 +3890,40 @@ async def settings_update_retention(request: Request):
     if not raw_hours:
         storage = storage_management_snapshot()
         csrf_token = ensure_csrf_token(request)
-        html_content = render_settings_page(
+        return settings_template_response(
+            request,
             storage,
             error="Retention hours are required",
             authenticated=authed,
             csrf_token=csrf_token,
+            status_code=400,
         )
-        return HTMLResponse(html_content, status_code=400)
 
     try:
         hours = float(raw_hours)
     except ValueError:
         storage = storage_management_snapshot()
         csrf_token = ensure_csrf_token(request)
-        html_content = render_settings_page(
+        return settings_template_response(
+            request,
             storage,
             error="Retention hours must be a number",
             authenticated=authed,
             csrf_token=csrf_token,
+            status_code=400,
         )
-        return HTMLResponse(html_content, status_code=400)
 
     if hours < 1 or hours > 24 * 365:
         storage = storage_management_snapshot()
         csrf_token = ensure_csrf_token(request)
-        html_content = render_settings_page(
+        return settings_template_response(
+            request,
             storage,
             error="Retention must be between 1 hour and 8760 hours (365 days)",
             authenticated=authed,
             csrf_token=csrf_token,
+            status_code=400,
         )
-        return HTMLResponse(html_content, status_code=400)
 
     days = hours / 24
     global RETENTION_DAYS
@@ -3810,13 +4003,14 @@ async def settings_update_performance(request: Request):
     if errors or rpm is None or timeout_minutes is None or chunk_mb is None or max_file_mb is None:
         storage = storage_management_snapshot()
         csrf_token = ensure_csrf_token(request)
-        html_content = render_settings_page(
+        return settings_template_response(
+            request,
             storage,
             error="; ".join(errors) if errors else "Invalid performance settings",
             authenticated=authed,
             csrf_token=csrf_token,
+            status_code=400,
         )
-        return HTMLResponse(html_content, status_code=400)
 
     global FFMPEG_TIMEOUT_SECONDS, UPLOAD_CHUNK_SIZE, MAX_FILE_SIZE_MB, MAX_FILE_SIZE_BYTES
 
@@ -3853,7 +4047,8 @@ def api_keys_page(
 
     new_key_value = API_KEYS.consume_plaintext(new_key_id) if new_key_id else None
     csrf_token = ensure_csrf_token(request)
-    html_content = render_api_keys_page(
+    return api_keys_template_response(
+        request,
         keys=API_KEYS.list_keys(),
         require_key=API_KEYS.is_required(),
         message=message or None,
@@ -3861,7 +4056,6 @@ def api_keys_page(
         new_key=new_key_value,
         csrf_token=csrf_token,
     )
-    return HTMLResponse(html_content)
 
 @app.post("/api-keys/generate")
 async def api_keys_generate(request: Request):
@@ -3972,7 +4166,7 @@ def metrics_dashboard(request: Request):
     )
     recent_percent = f"{recent_rate * 100.0:.1f}%" if recent_rate is not None else "-"
 
-    nav_html = render_nav("/metrics")
+    nav_html = fallback_nav_html("/metrics")
     html_content = f"""
     <!doctype html>
     <html>
@@ -5177,7 +5371,7 @@ def jobs_history(
 
     pagination = f"Page {page} of {total_pages}"
 
-    nav_html = render_nav("/jobs", indent="        ")
+    nav_html = fallback_nav_html("/jobs", indent="        ")
     html_content = f"""
     <!doctype html>
     <html>
