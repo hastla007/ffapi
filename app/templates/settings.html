@@ -1,0 +1,757 @@
+{% extends "base.html" %}
+
+{% block head_extra %}
+  <style>
+    body.settings-page {
+      max-width: 1400px;
+    }
+    section {
+      background: #f7f9fc;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+      margin-bottom: 24px;
+    }
+    h2 {
+      margin-top: 0;
+    }
+    form {
+      margin-top: 12px;
+    }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    input, select {
+      padding: 10px;
+      font-size: 14px;
+      border: 1px solid #ccd5e0;
+      border-radius: 4px;
+      width: 100%;
+    }
+    button {
+      padding: 8px 14px;
+      background: #0066cc;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #0053a3;
+    }
+    button.secondary {
+      background: #9aa5b1;
+    }
+    button.secondary:hover {
+      background: #7c8794;
+    }
+    .half-width {
+      width: 50%;
+    }
+    .api-auth-form button {
+      margin-top: 20px;
+    }
+    button:disabled,
+    button[disabled] {
+      cursor: not-allowed;
+      opacity: 0.65;
+    }
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 600;
+    }
+    .checkbox-row input {
+      width: auto;
+      margin: 0;
+      transform: scale(1.2);
+    }
+    .alert {
+      padding: 12px;
+      border-radius: 4px;
+      margin-bottom: 16px;
+      font-size: 14px;
+    }
+    .alert.success {
+      background: #e8f5e9;
+      color: #256029;
+      border: 1px solid #c8e6c9;
+    }
+    .alert.error {
+      background: #fdecea;
+      color: #b3261e;
+      border: 1px solid #f7c6c4;
+    }
+    .alert.info {
+      background: #eff6ff;
+      color: #1e40af;
+      border: 1px solid #bfdbfe;
+    }
+    .alert.info ul {
+      margin: 8px 0 0;
+      padding-left: 20px;
+    }
+    .alert.info li {
+      font-family: "Courier New", monospace;
+      margin-bottom: 4px;
+    }
+    .auth-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+      align-items: stretch;
+      margin-top: 16px;
+    }
+    .auth-card {
+      background: #fff;
+      padding: 16px;
+      border-radius: 8px;
+      box-shadow: inset 0 0 0 1px #e1e7ef;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .auth-card.is-disabled {
+      opacity: 0.55;
+    }
+    .auth-card h3 {
+      margin: 0;
+      font-size: 16px;
+      color: #1f2937;
+    }
+    .auth-card p {
+      margin: 0;
+      font-size: 14px;
+      color: #334155;
+    }
+    .auth-card form {
+      margin-top: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .credentials-block {
+      margin-top: 20px;
+      padding-top: 16px;
+      border-top: 1px solid #e1e7ef;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .credentials-block.is-disabled {
+      opacity: 0.5;
+    }
+    .credentials-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+    .whitelist-card {
+      margin-top: 20px;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: inset 0 0 0 1px #e1e7ef;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .whitelist-card.is-disabled {
+      opacity: 0.55;
+    }
+    .whitelist-card textarea {
+      min-height: 120px;
+      font-family: "Courier New", monospace;
+      resize: vertical;
+    }
+    .whitelist-card button {
+      width: fit-content;
+    }
+    .whitelist-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      background: #e8f5e9;
+      color: #256029;
+      border-radius: 999px;
+      font-weight: 600;
+      width: fit-content;
+    }
+    .status-pill.disabled {
+      background: #e2e8f0;
+      color: #475569;
+    }
+    .twofactor-card .status-pill {
+      background: #e0f2fe;
+      color: #0369a1;
+    }
+    .twofactor-card .status-pill.enabled {
+      background: #e8f5e9;
+      color: #256029;
+    }
+    .secret-box {
+      background: #f1f5f9;
+      border-radius: 6px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .secret-box span {
+      font-size: 12px;
+      color: #526079;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+    .secret-box code {
+      font-size: 18px;
+      letter-spacing: 2px;
+      font-weight: 600;
+    }
+    .retention-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .retention-actions .help-text {
+      margin: 0;
+    }
+    .qr-wrapper {
+      margin: 12px 0;
+    }
+    .qr-image {
+      width: 140px;
+      height: 140px;
+      image-rendering: pixelated;
+      border: 1px solid #d1d9e6;
+      border-radius: 8px;
+      padding: 8px;
+      background: #fff;
+    }
+    .twofactor-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-top: 4px;
+      align-items: flex-start;
+    }
+    .twofactor-actions form {
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      align-items: flex-start;
+    }
+    .backup-codes {
+      margin-top: 16px;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: inset 0 0 0 1px #e1e7ef;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .backup-codes.is-disabled {
+      opacity: 0.55;
+    }
+    .backup-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .backup-header h4 {
+      margin: 0;
+      font-size: 15px;
+      color: #1f2937;
+    }
+    .backup-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .backup-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .backup-table th,
+    .backup-table td {
+      padding: 8px 10px;
+      font-size: 13px;
+      border-bottom: 1px solid #e2e8f0;
+      text-align: left;
+    }
+    .backup-table td code {
+      font-size: 13px;
+    }
+    .backup-table .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+      background: #e0f2fe;
+      color: #0369a1;
+    }
+    .backup-table .status.used {
+      background: #f8f0f0;
+      color: #b91c1c;
+    }
+    .settings-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+    .settings-row section {
+      margin-bottom: 0;
+    }
+    .storage-table {
+      margin-top: 20px;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: inset 0 0 0 1px #e1e7ef;
+      overflow: hidden;
+    }
+    .storage-table h3 {
+      margin: 0;
+      padding: 16px;
+      font-size: 16px;
+      color: #1f2937;
+      border-bottom: 1px solid #d6e2f1;
+    }
+    .storage-table table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .storage-table th {
+      width: 220px;
+      font-weight: 600;
+      color: #2f3b52;
+    }
+    .storage-table th,
+    .storage-table td {
+      padding: 12px 16px;
+      font-size: 14px;
+      vertical-align: top;
+    }
+    .storage-table tr:not(:last-child) td,
+    .storage-table tr:not(:last-child) th {
+      border-bottom: 1px solid #edf2f7;
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+    }
+    .field-card {
+      background: #f9fbff;
+      padding: 12px;
+      border-radius: 8px;
+      box-shadow: inset 0 0 0 1px #d6e2f1;
+      display: grid;
+      gap: 8px;
+    }
+    .field-card label {
+      margin-bottom: 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .tooltip {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #e2e8f0;
+      color: #1e293b;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: help;
+    }
+    .tooltip:focus-visible {
+      outline: 2px solid #2563eb;
+      outline-offset: 2px;
+    }
+    .tooltip .tooltiptext {
+      visibility: hidden;
+      opacity: 0;
+      width: 220px;
+      background: #1e293b;
+      color: #f8fafc;
+      text-align: left;
+      border-radius: 6px;
+      padding: 8px 10px;
+      position: absolute;
+      z-index: 10;
+      bottom: 125%;
+      left: 50%;
+      transform: translateX(-50%);
+      transition: opacity 0.2s ease-in-out;
+      box-shadow: 0 8px 16px rgba(15, 23, 42, 0.25);
+    }
+    .tooltip:hover .tooltiptext,
+    .tooltip:focus .tooltiptext {
+      visibility: visible;
+      opacity: 1;
+    }
+    .help-text {
+      font-size: 13px;
+      color: #526079;
+    }
+    #processingIndicator {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.35);
+      color: #f8fafc;
+      font-size: 16px;
+      font-weight: 600;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      gap: 8px;
+    }
+    #processingIndicator .spinner {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      border: 2px solid rgba(248, 250, 252, 0.45);
+      border-top-color: #f8fafc;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+{% endblock %}
+
+{% block content %}
+  {% for alert in alerts %}
+    {% if alert.type == "success" %}
+      <div class="alert success">{{ alert.text }}</div>
+    {% elif alert.type == "error" %}
+      <div class="alert error">{{ alert.text }}</div>
+    {% elif alert.type == "info" %}
+      <div class="alert info">
+        <strong>Backup codes generated.</strong>
+        <p>Store these codes in a safe place. Each code can be used once if you lose access to your authenticator app.</p>
+        <ul class="backup-list">
+          {% for code in alert.backup_codes %}
+            <li><code>{{ code }}</code></li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif %}
+  {% endfor %}
+
+  <section>
+    <h2>UI Authentication</h2>
+    <div class="auth-row">
+      <div class="auth-card toggle-card">
+        <h3>Access control</h3>
+        <span class="status-pill">{{ status_text }}</span>
+        <p>{{ auth_note }}</p>
+        <form method="post" action="/settings/ui-auth">
+          {{ csrf_field|safe }}
+          <label class="checkbox-row" for="require_login">
+            <input type="checkbox" id="require_login" name="require_login" value="true" {% if checkbox_checked %}checked{% endif %} />
+            <span>Require login for dashboard pages</span>
+          </label>
+          <button type="submit">Save preference</button>
+        </form>
+        {% if logout_allowed %}
+          <form method="post" action="/settings/logout">
+            {{ csrf_field|safe }}
+            <button type="submit" class="secondary">Log out</button>
+          </form>
+        {% endif %}
+        <div class="credentials-block{% if ui_disabled %} is-disabled{% endif %}">
+          <h4>Update credentials</h4>
+          <form method="post" action="/settings/credentials">
+            {{ csrf_field|safe }}
+            <div class="credentials-grid">
+              <label for="username">Username</label>
+              <input id="username" name="username" type="text" value="{{ ui_username }}" required {% if ui_disabled %}disabled{% endif %} />
+              <label for="password">New password</label>
+              <input id="password" name="password" type="password" placeholder="Enter a new password" required {% if ui_disabled %}disabled{% endif %} />
+              <label for="password_confirm">Confirm new password</label>
+              <input id="password_confirm" name="password_confirm" type="password" placeholder="Re-enter the new password" required {% if ui_disabled %}disabled{% endif %} />
+            </div>
+            <button type="submit"{% if ui_disabled %} disabled{% endif %}>Update credentials</button>
+          </form>
+        </div>
+      </div>
+      <div class="auth-card twofactor-card{% if ui_disabled %} is-disabled{% endif %}">
+        <h3>Two-factor authentication</h3>
+        <span class="status-pill{% if two_factor.enabled %} enabled{% endif %}">{{ two_factor.status_text }}</span>
+        <p>{{ two_factor.note }}</p>
+        <div class="secret-box">
+          <span>Secret</span>
+          <code>{{ two_factor.secret }}</code>
+        </div>
+        {% if two_factor.qr_data_uri %}
+          <div class="qr-wrapper">
+            <img src="{{ two_factor.qr_data_uri }}" alt="Authenticator QR code" class="qr-image" />
+          </div>
+        {% endif %}
+        <p class="help-text">Scan or add the secret manually, then use<br /><a href="{{ two_factor.otpauth_uri }}">{{ two_factor.otpauth_uri }}</a> in your authenticator.</p>
+        <div class="twofactor-actions">
+          {% if two_factor.enabled %}
+            <form method="post" action="/settings/two-factor">
+              {{ csrf_field|safe }}
+              <input type="hidden" name="action" value="disable" />
+              <button type="submit" class="secondary" onclick="return confirm('Disable two-factor authentication?')"{% if two_factor.disabled %} disabled{% endif %}>Disable two-factor</button>
+            </form>
+            <form method="post" action="/settings/two-factor">
+              {{ csrf_field|safe }}
+              <input type="hidden" name="action" value="regenerate" />
+              <button type="submit" class="secondary"{% if two_factor.disabled %} disabled{% endif %}>Generate new secret</button>
+            </form>
+          {% else %}
+            <form method="post" action="/settings/two-factor">
+              {{ csrf_field|safe }}
+              <input type="hidden" name="action" value="enable" />
+              <label for="totp_code">Authentication code</label>
+              <input id="totp_code" name="code" type="text" inputmode="numeric" pattern="\d*" placeholder="123456" {% if two_factor.disabled %}disabled{% endif %} />
+              <span class="help-text">Enter a code from your authenticator app.</span>
+              <button type="submit"{% if two_factor.disabled %} disabled{% endif %}>Enable two-factor</button>
+            </form>
+            <form method="post" action="/settings/two-factor">
+              {{ csrf_field|safe }}
+              <input type="hidden" name="action" value="regenerate" />
+              <button type="submit" class="secondary"{% if two_factor.disabled %} disabled{% endif %}>Generate new secret</button>
+            </form>
+          {% endif %}
+        </div>
+        <div class="backup-codes{% if not two_factor.enabled %} is-disabled{% endif %}">
+          <div class="backup-header">
+            <h4>Backup codes</h4>
+            <div class="backup-actions">
+              <button type="button" class="secondary"{% if not two_factor.download_enabled %} disabled{% endif %} onclick="downloadBackupCodes()">Download as TXT</button>
+              <form method="post" action="/settings/two-factor">
+                {{ csrf_field|safe }}
+                <input type="hidden" name="action" value="generate_codes" />
+                <button type="submit" class="secondary"{% if not two_factor.generate_enabled %} disabled{% endif %}>Generate backup codes</button>
+              </form>
+            </div>
+          </div>
+          <p class="help-text">Each backup code may be used once when your authenticator is unavailable.</p>
+          <table class="backup-table">
+            <thead><tr><th>#</th><th>Code</th><th>Status</th></tr></thead>
+            <tbody>
+              {% if two_factor.backup_rows %}
+                {% for row in two_factor.backup_rows %}
+                  <tr>
+                    <td>{{ row.index }}</td>
+                    <td><code>{{ row.masked }}</code></td>
+                    <td><span class="status {{ row.status_class }}">{{ row.status_text }}</span></td>
+                  </tr>
+                {% endfor %}
+              {% else %}
+                <tr>
+                  <td colspan="3">Generate backup codes to view their status.</td>
+                </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="settings-row">
+    <section>
+      <h2>API Authentication</h2>
+      <span class="status-pill">{{ api_auth.status_text }}</span>
+      <p>{{ api_auth.note }}</p>
+        <form method="post" action="/settings/api-auth" class="api-auth-form">
+          {{ csrf_field|safe }}
+          <label class="checkbox-row" for="require_api_key_settings">
+            <input type="checkbox" id="require_api_key_settings" name="require_api_key" value="true" {% if api_auth.enabled %}checked{% endif %} />
+            <span>Require API key for API requests</span>
+          </label>
+          <button type="submit">Save API authentication</button>
+          <p class="help-text">{{ api_auth.help_text }}</p>
+        </form>
+        <div class="whitelist-card{% if api_whitelist.disabled %} is-disabled{% endif %}">
+          <div class="whitelist-header">
+            <h3>API IP whitelist</h3>
+            <span class="status-pill {% if api_whitelist.status_class %}{{ api_whitelist.status_class }}{% endif %}">{{ api_whitelist.status_text }}</span>
+          </div>
+          <p>{{ api_whitelist.note }}</p>
+          <form method="post" action="/settings/api-whitelist" class="whitelist-form">
+            {{ csrf_field|safe }}
+            <label class="checkbox-row" for="enable_api_whitelist">
+              <input type="checkbox" id="enable_api_whitelist" name="enable_whitelist" value="true" {% if api_whitelist.enabled %}checked{% endif %}{% if api_whitelist.disabled %} disabled{% endif %} />
+              <span>Restrict API access to specific IPs</span>
+            </label>
+            <label for="whitelist_entries">Allowed IPs or CIDR ranges</label>
+            <textarea id="whitelist_entries" name="whitelist_entries" rows="5"{% if api_whitelist.disabled %} disabled{% endif %}>{{ api_whitelist.entries_text }}</textarea>
+            <span class="help-text">{{ api_whitelist.help_text }}</span>
+            <button type="submit"{% if api_whitelist.disabled %} disabled{% endif %}>Save API whitelist</button>
+          </form>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retention Settings</h2>
+        <form method="post" action="/settings/retention" class="retention-form">
+        {{ csrf_field|safe }}
+        <label for="retention_hours">Default retention (hours)
+          <span class="tooltip" tabindex="0">?
+            <span class="tooltiptext">Hours files remain available before cleanup runs.</span>
+          </span>
+        </label>
+        <input id="retention_hours" name="retention_hours" type="number" min="1" max="8760" step="0.5" value="{{ retention.hours_value }}" required class="half-width" />
+        <div class="retention-actions">
+          <button type="submit" style="margin-top: 16px;">Update retention</button>
+          <span class="help-text">Equivalent to {{ retention.days_text }} day(s).</span>
+        </div>
+      </form>
+      <div class="storage-table">
+        <h3>Storage Management</h3>
+        <table>
+          <tbody>
+            <tr>
+              <th>Total storage used</th>
+              <td>{{ storage.total_used_text }}</td>
+              <td>Across all published files</td>
+            </tr>
+            <tr>
+              <th>Active files</th>
+              <td>{{ storage.active_files_text }}</td>
+              <td>Within retention window</td>
+            </tr>
+            <tr>
+              <th>Expired files pending cleanup</th>
+              <td>{{ storage.expired_files_text }}</td>
+              <td>Older than {{ storage.retention_days_text }} day(s)</td>
+            </tr>
+            <tr>
+              <th>Storage quota limit</th>
+              <td>{{ storage.quota_text }}</td>
+              <td>Based on current volume size</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Performance Settings</h2>
+      <form method="post" action="/settings/performance" class="performance-form">
+        {{ csrf_field|safe }}
+        <div class="form-grid">
+          <div class="field-card">
+            <label for="rate_limit_rpm">Rate limit (requests/minute)
+              <span class="tooltip" tabindex="0">?
+                <span class="tooltiptext">Maximum requests per client IP per minute.</span>
+              </span>
+            </label>
+            <input id="rate_limit_rpm" name="rate_limit_rpm" type="number" min="1" max="100000" step="1" value="{{ performance.rate_limit }}" required class="half-width" />
+            <span class="help-text">Requests allowed per minute.</span>
+          </div>
+          <div class="field-card">
+            <label for="ffmpeg_timeout_minutes">FFmpeg timeout (minutes)
+              <span class="tooltip" tabindex="0">?
+                <span class="tooltiptext">Terminate jobs exceeding this processing time.</span>
+              </span>
+            </label>
+            <input id="ffmpeg_timeout_minutes" name="ffmpeg_timeout_minutes" type="number" min="1" max="720" step="1" value="{{ performance.ffmpeg_timeout }}" required class="half-width" />
+            <span class="help-text">Maximum processing duration.</span>
+          </div>
+          <div class="field-card">
+            <label for="upload_chunk_mb">Upload chunk size (MB)
+              <span class="tooltip" tabindex="0">?
+                <span class="tooltiptext">Size of each streamed upload chunk.</span>
+              </span>
+            </label>
+            <input id="upload_chunk_mb" name="upload_chunk_mb" type="number" min="0.1" max="512" step="0.1" value="{{ performance.upload_chunk }}" required class="half-width" />
+            <span class="help-text">Per-stream read buffer.</span>
+          </div>
+          <div class="field-card">
+            <label for="max_file_size_mb">File size limit (MB)
+              <span class="tooltip" tabindex="0">?
+                <span class="tooltiptext">Largest upload accepted by the server.</span>
+              </span>
+            </label>
+            <input id="max_file_size_mb" name="max_file_size_mb" type="number" min="1" max="8192" step="1" value="{{ performance.max_file_size }}" required class="half-width" />
+            <span class="help-text">Maximum upload size.</span>
+          </div>
+        </div>
+        <button type="submit" style="margin-top: 16px;">Update performance settings</button>
+      </form>
+    </section>
+  </div>
+
+  <div id="processingIndicator">Processing... <span class="spinner"></span></div>
+  <script>
+    window.downloadBackupCodes = function downloadBackupCodes() {
+      const codes = Array.from(document.querySelectorAll('.backup-list code')).map(function (el) {
+        return el.textContent;
+      });
+      if (!codes.length) {
+        alert('No backup codes available. Generate new codes first.');
+        return;
+      }
+      const blob = new Blob([codes.join('\n')], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'ffapi-backup-codes.txt';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    };
+
+    document.addEventListener('DOMContentLoaded', function () {
+      const indicator = document.getElementById('processingIndicator');
+      if (indicator) {
+        document.querySelectorAll('form').forEach(function (form) {
+          form.addEventListener('submit', function () {
+            indicator.style.display = 'flex';
+          });
+        });
+      }
+
+      document.querySelectorAll('input[type="file"]').forEach(function (input) {
+        input.addEventListener('change', function (event) {
+          const file = event.target.files && event.target.files[0];
+          if (!file) {
+            return;
+          }
+          const maxSize = 1024 * 1024 * 1024; // 1GB
+          if (file.size > maxSize) {
+            alert('File too large');
+            event.target.value = '';
+          }
+        });
+      });
+    });
+  </script>
+{% endblock %}
