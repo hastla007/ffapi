@@ -517,6 +517,7 @@ def test_settings_page_shows_auth_retention_and_storage_sections(patched_app):
     assert "Two-factor authentication" in html
     assert "twofactor-card is-disabled" in html
     assert "Generate backup codes" in html
+    assert "Download as TXT" in html
     assert "Backup codes" in html
     assert "Enable dashboard login to configure two-factor authentication." in html
     assert "API Authentication" in html

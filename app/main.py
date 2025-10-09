@@ -939,6 +939,9 @@ def render_settings_page(
     two_factor_card_class = disabled_class
     two_factor_status_class = "status-pill enabled" if two_factor_enabled else "status-pill"
     backup_generation_disabled = two_factor_disabled_attr or ("" if two_factor_enabled else " disabled")
+    backup_download_disabled = two_factor_disabled_attr or (
+        " disabled" if not backup_status else ""
+    )
     backup_card_class = "" if two_factor_enabled else " is-disabled"
     backup_rows: List[str] = []
     for idx, item in enumerate(backup_status, start=1):
@@ -1001,11 +1004,14 @@ def render_settings_page(
             <div class=\"backup-codes{backup_card_class}\">
               <div class=\"backup-header\">
                 <h4>Backup codes</h4>
-                <form method=\"post\" action=\"/settings/two-factor\">
-                  {csrf_field}
-                  <input type=\"hidden\" name=\"action\" value=\"generate_codes\" />
-                  <button type=\"submit\" class=\"secondary\"{backup_generation_disabled}>Generate backup codes</button>
-                </form>
+                <div class=\"backup-actions\">
+                  <button type=\"button\" class=\"secondary\"{backup_download_disabled} onclick=\"downloadBackupCodes()\">Download as TXT</button>
+                  <form method=\"post\" action=\"/settings/two-factor\">
+                    {csrf_field}
+                    <input type=\"hidden\" name=\"action\" value=\"generate_codes\" />
+                    <button type=\"submit\" class=\"secondary\"{backup_generation_disabled}>Generate backup codes</button>
+                  </form>
+                </div>
               </div>
               <p class=\"help-text\">Each backup code may be used once when your authenticator is unavailable.</p>
               <table class=\"backup-table\">
@@ -1083,6 +1089,7 @@ def render_settings_page(
         .backup-header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; }}
         .backup-header h4 {{ margin: 0; font-size: 15px; color: #1f2937; }}
         .backup-header form {{ margin: 0; }}
+        .backup-actions {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }}
         .backup-table {{ width: 100%; border-collapse: collapse; }}
         .backup-table th, .backup-table td {{ padding: 8px 10px; font-size: 13px; border-bottom: 1px solid #e2e8f0; text-align: left; }}
         .backup-table td code {{ font-size: 13px; }}
@@ -1282,6 +1289,26 @@ def render_settings_page(
           </form>
         </section>
       </div>
+      <script>
+        function downloadBackupCodes() {{
+          const codes = Array.from(document.querySelectorAll('.backup-list code')).map(function(el) {{
+            return el.textContent;
+          }});
+          if (!codes.length) {{
+            alert('No backup codes available. Generate new codes first.');
+            return;
+          }}
+          const blob = new Blob([codes.join('\n')], {{ type: 'text/plain' }});
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = 'ffapi-backup-codes.txt';
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+        }}
+      </script>
     </body>
     </html>
     """
@@ -1651,7 +1678,6 @@ async def metrics_middleware(request, call_next):
             response.headers["X-Request-ID"] = request_id
             return response
 
-    RATE_LIMITER.cleanup_old_identifiers()
     wait_time = 0.0
     processing_start: Optional[float] = None
     try:
@@ -1804,6 +1830,7 @@ async def startup_event():
         asyncio.create_task(_periodic_public_cleanup())
         asyncio.create_task(_periodic_jobs_cleanup())
     asyncio.create_task(_periodic_session_cleanup())
+    asyncio.create_task(_periodic_rate_limiter_cleanup())
     _flush_logs()
 
 
@@ -2207,6 +2234,25 @@ async def _periodic_session_cleanup():
             logger.warning("Session cleanup failed: %s", exc)
         try:
             await asyncio.sleep(1800)
+        except asyncio.CancelledError:
+            raise
+
+
+async def _periodic_rate_limiter_cleanup():
+    """Periodically purge stale identifiers from the rate limiter cache."""
+    try:
+        await asyncio.sleep(300)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            RATE_LIMITER.cleanup_old_identifiers()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Rate limiter cleanup failed: %s", exc)
+        try:
+            await asyncio.sleep(300)
         except asyncio.CancelledError:
             raise
 
