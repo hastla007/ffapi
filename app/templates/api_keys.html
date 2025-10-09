@@ -1,0 +1,228 @@
+{% extends "base.html" %}
+
+{% block head_extra %}
+  <style>
+    body.api-keys-page {
+      max-width: 1400px;
+    }
+    section {
+      background: #f7f9fc;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+      margin-bottom: 24px;
+    }
+    h2 {
+      margin-top: 0;
+    }
+    .api-card {
+      background: #fff;
+      padding: 16px;
+      border-radius: 8px;
+      box-shadow: inset 0 0 0 1px #e1e7ef;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .api-card.is-disabled {
+      opacity: 0.5;
+    }
+    .api-card h3 {
+      margin: 0;
+      font-size: 16px;
+      color: #1f2937;
+    }
+    .api-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .api-card p {
+      margin: 0;
+      font-size: 14px;
+      color: #334155;
+    }
+    .api-card form {
+      margin-top: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    button {
+      padding: 8px 14px;
+      background: #28a745;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #1f7a34;
+    }
+    button.secondary {
+      background: #9aa5b1;
+    }
+    button.secondary:hover {
+      background: #7c8794;
+    }
+    button[disabled], button[disabled]:hover {
+      background: #9aa5b1;
+      cursor: not-allowed;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      background: #e8f5e9;
+      color: #256029;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .help-text {
+      font-size: 13px;
+      color: #526079;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th,
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid #e5edf6;
+      font-size: 14px;
+      text-align: left;
+    }
+    th {
+      color: #1f2937;
+    }
+    code {
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 6px 10px;
+      border-radius: 4px;
+      display: inline-block;
+      font-size: 13px;
+    }
+    #processingIndicator {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.35);
+      color: #f8fafc;
+      font-size: 16px;
+      font-weight: 600;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      gap: 8px;
+    }
+    #processingIndicator .spinner {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      border: 2px solid rgba(248, 250, 252, 0.45);
+      border-top-color: #f8fafc;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+  </style>
+{% endblock %}
+
+{% block content %}
+  {% if message %}
+    <div class="alert success">{{ message }}</div>
+  {% endif %}
+  {% if error %}
+    <div class="alert error">{{ error }}</div>
+  {% endif %}
+  {% if new_key %}
+    <div class="alert success">
+      <strong>New API key generated</strong>
+      <p>Copy this value now — it will not be shown again.</p>
+      <code>{{ new_key }}</code>
+    </div>
+  {% endif %}
+
+  <section>
+    <h2>API Keys</h2>
+    {% set disabled_class = '' if require_key else ' is-disabled' %}
+    {% set disabled_attr = '' if require_key else ' disabled' %}
+    <div class="api-card keys-card{{ disabled_class }}">
+      <div class="api-card-header">
+        <h3>Authentication status</h3>
+        <span class="status-pill">{{ status_text }}</span>
+      </div>
+      <p>{{ note_text }}</p>
+      {% if not require_key %}
+        <p class="help-text">Enable API authentication in <a href="/settings">Settings</a> before generating keys.</p>
+      {% endif %}
+      <form method="post" action="/api-keys/generate">
+        {{ csrf_field|safe }}
+        <button type="submit"{{ disabled_attr }}>Generate new key</button>
+      </form>
+      <table>
+        <thead>
+          <tr><th>Key</th><th>Created</th><th>Last used</th><th></th></tr>
+        </thead>
+        <tbody>
+          {% if keys %}
+            {% for key in keys %}
+              <tr>
+                <td>{{ key.prefix }}&hellip;</td>
+                <td>{{ key.created }}</td>
+                <td>{{ key.last_used }}</td>
+                <td>
+                  <form method="post" action="/api-keys/revoke" onsubmit="return confirm('Are you sure you want to revoke this API key?')">
+                    {{ csrf_field|safe }}
+                    <input type="hidden" name="key_id" value="{{ key.id }}" />
+                    <button type="submit" class="secondary"{{ disabled_attr }}>Revoke</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          {% else %}
+            <tr>
+              <td colspan="4">No API keys yet</td>
+            </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div id="processingIndicator">Processing... <span class="spinner"></span></div>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      const indicator = document.getElementById('processingIndicator');
+      if (indicator) {
+        document.querySelectorAll('form').forEach(function (form) {
+          form.addEventListener('submit', function () {
+            indicator.style.display = 'flex';
+          });
+        });
+      }
+
+      document.querySelectorAll('input[type="file"]').forEach(function (input) {
+        input.addEventListener('change', function (event) {
+          const file = event.target.files && event.target.files[0];
+          if (!file) {
+            return;
+          }
+          const maxSize = 1024 * 1024 * 1024;
+          if (file.size > maxSize) {
+            alert('File too large');
+            event.target.value = '';
+          }
+        });
+      });
+    });
+  </script>
+{% endblock %}

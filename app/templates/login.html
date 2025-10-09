@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block head_extra %}
+<style>
+  body.login-page {
+    max-width: 520px;
+  }
+  body.login-page .page-content {
+    background: transparent;
+    box-shadow: none;
+    padding: 0;
+  }
+  body.login-page form {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  body.login-page label {
+    font-weight: 600;
+  }
+  body.login-page input {
+    padding: 10px;
+    font-size: 14px;
+    border: 1px solid #cbd5f5;
+    border-radius: 6px;
+  }
+  body.login-page button {
+    padding: 10px;
+    background: #28a745;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 15px;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  body.login-page button:hover {
+    background: #1f7a34;
+  }
+  body.login-page .alert {
+    padding: 12px;
+    border-radius: 6px;
+    margin-bottom: 16px;
+    font-size: 14px;
+  }
+  body.login-page .alert.error {
+    background: #fdecea;
+    border: 1px solid #f7c6c4;
+    color: #b3261e;
+  }
+  body.login-page .help {
+    font-size: 13px;
+    color: #4b5563;
+    margin-top: 16px;
+    text-align: center;
+  }
+  body.login-page .help-text {
+    font-size: 13px;
+    color: #4b5563;
+    margin-top: -4px;
+  }
+</style>
+{% endblock %}
+{% block content %}
+  {% if error %}
+    <div class="alert error">{{ error }}</div>
+  {% endif %}
+  <form method="post" action="/settings/login">
+    {{ csrf_field|safe }}
+    <input type="hidden" name="next" value="{{ next_path }}" />
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="username" required />
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required />
+    {% if require_code %}
+      <label for="totp">Authentication code</label>
+      <input id="totp" name="totp" type="text" inputmode="numeric" pattern="\d*" autocomplete="one-time-code" />
+      <label for="backup_code">Backup code (optional)</label>
+      <input id="backup_code" name="backup_code" type="text" autocomplete="one-time-code" placeholder="ABCDE-12345" />
+      <p class="help-text">Enter a 6-digit authenticator code or one of your backup codes.</p>
+    {% endif %}
+    <button type="submit">Sign in</button>
+  </form>
+  <div class="help">Default credentials: {{ default_username }} / {{ default_password }}</div>
+{% endblock %}
