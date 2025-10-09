@@ -18,10 +18,18 @@
         background: #f8fafc;
         color: #111827;
       }
+      .top-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-bottom: 24px;
+      }
       .brand {
         font-size: 32px;
         font-weight: 700;
-        margin-bottom: 20px;
+        margin: 0;
       }
       .brand .ff {
         color: #28a745;
@@ -30,10 +38,12 @@
         color: #111827;
       }
       .main-nav {
-        margin-bottom: 20px;
+        margin: 0;
+        margin-left: auto;
         display: flex;
         flex-wrap: wrap;
         gap: 12px;
+        justify-content: flex-end;
       }
       .main-nav a {
         padding: 8px 14px;
@@ -61,10 +71,12 @@
     {% block head_extra %}{% endblock %}
   </head>
   <body class="{{ body_class or '' }}">
-    <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-    {% if nav_links %}
-      {% include "components/nav.html" %}
-    {% endif %}
+    <header class="top-bar">
+      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
+      {% if nav_links %}
+        {% include "components/nav.html" %}
+      {% endif %}
+    </header>
     <div class="page-content">
       {% block content %}{% endblock %}
     </div>

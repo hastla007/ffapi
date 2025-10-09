@@ -820,12 +820,15 @@ def nav_context(active: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
-def fallback_nav_html(active: Optional[str] = None, *, indent: str = "      ") -> str:
-    lines = ['<nav class="main-nav">']
+def fallback_top_bar_html(active: Optional[str] = None, *, indent: str = "      ") -> str:
+    lines = ['<div class="top-bar">']
+    lines.append('  <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>')
+    lines.append('  <nav class="main-nav">')
     for href, label in NAV_LINKS:
         class_attr = ' class="active"' if active == href else ""
-        lines.append(f'  <a href="{href}"{class_attr}>{label}</a>')
-    lines.append("</nav>")
+        lines.append(f'    <a href="{href}"{class_attr}>{label}</a>')
+    lines.append('  </nav>')
+    lines.append('</div>')
     return "\n".join(f"{indent}{line}" for line in lines)
 
 
@@ -1115,7 +1118,7 @@ def settings_template_response(
             </div>
     """
 
-    nav_html = fallback_nav_html("/settings")
+    top_bar_html = fallback_top_bar_html("/settings")
     html_content = f"""
     <!doctype html>
     <html>
@@ -1124,10 +1127,11 @@ def settings_template_response(
       <title>Settings</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
-        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
         .main-nav a {{ color: #0066cc; text-decoration: none; }}
         .main-nav a:hover {{ text-decoration: underline; }}
         h2 {{ margin-top: 32px; }}
@@ -1205,8 +1209,7 @@ def settings_template_response(
       </style>
     </head>
     <body>
-      <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
-{nav_html}
+{top_bar_html}
       {alerts}
 
       <section>
@@ -1638,7 +1641,7 @@ def api_keys_template_response(
                 "<p class=\"help-text\">Enable API authentication in <a href=\"/settings\">Settings</a> before generating keys.</p>"
             )
 
-        nav_html = fallback_nav_html("/api-keys")
+        top_bar_html = fallback_top_bar_html("/api-keys")
         html_content = f"""
     <!doctype html>
     <html>
@@ -1647,10 +1650,11 @@ def api_keys_template_response(
       <title>API Keys</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
-        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
         .main-nav a {{ color: #0066cc; text-decoration: none; }}
         .main-nav a:hover {{ text-decoration: underline; }}
         h2 {{ margin-top: 32px; }}
@@ -1684,8 +1688,7 @@ def api_keys_template_response(
       </style>
     </head>
     <body>
-      <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
-{nav_html}
+{top_bar_html}
       {alerts_html}
 
       <section>
@@ -2923,7 +2926,7 @@ def downloads(
         f"<a class=\"clear-link\" href=\"{html.escape(clear_url, quote=True)}\">Clear</a>" if clear_url else ""
     )
 
-    nav_html = fallback_nav_html("/downloads")
+    top_bar_html = fallback_top_bar_html("/downloads")
     html_content = f"""
     <!doctype html>
     <html>
@@ -2932,10 +2935,11 @@ def downloads(
       <title>Downloads</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
-        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
         .main-nav a {{ color: #0066cc; text-decoration: none; }}
         .main-nav a:hover {{ text-decoration: underline; }}
         table {{ border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 2px rgba(15,23,42,0.08); }}
@@ -2959,8 +2963,7 @@ def downloads(
       </style>
     </head>
     <body>
-      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-{nav_html}
+{top_bar_html}
       <h2>Generated Files</h2>
       <form method="get" class="filters">
         <input type="text" name="q" value="{search_value}" placeholder="Search by filename or date" />
@@ -3093,7 +3096,7 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
         else ""
     )
 
-    nav_html = fallback_nav_html("/logs")
+    top_bar_html = fallback_top_bar_html("/logs")
     html_content = f"""
     <!doctype html>
     <html>
@@ -3102,10 +3105,11 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
       <title>FFmpeg Logs</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
-        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
         .main-nav a {{ color: #0066cc; text-decoration: none; }}
         .main-nav a:hover {{ text-decoration: underline; }}
         table {{ border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 2px rgba(15,23,42,0.08); }}
@@ -3117,8 +3121,7 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
       </style>
     </head>
     <body>
-      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-{nav_html}
+{top_bar_html}
       <h2>FFmpeg Logs</h2>
       <table>
         <thead><tr><th>Date</th><th>Filename</th><th>Operation</th><th>Size</th><th>Action</th></tr></thead>
@@ -3213,7 +3216,7 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
     app_logs_safe = html.escape(app_logs)
     log_info_safe = html.escape(log_info)
 
-    nav_html = fallback_nav_html("/ffmpeg")
+    top_bar_html = fallback_top_bar_html("/ffmpeg")
     html_content = f"""
     <!doctype html>
     <html>
@@ -3223,12 +3226,13 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
       {refresh_meta}
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
         pre {{ background: #f5f5f5; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; line-height: 1.4; }}
         h3 {{ margin-top: 30px; margin-bottom: 10px; }}
-        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
         .main-nav a {{ color: #0066cc; text-decoration: none; }}
         .main-nav a:hover {{ text-decoration: underline; }}
         .section {{ margin-bottom: 40px; }}
@@ -3267,8 +3271,7 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
       </style>
     </head>
     <body>
-      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-{nav_html}
+{top_bar_html}
       <h2>FFmpeg & Container Information</h2>
 
       <div class="section">
@@ -3596,7 +3599,7 @@ def documentation(request: Request):
     base_url = PUBLIC_BASE_URL or "http://localhost:3000"
     retention_days = str(RETENTION_DAYS)
     if templates is None:
-        nav_html = fallback_nav_html("/documentation")
+        top_bar_html = fallback_top_bar_html("/documentation")
         html_content = f"""
     <!doctype html>
     <html>
@@ -3605,12 +3608,13 @@ def documentation(request: Request):
       <title>API Documentation</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
         h2 {{ margin-bottom: 10px; }}
         h4 {{ margin-top: 30px; margin-bottom: 15px; color: #333; border-bottom: 2px solid #0066cc; padding-bottom: 5px; }}
-        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
         .main-nav a {{ color: #0066cc; text-decoration: none; }}
         .main-nav a:hover {{ text-decoration: underline; }}
         .intro {{
@@ -3686,8 +3690,7 @@ def documentation(request: Request):
       </style>
     </head>
     <body>
-      <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
-{nav_html}
+{top_bar_html}
       <h2>FFAPI Ultimate - API Documentation</h2>
 
       <div class=\"intro\">
@@ -4286,7 +4289,7 @@ def metrics_dashboard(request: Request):
                 )
             )
 
-    nav_html = fallback_nav_html("/metrics")
+    top_bar_html = fallback_top_bar_html("/metrics")
     html_content = f"""
     <!doctype html>
     <html>
@@ -4295,13 +4298,14 @@ def metrics_dashboard(request: Request):
       <title>Operational Metrics</title>
       <style>
         body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
         table {{ border-collapse: collapse; width: 100%; margin-bottom: 30px; }}
         th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
         th {{ text-align: left; background: #fafafa; }}
-        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
         .main-nav a {{ color: #0066cc; text-decoration: none; }}
         .main-nav a:hover {{ text-decoration: underline; }}
         .cards {{ display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 30px; }}
@@ -4317,8 +4321,7 @@ def metrics_dashboard(request: Request):
       </style>
     </head>
     <body>
-      <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-{nav_html}
+{top_bar_html}
 
       <div class="cards">
         <div class="card">
@@ -5524,7 +5527,7 @@ def jobs_history(
             f"<a href='{html.escape(item['url'], quote=True)}' class='filter-link {css_class}'>{html.escape(item['label'])}</a>"
         )
 
-    nav_html = fallback_nav_html("/jobs", indent="        ")
+    top_bar_html = fallback_top_bar_html("/jobs", indent="        ")
     html_content = f"""
     <!doctype html>
     <html>
@@ -5533,10 +5536,11 @@ def jobs_history(
         <title>Job History</title>
         <style>
             body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-            .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+            .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
+            .brand {{ font-size: 32px; font-weight: bold; margin: 0; }}
             .brand .ff {{ color: #28a745; }}
             .brand .api {{ color: #000; }}
-            .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+            .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }}
             .main-nav a {{ color: #0066cc; text-decoration: none; font-weight: 500; }}
             .main-nav a:hover {{ text-decoration: underline; }}
             .filters {{ margin-bottom: 16px; display: flex; gap: 12px; flex-wrap: wrap; }}
@@ -5555,8 +5559,7 @@ def jobs_history(
         </style>
     </head>
     <body>
-        <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-{nav_html}
+{top_bar_html}
         <h2>Job History</h2>
         <div class="filters">{''.join(filter_links)}</div>
         <table>
