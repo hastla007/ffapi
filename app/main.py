@@ -406,21 +406,27 @@ def render_settings_page(
         alert_blocks.append(f"<div class=\"alert error\">{html.escape(error)}</div>")
     alerts = "".join(alert_blocks)
     require_login = UI_AUTH.require_login
-    toggle_value = "false" if require_login else "true"
-    toggle_label = "Disable login requirement" if require_login else "Enable login requirement"
     status_text = "Enabled" if require_login else "Disabled"
     auth_note = (
         "Dashboard pages currently require sign-in."
         if require_login
         else "Dashboard pages are open without authentication."
     )
+    checkbox_state = "checked" if require_login else ""
+    disabled_class = "" if require_login else " is-disabled"
+    disabled_attr = "" if require_login else " disabled"
     logout_button = ""
     if require_login and authenticated:
         logout_button = """
-        <form method=\"post\" action=\"/settings/logout\" style=\"margin-top: 10px;\">
+        <form method=\"post\" action=\"/settings/logout\">
           <button type=\"submit\" class=\"secondary\">Log out</button>
         </form>
         """
+
+    retention_hours = RETENTION_DAYS * 24
+    rate_limit_rpm = settings.RATE_LIMIT_REQUESTS_PER_MINUTE
+    ffmpeg_timeout_minutes = FFMPEG_TIMEOUT_SECONDS / 60
+    upload_chunk_mb = UPLOAD_CHUNK_SIZE / (1024 * 1024)
 
     return f"""
     <!doctype html>
@@ -437,13 +443,16 @@ def render_settings_page(
         nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
         h2 {{ margin-top: 32px; }}
         section {{ background: #f7f9fc; padding: 20px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.08); margin-bottom: 24px; }}
-        form {{ margin-top: 16px; }}
+        form {{ margin-top: 12px; }}
         label {{ display: block; font-weight: 600; margin-bottom: 6px; }}
         input {{ padding: 10px; font-size: 14px; border: 1px solid #ccd5e0; border-radius: 4px; width: 100%; box-sizing: border-box; }}
         button {{ padding: 10px 16px; background: #0066cc; color: #fff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }}
         button:hover {{ background: #0053a3; }}
         button.secondary {{ background: #9aa5b1; }}
         button.secondary:hover {{ background: #7c8794; }}
+        .checkbox-row {{ display: flex; align-items: center; gap: 10px; font-weight: 600; }}
+        .checkbox-row input {{ width: auto; margin: 0; transform: scale(1.2); }}
+        .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-top: 16px; }}
         .alert {{ padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }}
         .alert.success {{ background: #e8f5e9; color: #256029; border: 1px solid #c8e6c9; }}
         .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
@@ -452,6 +461,15 @@ def render_settings_page(
         .storage-card h3 {{ margin: 0 0 6px 0; font-size: 15px; color: #2f3b52; }}
         .storage-card p {{ margin: 0; font-size: 24px; font-weight: 600; color: #0f172a; }}
         .storage-card span {{ display: block; margin-top: 4px; font-size: 13px; color: #526079; }}
+        .auth-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; align-items: stretch; margin-top: 16px; }}
+        .auth-card {{ background: #fff; padding: 16px; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; display: flex; flex-direction: column; gap: 12px; }}
+        .auth-card h3 {{ margin: 0; font-size: 16px; color: #1f2937; }}
+        .auth-card p {{ margin: 0; font-size: 14px; color: #334155; }}
+        .auth-card form {{ margin-top: 0; display: flex; flex-direction: column; gap: 12px; }}
+        .auth-card.is-disabled {{ opacity: 0.5; }}
+        .credentials-grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
+        .credentials-grid label {{ margin-bottom: 0; }}
+        .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e8f5e9; color: #256029; border-radius: 999px; font-weight: 600; width: fit-content; }}
       </style>
     </head>
     <body>
@@ -465,23 +483,77 @@ def render_settings_page(
         <a href=\"/settings\">Settings</a>
       </nav>
       {alerts}
+
       <section>
         <h2>UI Authentication</h2>
-        <p><strong>Status:</strong> {status_text}</p>
-        <p>{auth_note}</p>
-        <form method=\"post\" action=\"/settings/ui-auth\">
-          <input type=\"hidden\" name=\"enable\" value=\"{toggle_value}\" />
-          <button type=\"submit\">{toggle_label}</button>
-        </form>
-        <p style=\"margin-top: 16px;\"><strong>Current username:</strong> {html.escape(UI_AUTH.username)}</p>
-        <form method=\"post\" action=\"/settings/credentials\">
-          <label for=\"username\">Username</label>
-          <input id=\"username\" name=\"username\" type=\"text\" value=\"{html.escape(UI_AUTH.username, quote=True)}\" required />
-          <label for=\"password\" style=\"margin-top: 12px;\">New password</label>
-          <input id=\"password\" name=\"password\" type=\"password\" placeholder=\"Enter a new password\" required />
-          <button type=\"submit\" style=\"margin-top: 12px;\">Update credentials</button>
-        </form>
-        {logout_button}
+        <div class="auth-row">
+          <div class="auth-card toggle-card">
+            <h3>Access control</h3>
+            <span class="status-pill">{status_text}</span>
+            <p>{auth_note}</p>
+            <form method="post" action="/settings/ui-auth">
+              <label class="checkbox-row" for="require_login">
+                <input type="checkbox" id="require_login" name="require_login" value="true" {checkbox_state} />
+                <span>Require login for dashboard pages</span>
+              </label>
+              <button type="submit">Save preference</button>
+            </form>
+            {logout_button}
+          </div>
+          <div class="auth-card current-card{disabled_class}">
+            <h3>Current username</h3>
+            <p>{html.escape(UI_AUTH.username)}</p>
+          </div>
+          <div class="auth-card credentials-card{disabled_class}">
+            <h3>Update credentials</h3>
+            <form method="post" action="/settings/credentials">
+              <div class="credentials-grid">
+                <label for="username">Username</label>
+                <input id="username" name="username" type="text" value="{html.escape(UI_AUTH.username, quote=True)}" required{disabled_attr} />
+                <label for="password">New password</label>
+                <input id="password" name="password" type="password" placeholder="Enter a new password" required{disabled_attr} />
+              </div>
+              <button type="submit"{disabled_attr}>Update credentials</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Retention Settings</h2>
+        <div class="settings-grid">
+          <div class="storage-card">
+            <h3>Default retention (hours)</h3>
+            <p>{retention_hours}</p>
+            <span>Equivalent to {RETENTION_DAYS} day(s)</span>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Performance Settings</h2>
+        <div class="settings-grid">
+          <div class="storage-card">
+            <h3>Rate limit</h3>
+            <p>{rate_limit_rpm} rpm</p>
+            <span>Requests allowed per minute</span>
+          </div>
+          <div class="storage-card">
+            <h3>FFmpeg timeout</h3>
+            <p>{ffmpeg_timeout_minutes:.0f} min</p>
+            <span>Maximum processing duration</span>
+          </div>
+          <div class="storage-card">
+            <h3>Upload chunk size</h3>
+            <p>{upload_chunk_mb:.1f} MB</p>
+            <span>Per-stream read buffer</span>
+          </div>
+          <div class="storage-card">
+            <h3>File size limit</h3>
+            <p>{MAX_FILE_SIZE_MB} MB</p>
+            <span>Maximum upload size</span>
+          </div>
+        </div>
       </section>
 
       <section>
@@ -1905,7 +1977,7 @@ async def settings_logout(request: Request):
 @app.post("/settings/ui-auth")
 async def settings_toggle_auth(request: Request):
     form = await request.form()
-    enable_value = str(form.get("enable", "")).lower()
+    raw_value = form.get("require_login")
     authed = is_authenticated(request)
     if UI_AUTH.require_login and not authed:
         response = RedirectResponse(
@@ -1915,16 +1987,9 @@ async def settings_toggle_auth(request: Request):
         response.delete_cookie(SESSION_COOKIE_NAME)
         return response
 
-    if enable_value not in {"true", "false"}:
-        storage = storage_management_snapshot()
-        html_content = render_settings_page(
-            storage,
-            error="Invalid toggle value",
-            authenticated=authed,
-        )
-        return HTMLResponse(html_content, status_code=400)
-
-    enable = enable_value == "true"
+    enable = False
+    if raw_value is not None:
+        enable = str(raw_value).lower() in {"true", "1", "on", "yes"}
     UI_AUTH.set_require_login(enable)
     message = (
         "Dashboard login requirement enabled"

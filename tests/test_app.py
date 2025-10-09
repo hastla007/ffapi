@@ -356,17 +356,24 @@ def test_downloads_page_escapes_special_characters(patched_app):
     assert "<img" not in html.split("Generated Files", 1)[1]
 
 
-def test_settings_page_shows_auth_and_storage_sections(patched_app):
+def test_settings_page_shows_auth_retention_and_storage_sections(patched_app):
     status, _, body = call_app(patched_app.app, "GET", "/settings")
     assert status == 200
     html = body.decode()
     assert "UI Authentication" in html
+    assert "Require login for dashboard pages" in html
+    assert "auth-row" in html
+    assert "credentials-card is-disabled" in html
+    assert "button type=\"submit\" disabled" in html
+    assert "Retention Settings" in html
+    assert "Default retention (hours)" in html
+    assert "Performance Settings" in html
     assert "Storage Management" in html
     assert "Total storage used" in html
 
 
 def test_dashboard_requires_login_when_enabled(patched_app):
-    enable_body = urlencode({"enable": "true"}).encode()
+    enable_body = urlencode({"require_login": "true"}).encode()
     status, headers, _ = call_app(
         patched_app.app,
         "POST",
@@ -412,6 +419,21 @@ def test_dashboard_requires_login_when_enabled(patched_app):
         headers=[("Cookie", f"{patched_app.SESSION_COOKIE_NAME}={session_token}")],
     )
     assert status == 200
+
+
+def test_settings_page_enables_credentials_when_authentication_required(patched_app):
+    patched_app.UI_AUTH.set_require_login(True)
+    token = patched_app.UI_AUTH.create_session()
+    status, _, body = call_app(
+        patched_app.app,
+        "GET",
+        "/settings",
+        headers=[("Cookie", f"{patched_app.SESSION_COOKIE_NAME}={token}")],
+    )
+    assert status == 200
+    html = body.decode()
+    assert "credentials-card is-disabled" not in html
+    assert "button type=\"submit\" disabled" not in html
 
 
 def test_settings_rejects_short_password(patched_app):
