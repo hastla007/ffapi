@@ -151,6 +151,34 @@
       grid-template-columns: 1fr;
       gap: 12px;
     }
+    .whitelist-card {
+      margin-top: 20px;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: inset 0 0 0 1px #e1e7ef;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .whitelist-card.is-disabled {
+      opacity: 0.55;
+    }
+    .whitelist-card textarea {
+      min-height: 120px;
+      font-family: "Courier New", monospace;
+      resize: vertical;
+    }
+    .whitelist-card button {
+      width: fit-content;
+    }
+    .whitelist-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
     .status-pill {
       display: inline-flex;
       align-items: center;
@@ -161,6 +189,10 @@
       border-radius: 999px;
       font-weight: 600;
       width: fit-content;
+    }
+    .status-pill.disabled {
+      background: #e2e8f0;
+      color: #475569;
     }
     .twofactor-card .status-pill {
       background: #e0f2fe;
@@ -562,14 +594,32 @@
             <input type="checkbox" id="require_api_key_settings" name="require_api_key" value="true" {% if api_auth.enabled %}checked{% endif %} />
             <span>Require API key for API requests</span>
           </label>
-        <button type="submit">Save API authentication</button>
+          <button type="submit">Save API authentication</button>
           <p class="help-text">{{ api_auth.help_text }}</p>
         </form>
-    </section>
+        <div class="whitelist-card{% if api_whitelist.disabled %} is-disabled{% endif %}">
+          <div class="whitelist-header">
+            <h3>API IP whitelist</h3>
+            <span class="status-pill {% if api_whitelist.status_class %}{{ api_whitelist.status_class }}{% endif %}">{{ api_whitelist.status_text }}</span>
+          </div>
+          <p>{{ api_whitelist.note }}</p>
+          <form method="post" action="/settings/api-whitelist" class="whitelist-form">
+            {{ csrf_field|safe }}
+            <label class="checkbox-row" for="enable_api_whitelist">
+              <input type="checkbox" id="enable_api_whitelist" name="enable_whitelist" value="true" {% if api_whitelist.enabled %}checked{% endif %}{% if api_whitelist.disabled %} disabled{% endif %} />
+              <span>Restrict API access to specific IPs</span>
+            </label>
+            <label for="whitelist_entries">Allowed IPs or CIDR ranges</label>
+            <textarea id="whitelist_entries" name="whitelist_entries" rows="5"{% if api_whitelist.disabled %} disabled{% endif %}>{{ api_whitelist.entries_text }}</textarea>
+            <span class="help-text">{{ api_whitelist.help_text }}</span>
+            <button type="submit"{% if api_whitelist.disabled %} disabled{% endif %}>Save API whitelist</button>
+          </form>
+        </div>
+      </section>
 
-    <section>
-      <h2>Retention Settings</h2>
-      <form method="post" action="/settings/retention" class="retention-form">
+      <section>
+        <h2>Retention Settings</h2>
+        <form method="post" action="/settings/retention" class="retention-form">
         {{ csrf_field|safe }}
         <label for="retention_hours">Default retention (hours)
           <span class="tooltip" tabindex="0">?

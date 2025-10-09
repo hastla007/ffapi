@@ -92,7 +92,16 @@ class DummyCompletedProcess:
         self.stderr = stderr
 
 
-async def _call_app(app, method: str, path: str, *, headers=None, body: bytes = b"", query: str = "") -> Tuple[int, dict, bytes]:
+async def _call_app(
+    app,
+    method: str,
+    path: str,
+    *,
+    headers=None,
+    body: bytes = b"",
+    query: str = "",
+    client_host: str = "testclient",
+) -> Tuple[int, dict, bytes]:
     headers = headers or []
     scope = {
         "type": "http",
@@ -102,7 +111,7 @@ async def _call_app(app, method: str, path: str, *, headers=None, body: bytes = 
         "raw_path": path.encode("ascii"),
         "query_string": query.encode("ascii"),
         "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers],
-        "client": ("testclient", 123),
+        "client": (client_host, 123),
         "server": ("testserver", 80),
         "scheme": "http",
     }
@@ -144,8 +153,19 @@ async def _call_app(app, method: str, path: str, *, headers=None, body: bytes = 
     return response_status or 500, headers_dict, bytes(response_body)
 
 
-def call_app(app, method: str, path: str, *, headers=None, body: bytes = b"", query: str = "") -> Tuple[int, dict, bytes]:
-    return asyncio.run(_call_app(app, method, path, headers=headers, body=body, query=query))
+def call_app(
+    app,
+    method: str,
+    path: str,
+    *,
+    headers=None,
+    body: bytes = b"",
+    query: str = "",
+    client_host: str = "testclient",
+) -> Tuple[int, dict, bytes]:
+    return asyncio.run(
+        _call_app(app, method, path, headers=headers, body=body, query=query, client_host=client_host)
+    )
 
 
 def extract_csrf_token(html: str) -> str:
@@ -280,6 +300,7 @@ def app_module(tmp_path_factory: pytest.TempPathFactory):
     module.UI_AUTH.reset()
     module.PROBE_CACHE.clear()
     module.csrf_protect.validate_csrf = lambda submitted, cookie: None
+    module.API_WHITELIST.reset()
     return module
 
 
@@ -414,6 +435,7 @@ def patched_app(app_module, monkeypatch, tmp_path):
     app_module.RATE_LIMITER.reset()
     app_module.UI_AUTH.reset()
     app_module.API_KEYS.reset()
+    app_module.API_WHITELIST.reset()
 
     return app_module
 
@@ -422,9 +444,11 @@ def patched_app(app_module, monkeypatch, tmp_path):
 def reset_ui_auth_state(app_module):
     app_module.UI_AUTH.reset()
     app_module.API_KEYS.reset()
+    app_module.API_WHITELIST.reset()
     yield
     app_module.UI_AUTH.reset()
     app_module.API_KEYS.reset()
+    app_module.API_WHITELIST.reset()
 
 
 def test_root_redirects_to_downloads(patched_app):
@@ -559,6 +583,11 @@ def test_settings_page_shows_auth_retention_and_storage_sections(patched_app):
     assert "API Authentication" in html
     assert "Require API key for API requests" in html
     assert "Save API authentication" in html
+    assert "API IP whitelist" in html
+    assert "Restrict API access to specific IPs" in html
+    assert "name=\"whitelist_entries\"" in html
+    assert "Save API whitelist" in html
+    assert "whitelist-card is-disabled" in html
     assert "Retention Settings" in html
     assert "Default retention (hours)" in html
     assert "name=\"retention_hours\"" in html
@@ -830,7 +859,7 @@ def test_settings_page_enables_credentials_when_authentication_required(patched_
     assert status == 200
     html = body.decode()
     assert "credentials-block is-disabled" not in html
-    assert "button type=\"submit\" disabled" not in html
+    assert '<button type="submit" disabled>Update credentials</button>' not in html
 
 
 def test_settings_rejects_short_password(patched_app):
@@ -1234,6 +1263,125 @@ def test_api_requests_require_key_when_enabled(patched_app):
     assert data["ok"] is True
     listing = patched_app.API_KEYS.list_keys()
     assert listing and listing[0]["last_used"] is not None
+
+
+def test_api_whitelist_requires_api_auth_before_toggle(patched_app):
+    jar: dict[str, str] = {}
+    csrf_token = fetch_csrf_token(patched_app.app, jar)
+    status, headers, _ = post_form(
+        patched_app.app,
+        "/settings/api-whitelist",
+        {
+            "enable_whitelist": "true",
+            "whitelist_entries": "203.0.113.5",
+            "csrf_token": csrf_token,
+        },
+        jar,
+    )
+    assert status == 303
+    assert headers["location"].startswith("/settings?error=")
+    assert not patched_app.API_WHITELIST.is_enabled()
+
+
+def test_api_whitelist_rejects_empty_entries_when_enabled(patched_app):
+    jar: dict[str, str] = {}
+    csrf_token = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
+        patched_app.app,
+        "/settings/api-auth",
+        {"require_api_key": "true", "csrf_token": csrf_token},
+        jar,
+    )
+    assert status == 303
+    whitelist_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, _, body = post_form(
+        patched_app.app,
+        "/settings/api-whitelist",
+        {"enable_whitelist": "true", "whitelist_entries": "", "csrf_token": whitelist_csrf},
+        jar,
+    )
+    assert status == 400
+    html = body.decode()
+    assert "Add at least one IP address" in html
+    assert not patched_app.API_WHITELIST.is_enabled()
+
+
+def test_api_whitelist_blocks_non_whitelisted_ip(patched_app):
+    jar: dict[str, str] = {}
+    csrf_token = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
+        patched_app.app,
+        "/settings/api-auth",
+        {"require_api_key": "true", "csrf_token": csrf_token},
+        jar,
+    )
+    assert status == 303
+
+    whitelist_csrf = fetch_csrf_token(patched_app.app, jar)
+    status, _, _ = post_form(
+        patched_app.app,
+        "/settings/api-whitelist",
+        {
+            "enable_whitelist": "true",
+            "whitelist_entries": "203.0.113.5\n2001:db8::/32",
+            "csrf_token": whitelist_csrf,
+        },
+        jar,
+    )
+    assert status == 303
+    assert patched_app.API_WHITELIST.is_enabled()
+
+    payload = {
+        "video_url": "https://example.com/video.mp4",
+        "duration_ms": 1000,
+        "width": 640,
+        "height": 360,
+        "fps": 24,
+    }
+
+    status, _, body = call_app(
+        patched_app.app,
+        "POST",
+        "/compose/from-urls",
+        headers=[("content-type", "application/json")],
+        body=json.dumps(payload).encode("utf-8"),
+        query="as_json=true",
+        client_host="198.51.100.10",
+    )
+    assert status == 403
+    error_payload = json.loads(body.decode())
+    assert error_payload["error"] == "ip_not_whitelisted"
+
+    status, _, body = call_app(
+        patched_app.app,
+        "POST",
+        "/compose/from-urls",
+        headers=[("content-type", "application/json")],
+        body=json.dumps(payload).encode("utf-8"),
+        query="as_json=true",
+        client_host="203.0.113.5",
+    )
+    assert status == 401
+    missing_key = json.loads(body.decode())
+    assert missing_key["error"] == "api_key_required"
+
+    _, api_key = patched_app.API_KEYS.generate_key()
+
+    status, _, body = call_app(
+        patched_app.app,
+        "POST",
+        "/compose/from-urls",
+        headers=[
+            ("content-type", "application/json"),
+            ("x-api-key", api_key),
+        ],
+        body=json.dumps(payload).encode("utf-8"),
+        query="as_json=true",
+        client_host="203.0.113.5",
+    )
+    assert status == 200
+    result = json.loads(body.decode())
+    assert result.get("ok") is True
 
 
 def test_concurrent_requests_handle_independent_state(patched_app):

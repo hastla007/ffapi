@@ -8,6 +8,7 @@
 - **Fixed retention**: Files are deleted based on actual file age (modification time), not folder name. Files persist through restarts until they are truly RETENTION_DAYS old, and cleanup resumes automatically on startup and via a periodic background task.
 - **Runtime tuning**: Administrators can adjust retention windows, rate limits, FFmpeg timeouts, and upload limits directly from the `/settings` dashboard without restarting the service.
 - **Optional API authentication**: Toggle API key enforcement at runtime and issue/revoke keys from the `/api-keys` dashboard.
+- **API IP whitelist**: When API authentication is enabled, restrict access to approved IPv4/IPv6 addresses or CIDR ranges from the `/settings` page.
 - **Optional dashboard MFA**: Enable TOTP-based two-factor authentication with QR setup, backup codes, and recovery enforcement for the settings and dashboard pages when UI authentication is required. (Install `qrcode[pil]` to render setup QR codes—otherwise a placeholder image is shown.)
 - **Rich browsing experience**: The `/downloads` page now supports search, pagination, and inline video thumbnails while `/logs` offers paginated browsing for large histories.
 - **Job telemetry**: Asynchronous compose jobs expose granular progress updates, status messages, and a capped history log via the `/jobs/{job_id}` endpoint.
@@ -55,8 +56,8 @@ docker compose up -d
 - `/logs` - View FFmpeg operation logs
 - `/ffmpeg` - Monitor container with live logs and FFmpeg version info (supports auto-refresh)
 - `/documentation` - Complete API reference with all endpoints and parameters
-- `/api-keys` - Enable API authentication and create/revoke access keys
-- `/settings` - Toggle dashboard authentication, configure two-factor login, adjust retention/performance limits, and review storage usage
+- `/api-keys` - Enable API authentication and create/revoke access keys (honors IP whitelist state)
+- `/settings` - Configure dashboard access, retention, performance, API authentication (including the optional IP whitelist), and review storage usage
 
 Outputs persist in `./public` (mounted to `/data/public`).  
 Temporary work files live in `./work` (`/data/work`).  

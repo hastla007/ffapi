@@ -1,4 +1,4 @@
-import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit, hmac, hashlib, secrets, base64, struct, math
+import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit, hmac, hashlib, secrets, base64, struct, math, ipaddress
 from collections import Counter, defaultdict, deque
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
@@ -712,6 +712,90 @@ class APIKeyManager:
 API_KEYS = APIKeyManager()
 
 
+def _split_whitelist_entries(text: str) -> List[str]:
+    entries: List[str] = []
+    if not text:
+        return entries
+    for raw_line in text.replace(",", "\n").splitlines():
+        entry = raw_line.strip()
+        if entry:
+            entries.append(entry)
+    return entries
+
+
+class APIWhitelist:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._enabled = False
+        self._entries: List[str] = []
+        self._networks: List[ipaddress._BaseNetwork] = []
+
+    def reset(self) -> None:
+        with self._lock:
+            self._enabled = False
+            self._entries.clear()
+            self._networks.clear()
+
+    def is_enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+    def get_entries(self) -> List[str]:
+        with self._lock:
+            return list(self._entries)
+
+    def configure(self, enabled: bool, entries: List[str]) -> None:
+        normalized: List[str] = []
+        networks: List[ipaddress._BaseNetwork] = []
+        for raw_entry in entries:
+            entry = raw_entry.strip()
+            if not entry:
+                continue
+            try:
+                if "/" in entry:
+                    network = ipaddress.ip_network(entry, strict=False)
+                    display = str(network)
+                else:
+                    address = ipaddress.ip_address(entry)
+                    display = str(address)
+                    network = ipaddress.ip_network(
+                        f"{address}/{address.max_prefixlen}", strict=False
+                    )
+            except ValueError as exc:
+                raise ValueError(f"Invalid IP address or network: {entry}") from exc
+            if display in normalized:
+                continue
+            normalized.append(display)
+            networks.append(network)
+
+        if enabled and not normalized:
+            raise ValueError(
+                "Add at least one IP address or network before enabling the whitelist"
+            )
+
+        with self._lock:
+            self._enabled = enabled
+            self._entries = normalized
+            self._networks = networks
+
+    def is_allowed(self, host: Optional[str]) -> bool:
+        with self._lock:
+            enabled = self._enabled
+            networks = tuple(self._networks)
+        if not enabled:
+            return True
+        if not host:
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return any(ip in network for network in networks)
+
+
+API_WHITELIST = APIWhitelist()
+
+
 _DASHBOARD_EXACT_PATHS = {"/", "/health"}
 _DASHBOARD_PREFIXES = (
     "/downloads",
@@ -922,6 +1006,7 @@ def settings_template_response(
     csrf_token: str,
     backup_codes: Optional[List[str]] = None,
     backup_status: Optional[List[Dict[str, Any]]] = None,
+    whitelist_text: Optional[str] = None,
     status_code: int = 200,
 ) -> Response:
     total_used_mb = storage["total_bytes"] / (1024 * 1024) if storage["total_bytes"] else 0.0
@@ -1008,6 +1093,32 @@ def settings_template_response(
     api_help_text = html.escape(
         "Clients must provide X-API-Key header or api_key query when enabled."
     )
+    whitelist_entries_current = API_WHITELIST.get_entries()
+    whitelist_enabled = API_WHITELIST.is_enabled()
+    whitelist_entries_text = (
+        whitelist_text if whitelist_text is not None else "\n".join(whitelist_entries_current)
+    )
+    if not api_require_key:
+        if whitelist_enabled:
+            whitelist_note = (
+                "Enable API authentication to enforce the saved whitelist entries."
+            )
+        else:
+            whitelist_note = "Enable API authentication to restrict API access by IP address."
+    elif whitelist_enabled:
+        whitelist_note = "Only the IP addresses below may call API endpoints."
+    else:
+        whitelist_note = "All client IPs can call API endpoints until a whitelist is enabled."
+    whitelist_help = "Enter one IPv4/IPv6 address or CIDR range per line."
+    whitelist_checkbox_state = "checked" if whitelist_enabled else ""
+    whitelist_card_class = " is-disabled" if not api_require_key else ""
+    whitelist_disabled_attr = " disabled" if not api_require_key else ""
+    whitelist_status_text = "Enabled" if whitelist_enabled else "Disabled"
+    whitelist_status_html = html.escape(whitelist_status_text)
+    whitelist_status_class = "enabled" if whitelist_enabled else "disabled"
+    whitelist_note_text = html.escape(whitelist_note)
+    whitelist_help_text = html.escape(whitelist_help)
+    whitelist_entries_html = html.escape(whitelist_entries_text)
     two_factor_enabled = UI_AUTH.is_two_factor_enabled()
     two_factor_status_text = "Enabled" if two_factor_enabled else "Disabled"
     if two_factor_enabled:
@@ -1173,6 +1284,11 @@ def settings_template_response(
         .credentials-block {{ margin-top: 20px; padding-top: 16px; border-top: 1px solid #e1e7ef; display: flex; flex-direction: column; gap: 12px; }}
         .credentials-block.is-disabled {{ opacity: 0.5; }}
         .credentials-grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
+        .whitelist-card {{ margin-top: 20px; background: #fff; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; padding: 16px; display: flex; flex-direction: column; gap: 12px; }}
+        .whitelist-card.is-disabled {{ opacity: 0.55; }}
+        .whitelist-card textarea {{ min-height: 120px; font-family: 'Courier New', monospace; resize: vertical; }}
+        .whitelist-card button {{ width: fit-content; }}
+        .whitelist-header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }}
         .credentials-grid label {{ margin-bottom: 0; }}
         .twofactor-card .status-pill {{ background: #e0f2fe; color: #0369a1; }}
         .twofactor-card .status-pill.enabled {{ background: #e8f5e9; color: #256029; }}
@@ -1183,6 +1299,7 @@ def settings_template_response(
         .twofactor-actions form {{ margin: 0; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }}
         .twofactor-actions button {{ width: fit-content; }}
         .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e8f5e9; color: #256029; border-radius: 999px; font-weight: 600; width: fit-content; }}
+        .status-pill.disabled {{ background: #e2e8f0; color: #475569; }}
         .help-text {{ font-size: 13px; color: #526079; }}
         .qr-wrapper {{ margin: 12px 0; }}
         .qr-image {{ width: 140px; height: 140px; image-rendering: pixelated; border: 1px solid #d1d9e6; border-radius: 8px; padding: 8px; background: #fff; }}
@@ -1278,6 +1395,24 @@ def settings_template_response(
           <button type="submit">Save API authentication</button>
           <p class="help-text">{api_help_text}</p>
         </form>
+        <div class="whitelist-card{whitelist_card_class}">
+          <div class="whitelist-header">
+            <h3>API IP whitelist</h3>
+            <span class="status-pill {whitelist_status_class}">{whitelist_status_html}</span>
+          </div>
+          <p>{whitelist_note_text}</p>
+          <form method="post" action="/settings/api-whitelist" class="whitelist-form">
+            {csrf_field}
+            <label class="checkbox-row" for="enable_api_whitelist">
+              <input type="checkbox" id="enable_api_whitelist" name="enable_whitelist" value="true" {whitelist_checkbox_state}{whitelist_disabled_attr} />
+              <span>Restrict API access to specific IPs</span>
+            </label>
+            <label for="whitelist_entries">Allowed IPs or CIDR ranges</label>
+            <textarea id="whitelist_entries" name="whitelist_entries" rows="5"{whitelist_disabled_attr}>{whitelist_entries_html}</textarea>
+            <span class="help-text">{whitelist_help_text}</span>
+            <button type="submit"{whitelist_disabled_attr}>Save API whitelist</button>
+          </form>
+        </div>
       </section>
 
       <section>
@@ -1545,6 +1680,15 @@ def settings_template_response(
             "status_text": api_status_text,
             "note": api_note,
             "help_text": "Clients must provide X-API-Key header or api_key query when enabled.",
+        },
+        "api_whitelist": {
+            "enabled": whitelist_enabled,
+            "status_text": whitelist_status_text,
+            "status_class": whitelist_status_class,
+            "note": whitelist_note,
+            "help_text": whitelist_help,
+            "entries_text": whitelist_entries_text,
+            "disabled": not api_require_key,
         },
     }
 
@@ -2006,6 +2150,18 @@ async def metrics_middleware(request, call_next):
         identifier = request.client.host or "unknown"
 
     if requires_api_key(request):
+        client_host = request.client.host if request.client else None
+        if not API_WHITELIST.is_allowed(client_host):
+            METRICS.request_finished(path, 403, 0.0, 0.0, "ip_not_whitelisted")
+            response = JSONResponse(
+                {
+                    "error": "ip_not_whitelisted",
+                    "detail": "Client IP address is not permitted",
+                },
+                status_code=403,
+            )
+            response.headers["X-Request-ID"] = request_id
+            return response
         provided_key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
         if not provided_key:
             METRICS.request_finished(path, 401, 0.0, 0.0, "missing_api_key")
@@ -3848,6 +4004,51 @@ async def settings_update_api_auth(request: Request):
         enable = str(raw_value).lower() in {"true", "1", "on", "yes"}
     API_KEYS.set_require_key(enable)
     message = "API authentication enabled" if enable else "API authentication disabled"
+    query = urlencode({"message": message})
+    return RedirectResponse(url=f"/settings?{query}", status_code=303)
+
+
+@app.post("/settings/api-whitelist")
+async def settings_update_api_whitelist(request: Request):
+    authed = is_authenticated(request)
+    if UI_AUTH.require_login and not authed:
+        response = RedirectResponse(
+            url=f"/settings?{urlencode({'error': 'Authentication required to change API whitelist'})}",
+            status_code=303,
+        )
+        response.delete_cookie(SESSION_COOKIE_NAME)
+        return response
+
+    if not API_KEYS.is_required():
+        query = urlencode(
+            {"error": "Enable API authentication before configuring the API whitelist"}
+        )
+        return RedirectResponse(url=f"/settings?{query}", status_code=303)
+
+    form = await request.form()
+    raw_enabled = form.get("enable_whitelist")
+    enable = False
+    if raw_enabled is not None:
+        enable = str(raw_enabled).lower() in {"true", "1", "on", "yes"}
+    entries_text = str(form.get("whitelist_entries", ""))
+    entries = _split_whitelist_entries(entries_text)
+
+    try:
+        API_WHITELIST.configure(enable, entries)
+    except ValueError as exc:
+        storage = storage_management_snapshot()
+        csrf_token = ensure_csrf_token(request)
+        return settings_template_response(
+            request,
+            storage,
+            error=str(exc),
+            authenticated=authed,
+            csrf_token=csrf_token,
+            whitelist_text=entries_text,
+            status_code=400,
+        )
+
+    message = "API whitelist enabled" if enable else "API whitelist disabled"
     query = urlencode({"message": message})
     return RedirectResponse(url=f"/settings?{query}", status_code=303)
 
