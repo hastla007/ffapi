@@ -805,7 +805,7 @@ NAV_LINKS: Tuple[Tuple[str, str], ...] = (
 
 
 def render_nav(active: Optional[str] = None, *, indent: str = "      ") -> str:
-    lines = ["<nav>"]
+    lines = ['<nav class="main-nav">']
     for href, label in NAV_LINKS:
         class_attr = ' class="active"' if active == href else ""
         lines.append(f'  <a href="{href}"{class_attr}>{label}</a>')
@@ -1085,8 +1085,9 @@ def render_settings_page(
         .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
-        nav {{ margin-bottom: 20px; }}
-        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav a {{ color: #0066cc; text-decoration: none; }}
+        .main-nav a:hover {{ text-decoration: underline; }}
         h2 {{ margin-top: 32px; }}
         section {{ background: #f7f9fc; padding: 20px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.08); margin-bottom: 24px; }}
         form {{ margin-top: 12px; }}
@@ -1512,8 +1513,9 @@ def render_api_keys_page(
         .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
-        nav {{ margin-bottom: 20px; }}
-        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav a {{ color: #0066cc; text-decoration: none; }}
+        .main-nav a:hover {{ text-decoration: underline; }}
         h2 {{ margin-top: 32px; }}
         section {{ background: #f7f9fc; padding: 20px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.08); margin-bottom: 24px; }}
         form {{ margin-top: 12px; }}
@@ -2749,8 +2751,9 @@ def downloads(
         .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
-        nav {{ margin-bottom: 20px; }}
-        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav a {{ color: #0066cc; text-decoration: none; }}
+        .main-nav a:hover {{ text-decoration: underline; }}
         table {{ border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 2px rgba(15,23,42,0.08); }}
         th, td {{ border-bottom: 1px solid #e2e8f0; padding: 12px 14px; font-size: 14px; vertical-align: top; }}
         th {{ text-align: left; background: #f8fafc; color: #1f2937; }}
@@ -2884,8 +2887,9 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
         .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
-        nav {{ margin-bottom: 20px; }}
-        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav a {{ color: #0066cc; text-decoration: none; }}
+        .main-nav a:hover {{ text-decoration: underline; }}
         table {{ border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 2px rgba(15,23,42,0.08); }}
         th, td {{ border-bottom: 1px solid #e2e8f0; padding: 12px 14px; font-size: 14px; }}
         th {{ text-align: left; background: #f8fafc; color: #1f2937; }}
@@ -2991,9 +2995,9 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
         .brand .api {{ color: #000; }}
         pre {{ background: #f5f5f5; padding: 15px; border-radius: 4px; overflow-x: auto; font-size: 12px; line-height: 1.4; }}
         h3 {{ margin-top: 30px; margin-bottom: 10px; }}
-        nav {{ margin-bottom: 20px; }}
-        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
-        nav a:hover {{ text-decoration: underline; }}
+        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav a {{ color: #0066cc; text-decoration: none; }}
+        .main-nav a:hover {{ text-decoration: underline; }}
         .section {{ margin-bottom: 40px; }}
         .logs {{ 
           height: 600px; 
@@ -3370,9 +3374,9 @@ def documentation(request: Request):
         .brand .api {{ color: #000; }}
         h2 {{ margin-bottom: 10px; }}
         h4 {{ margin-top: 30px; margin-bottom: 15px; color: #333; border-bottom: 2px solid #0066cc; padding-bottom: 5px; }}
-        nav {{ margin-bottom: 20px; }}
-        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
-        nav a:hover {{ text-decoration: underline; }}
+        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav a {{ color: #0066cc; text-decoration: none; }}
+        .main-nav a:hover {{ text-decoration: underline; }}
         .intro {{ 
           background: #f0f7ff; 
           padding: 20px; 
@@ -3983,8 +3987,9 @@ def metrics_dashboard(request: Request):
         table {{ border-collapse: collapse; width: 100%; margin-bottom: 30px; }}
         th, td {{ border-bottom: 1px solid #eee; padding: 8px 10px; font-size: 14px; }}
         th {{ text-align: left; background: #fafafa; }}
-        nav {{ margin-bottom: 20px; }}
-        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+        .main-nav a {{ color: #0066cc; text-decoration: none; }}
+        .main-nav a:hover {{ text-decoration: underline; }}
         .cards {{ display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 30px; }}
         .card {{
           flex: 1 1 240px;
@@ -5184,9 +5189,9 @@ def jobs_history(
             .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
             .brand .ff {{ color: #28a745; }}
             .brand .api {{ color: #000; }}
-            nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
-            nav a {{ color: #0066cc; text-decoration: none; font-weight: 500; }}
-            nav a:hover {{ text-decoration: underline; }}
+            .main-nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+            .main-nav a {{ color: #0066cc; text-decoration: none; font-weight: 500; }}
+            .main-nav a:hover {{ text-decoration: underline; }}
             .filters {{ margin-bottom: 16px; display: flex; gap: 12px; flex-wrap: wrap; }}
             .filter-link {{ padding: 6px 12px; border-radius: 4px; background: #f0f0f0; text-decoration: none; color: #333; }}
             .filter-link.active {{ background: #0066cc; color: white; }}

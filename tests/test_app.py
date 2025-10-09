@@ -480,6 +480,27 @@ def test_downloads_search_filters_results(patched_app):
     assert "No files match your filters" not in html
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/downloads",
+        "/logs",
+        "/ffmpeg",
+        "/metrics",
+        "/documentation",
+        "/api-keys",
+        "/settings",
+        "/jobs",
+    ],
+)
+def test_dashboard_navigation_links_visible_everywhere(patched_app, path):
+    status, _, body = call_app(patched_app.app, "GET", path)
+    assert status == 200
+    html = body.decode()
+    for _, label in patched_app.NAV_LINKS:
+        assert label in html
+
+
 def test_downloads_supports_pagination(patched_app):
     day_dir = patched_app.PUBLIC_DIR / "20240112"
     day_dir.mkdir(parents=True, exist_ok=True)
