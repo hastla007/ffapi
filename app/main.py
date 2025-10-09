@@ -1,6 +1,6 @@
 import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit
 from collections import Counter, defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -94,7 +94,7 @@ class RateLimiter:
         self._lock = threading.Lock()
 
     def check(self, identifier: str) -> bool:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         cutoff = now - timedelta(minutes=1)
         with self._lock:
             timestamps = [t for t in self._limits[identifier] if t > cutoff]
@@ -104,6 +104,16 @@ class RateLimiter:
             timestamps.append(now)
             self._limits[identifier] = timestamps
             return True
+
+    def cleanup_old_identifiers(self, max_age_minutes: int = 60) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
+        with self._lock:
+            stale: List[str] = []
+            for identifier, timestamps in self._limits.items():
+                if not timestamps or all(t < cutoff for t in timestamps):
+                    stale.append(identifier)
+            for identifier in stale:
+                self._limits.pop(identifier, None)
 
     def reset(self) -> None:
         with self._lock:
@@ -191,6 +201,21 @@ RATE_LIMITER = RateLimiter(settings.RATE_LIMIT_REQUESTS_PER_MINUTE)
 
 JOBS: Dict[str, Dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
+
+
+def cleanup_old_jobs(max_age_seconds: int = 3600) -> None:
+    cutoff = time.time() - max_age_seconds
+    with JOBS_LOCK:
+        to_remove: List[str] = []
+        for job_id, data in JOBS.items():
+            created = data.get("created")
+            status = data.get("status")
+            if created is None:
+                continue
+            if created < cutoff and status in {"finished", "failed"}:
+                to_remove.append(job_id)
+        for job_id in to_remove:
+            JOBS.pop(job_id, None)
 
 
 class MetricsTracker:
@@ -323,6 +348,7 @@ async def metrics_middleware(request, call_next):
     if request.client:
         identifier = request.client.host or "unknown"
 
+    RATE_LIMITER.cleanup_old_identifiers()
     if not RATE_LIMITER.check(identifier):
         METRICS.request_finished(path, 429, 0.0, 0.0, "rate_limited")
         METRICS.request_completed()
@@ -644,32 +670,36 @@ def cleanup_old_public(days: int = RETENTION_DAYS):
     
     deleted_count = 0
     for child in PUBLIC_DIR.iterdir():
-        if child.is_dir():
-            # Check all files in this directory
-            files_to_delete = []
+        if not child.is_dir():
+            continue
+
+        files_to_delete: List[Path] = []
+        try:
             for file_path in child.iterdir():
-                if file_path.is_file():
-                    try:
-                        file_mtime = file_path.stat().st_mtime
-                        if file_mtime < cutoff_timestamp:
-                            files_to_delete.append(file_path)
-                    except Exception as exc:
-                        logger.warning("Failed to inspect file %s: %s", file_path, exc)
-            
-            # Delete old files
-            for fp in files_to_delete:
+                if not file_path.is_file():
+                    continue
                 try:
-                    fp.unlink()
-                    deleted_count += 1
+                    file_mtime = file_path.stat().st_mtime
+                    if file_mtime < cutoff_timestamp:
+                        files_to_delete.append(file_path)
                 except Exception as exc:
-                    logger.warning("Failed to delete expired file %s: %s", fp, exc)
-            
-            # Remove directory if empty
+                    logger.warning("Failed to inspect file %s: %s", file_path, exc)
+        except Exception as exc:
+            logger.warning("Failed to scan directory %s: %s", child, exc)
+            continue
+
+        for fp in files_to_delete:
             try:
-                if not any(child.iterdir()):
-                    child.rmdir()
+                fp.unlink()
+                deleted_count += 1
             except Exception as exc:
-                logger.warning("Failed to remove empty directory %s: %s", child, exc)
+                logger.warning("Failed to delete expired file %s: %s", fp, exc)
+
+        try:
+            if not any(child.iterdir()):
+                child.rmdir()
+        except Exception as exc:
+            logger.warning("Failed to remove empty directory %s: %s", child, exc)
     
     if deleted_count > 0:
         logger.info(f"Cleanup: deleted {deleted_count} files older than {days} days")
@@ -699,11 +729,12 @@ def publish_file(src: Path, ext: str) -> Dict[str, str]:
     """Move a finished file into PUBLIC_DIR/YYYYMMDD/ and return URLs/paths.
        Uses shutil.move to be cross-device safe (works across Docker volumes/Windows)."""
     check_disk_space(PUBLIC_DIR)
-    day = datetime.utcnow().strftime("%Y%m%d")
+    now = datetime.now(timezone.utc)
+    day = now.strftime("%Y%m%d")
     folder = PUBLIC_DIR / day
     folder.mkdir(parents=True, exist_ok=True)
     check_disk_space(folder)
-    name = datetime.utcnow().strftime("%Y%m%d_%H%M%S_") + _rand() + ext
+    name = now.strftime("%Y%m%d_%H%M%S_") + _rand() + ext
     dst = folder / name
 
     # Cross-device safe move
@@ -721,11 +752,12 @@ def save_log(log_path: Path, operation: str) -> None:
     if not log_path.exists():
         return
     check_disk_space(LOGS_DIR)
-    day = datetime.utcnow().strftime("%Y%m%d")
+    now = datetime.now(timezone.utc)
+    day = now.strftime("%Y%m%d")
     folder = LOGS_DIR / day
     folder.mkdir(parents=True, exist_ok=True)
     check_disk_space(folder)
-    name = datetime.utcnow().strftime("%Y%m%d_%H%M%S_") + _rand() + f"_{operation}.log"
+    name = now.strftime("%Y%m%d_%H%M%S_") + _rand() + f"_{operation}.log"
     dst = folder / name
     try:
         shutil.copy2(str(log_path), str(dst))
@@ -905,7 +937,7 @@ def ffmpeg_info(auto_refresh: int = 0):
     refresh_status = f"Auto-refreshing every {auto_refresh} seconds" if auto_refresh > 0 else "Auto-refresh: OFF"
     
     # Current time
-    current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     version_output_safe = html.escape(version_output)
     app_logs_safe = html.escape(app_logs)
@@ -2117,9 +2149,16 @@ async def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
 
 async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -> None:
     with JOBS_LOCK:
-        JOBS[job_id]["status"] = "processing"
-        JOBS[job_id]["progress"] = 10
-        JOBS[job_id]["started"] = time.time()
+        created = JOBS[job_id].get("created", time.time())
+        JOBS[job_id].update(
+            {
+                "status": "processing",
+                "progress": 10,
+                "started": time.time(),
+                "created": created,
+                "updated": time.time(),
+            }
+        )
 
     start = time.perf_counter()
     try:
@@ -2127,26 +2166,33 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, (str, dict)) else str(exc.detail)
         with JOBS_LOCK:
+            created = JOBS[job_id].get("created", time.time())
             JOBS[job_id] = {
                 "status": "failed",
                 "progress": 100,
                 "status_code": exc.status_code,
                 "error": detail,
+                "created": created,
+                "updated": time.time(),
             }
         return
     except Exception as exc:
         logger.exception("Async compose job %s failed", job_id)
         with JOBS_LOCK:
+            created = JOBS[job_id].get("created", time.time())
             JOBS[job_id] = {
                 "status": "failed",
                 "progress": 100,
                 "status_code": 500,
                 "error": str(exc),
+                "created": created,
+                "updated": time.time(),
             }
         return
 
     duration_ms = (time.perf_counter() - start) * 1000.0
     with JOBS_LOCK:
+        created = JOBS[job_id].get("created", time.time())
         JOBS[job_id] = {
             "status": "finished",
             "progress": 100,
@@ -2156,14 +2202,18 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
                 "rel": pub["rel"],
             },
             "duration_ms": duration_ms,
+            "created": created,
+            "updated": time.time(),
         }
 
 
 @app.post("/compose/from-urls/async")
 async def compose_from_urls_async(job: ComposeFromUrlsJob):
+    cleanup_old_jobs()
     job_id = str(uuid4())
     with JOBS_LOCK:
-        JOBS[job_id] = {"status": "queued", "progress": 0, "created": time.time()}
+        now = time.time()
+        JOBS[job_id] = {"status": "queued", "progress": 0, "created": now, "updated": now}
     job_copy = job.model_copy(deep=True)
     asyncio.create_task(_process_compose_from_urls_job(job_id, job_copy))
     return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}
@@ -2171,6 +2221,7 @@ async def compose_from_urls_async(job: ComposeFromUrlsJob):
 
 @app.get("/jobs/{job_id}")
 async def job_status(job_id: str):
+    cleanup_old_jobs()
     with JOBS_LOCK:
         data = JOBS.get(job_id)
     if data is None:
@@ -2184,7 +2235,7 @@ async def job_status(job_id: str):
 async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
     video_urls: List[str] = []
     audio_urls: List[str] = []
-    primary_video_url: Optional[str] = None
+    has_valid_video_keyframe = False
     max_dur = 0
     for track in job.tracks:
         for keyframe in track.keyframes:
@@ -2198,13 +2249,12 @@ async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
                 if track.type == "video":
                     video_urls.append(str(keyframe.url))
                     if duration_value and duration_value > 0:
-                        if primary_video_url is None:
-                            primary_video_url = str(keyframe.url)
+                        has_valid_video_keyframe = True
                 elif track.type == "audio":
                     audio_urls.append(str(keyframe.url))
     if not video_urls:
         raise HTTPException(status_code=400, detail="No video URLs found in tracks")
-    if primary_video_url is None:
+    if not has_valid_video_keyframe:
         raise HTTPException(status_code=400, detail="No valid video keyframes with URLs found in tracks")
     if max_dur <= 0:
         raise HTTPException(status_code=400, detail="At least one keyframe must include a duration")
@@ -2212,8 +2262,47 @@ async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
     check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="tracks_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
-        v_in = work / "video.mp4"
-        await _download_to(primary_video_url, v_in, None)
+        video_paths: List[Path] = []
+        for index, url in enumerate(video_urls):
+            v_path = work / f"video_{index:03d}.mp4"
+            await _download_to(url, v_path, None)
+            video_paths.append(v_path)
+
+        if len(video_paths) == 1:
+            v_in = video_paths[0]
+        else:
+            concat_list = work / "videos.txt"
+            with concat_list.open("w", encoding="utf-8") as handle:
+                for path in video_paths:
+                    safe_path = path.as_posix().replace("'", "'\\''")
+                    handle.write(f"file '{safe_path}'\n")
+            v_in = work / "video_concat.mp4"
+            concat_log = work / "ffmpeg_concat.log"
+            concat_cmd = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+                str(v_in),
+            ]
+            with concat_log.open("wb") as lf:
+                concat_code = run_ffmpeg_with_timeout(concat_cmd, lf)
+            save_log(concat_log, "compose-tracks-concat")
+            if concat_code != 0 or not v_in.exists():
+                logger.error("compose-from-tracks concat failed")
+                _flush_logs()
+                raise HTTPException(status_code=500, detail="Failed to combine video tracks")
         a_ins: List[Path] = []
         for i, url in enumerate(audio_urls):
             p = work / f"aud_{i:03d}.bin"

@@ -927,6 +927,106 @@ def test_compose_from_tracks_rejects_non_positive_duration(patched_app):
     assert exc.value.status_code == 400
 
 
+def test_compose_from_tracks_concats_multiple_videos(patched_app, monkeypatch):
+    download_calls: List[str] = []
+
+    async def tracking_download(url: str, dest: Path, headers=None, max_retries: int = 3, chunk_size: int = 1024 * 1024, client=None):
+        download_calls.append(url)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(f"content from {url}".encode("utf-8"))
+
+    commands: List[List[str]] = []
+
+    def fake_run_ffmpeg_with_timeout(cmd: List[str], log_handle) -> int:
+        commands.append(list(cmd))
+        output_path = None
+        for token in reversed(cmd):
+            if isinstance(token, str) and not token.startswith("-"):
+                output_path = Path(token)
+                break
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"video")
+        try:
+            log_handle.write(b"log")
+        except TypeError:
+            log_handle.write("log")
+        return 0
+
+    monkeypatch.setattr(patched_app, "_download_to", tracking_download)
+    monkeypatch.setattr(patched_app, "run_ffmpeg_with_timeout", fake_run_ffmpeg_with_timeout)
+
+    job = patched_app.TracksComposeJob(
+        tracks=[
+            patched_app.Track(
+                id="video1",
+                type="video",
+                keyframes=[
+                    patched_app.Keyframe(url="https://example.com/video1.mp4", timestamp=0, duration=4000),
+                    patched_app.Keyframe(url="https://example.com/video2.mp4", timestamp=4000, duration=4000),
+                ],
+            ),
+            patched_app.Track(
+                id="audio1",
+                type="audio",
+                keyframes=[patched_app.Keyframe(url="https://example.com/audio.mp3", timestamp=0, duration=8000)],
+            ),
+        ],
+        width=640,
+        height=360,
+        fps=24,
+    )
+
+    result = asyncio.run(patched_app.compose_from_tracks(job, as_json=True))
+
+    assert result["ok"] is True
+    assert download_calls[:2] == [
+        "https://example.com/video1.mp4",
+        "https://example.com/video2.mp4",
+    ]
+    assert any("concat" in cmd for cmd in commands)
+
+
+def test_cleanup_old_jobs_removes_finished_entries(patched_app):
+    with patched_app.JOBS_LOCK:
+        patched_app.JOBS.clear()
+        patched_app.JOBS["expired"] = {
+            "status": "finished",
+            "created": time.time() - 7200,
+        }
+        patched_app.JOBS["active"] = {
+            "status": "processing",
+            "created": time.time() - 7200,
+        }
+        patched_app.JOBS["fresh"] = {
+            "status": "finished",
+            "created": time.time(),
+        }
+
+    patched_app.cleanup_old_jobs(max_age_seconds=3600)
+
+    with patched_app.JOBS_LOCK:
+        assert "expired" not in patched_app.JOBS
+        assert "fresh" in patched_app.JOBS
+        assert "active" in patched_app.JOBS
+
+
+def test_rate_limiter_cleanup_removes_stale_identifiers(patched_app):
+    limiter = patched_app.RateLimiter(10)
+    now = patched_app.datetime.now(patched_app.timezone.utc)
+    stale = now - patched_app.timedelta(minutes=120)
+
+    with limiter._lock:
+        limiter._limits["old"] = [stale]
+        limiter._limits["fresh"] = [now]
+
+    limiter.cleanup_old_identifiers(max_age_minutes=60)
+
+    with limiter._lock:
+        assert "old" not in limiter._limits
+        assert "fresh" in limiter._limits
+
+
 def test_video_concat_from_urls_as_json(patched_app):
     job = patched_app.ConcatJob(
         clips=[
