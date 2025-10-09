@@ -656,13 +656,27 @@ def render_settings_page(
     active_files_text = html.escape(str(active_files))
     expired_files_text = html.escape(str(expired_files))
     quota_text = html.escape(quota_display)
+    api_require_key = API_KEYS.is_required()
+    api_status_text = "Enabled" if api_require_key else "Disabled"
+    api_note = (
+        "API requests currently require a valid key."
+        if api_require_key
+        else "Requests are open without a key. Enable protection to restrict access."
+    )
+    api_note_text = html.escape(api_note)
+    api_status_html = html.escape(api_status_text)
+    api_checkbox_state = "checked" if api_require_key else ""
+    api_help_text = html.escape(
+        "Clients must provide X-API-Key header or api_key query when enabled."
+    )
     two_factor_enabled = UI_AUTH.is_two_factor_enabled()
     two_factor_status_text = "Enabled" if two_factor_enabled else "Disabled"
-    two_factor_note = (
-        "One-time codes are required when signing in."
-        if two_factor_enabled
-        else "Protect the dashboard with an authenticator app."
-    )
+    if two_factor_enabled:
+        two_factor_note = "One-time codes are required when signing in."
+    elif not require_login:
+        two_factor_note = "Enable dashboard login to configure two-factor authentication."
+    else:
+        two_factor_note = "Protect the dashboard with an authenticator app."
     two_factor_note_text = html.escape(two_factor_note)
     secret_raw = UI_AUTH.get_two_factor_secret()
     grouped_secret = " ".join(
@@ -728,8 +742,8 @@ def render_settings_page(
         .checkbox-row {{ display: flex; align-items: center; gap: 10px; font-weight: 600; }}
         .checkbox-row input {{ width: auto; margin: 0; transform: scale(1.2); }}
         .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-top: 16px; }}
-        .section-pair {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; margin-bottom: 24px; }}
-        .section-pair section {{ margin-bottom: 0; }}
+        .settings-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; margin-bottom: 24px; }}
+        .settings-row section {{ margin-bottom: 0; }}
         .alert {{ padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }}
         .alert.success {{ background: #e8f5e9; color: #256029; border: 1px solid #c8e6c9; }}
         .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
@@ -742,9 +756,11 @@ def render_settings_page(
         .storage-table tr:not(:last-child) td, .storage-table tr:not(:last-child) th {{ border-bottom: 1px solid #edf2f7; }}
         .auth-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; align-items: stretch; margin-top: 16px; }}
         .auth-card {{ background: #fff; padding: 16px; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; display: flex; flex-direction: column; gap: 12px; }}
+        .auth-card.is-disabled {{ opacity: 0.55; }}
         .auth-card h3 {{ margin: 0; font-size: 16px; color: #1f2937; }}
         .auth-card p {{ margin: 0; font-size: 14px; color: #334155; }}
-        .auth-card form {{ margin-top: 0; display: flex; flex-direction: column; gap: 12px; }}
+        .auth-card form {{ margin-top: 0; display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }}
+        .auth-card button {{ width: fit-content; padding: 8px 14px; }}
         .credentials-block {{ margin-top: 20px; padding-top: 16px; border-top: 1px solid #e1e7ef; display: flex; flex-direction: column; gap: 12px; }}
         .credentials-block.is-disabled {{ opacity: 0.5; }}
         .credentials-grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
@@ -754,9 +770,9 @@ def render_settings_page(
         .secret-box {{ background: #f1f5f9; border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }}
         .secret-box span {{ font-size: 12px; color: #526079; text-transform: uppercase; letter-spacing: 0.1em; }}
         .secret-box code {{ font-size: 18px; letter-spacing: 2px; font-weight: 600; }}
-        .twofactor-actions {{ display: flex; flex-direction: column; gap: 12px; margin-top: 4px; }}
-        .twofactor-actions form {{ margin: 0; }}
-        .twofactor-actions button {{ width: 100%; }}
+        .twofactor-actions {{ display: flex; flex-direction: column; gap: 12px; margin-top: 4px; align-items: flex-start; }}
+        .twofactor-actions form {{ margin: 0; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }}
+        .twofactor-actions button {{ width: fit-content; }}
         .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e8f5e9; color: #256029; border-radius: 999px; font-weight: 600; width: fit-content; }}
         .help-text {{ font-size: 13px; color: #526079; }}
         .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
@@ -820,7 +836,21 @@ def render_settings_page(
         </div>
       </section>
 
-      <div class="section-pair">
+      <div class="settings-row">
+      <section>
+        <h2>API Authentication</h2>
+        <span class="status-pill">{api_status_html}</span>
+        <p>{api_note_text}</p>
+        <form method="post" action="/settings/api-auth">
+          <label class="checkbox-row" for="require_api_key_settings">
+            <input type="checkbox" id="require_api_key_settings" name="require_api_key" value="true" {api_checkbox_state} />
+            <span>Require API key for API requests</span>
+          </label>
+          <button type="submit">Save API authentication</button>
+          <p class="help-text">{api_help_text}</p>
+        </form>
+      </section>
+
       <section>
         <h2>Retention Settings</h2>
         <form method="post" action="/settings/retention" class="retention-form">
@@ -962,7 +992,6 @@ def render_api_keys_page(
         )
     alerts = "".join(alert_blocks)
 
-    checkbox_state = "checked" if require_key else ""
     disabled_class = "" if require_key else " is-disabled"
     disabled_attr = "" if require_key else " disabled"
 
@@ -1014,6 +1043,13 @@ def render_api_keys_page(
         if require_key
         else "API endpoints are open; enable authentication to restrict access."
     )
+    status_html = html.escape(status_text)
+    note_html = html.escape(note_text)
+    settings_notice = ""
+    if not require_key:
+        settings_notice = (
+            "<p class=\"help-text\">Enable API authentication in <a href=\"/settings\">Settings</a> before generating keys.</p>"
+        )
 
     return f"""
     <!doctype html>
@@ -1037,18 +1073,18 @@ def render_api_keys_page(
         button:hover {{ background: #0053a3; }}
         button.secondary {{ background: #9aa5b1; }}
         button.secondary:hover {{ background: #7c8794; }}
-        .checkbox-row {{ display: flex; align-items: center; gap: 10px; font-weight: 600; }}
-        .checkbox-row input {{ width: auto; margin: 0; transform: scale(1.2); }}
         .alert {{ padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }}
         .alert.success {{ background: #e8f5e9; color: #256029; border: 1px solid #c8e6c9; }}
         .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
-        .api-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 16px; }}
         .api-card {{ background: #fff; padding: 16px; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; display: flex; flex-direction: column; gap: 12px; }}
         .api-card h3 {{ margin: 0; font-size: 16px; color: #1f2937; }}
+        .api-card-header {{ display: flex; align-items: center; justify-content: space-between; }}
         .api-card p {{ margin: 0; font-size: 14px; color: #334155; }}
         .api-card form {{ margin-top: 0; display: flex; flex-direction: column; gap: 12px; }}
+        .api-card button {{ width: fit-content; }}
         .api-card.is-disabled {{ opacity: 0.5; }}
         .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e8f5e9; color: #256029; border-radius: 999px; font-weight: 600; width: fit-content; }}
+        .help-text {{ font-size: 13px; color: #526079; }}
         table {{ width: 100%; border-collapse: collapse; }}
         th, td {{ padding: 10px 12px; border-bottom: 1px solid #e5edf6; font-size: 14px; text-align: left; }}
         th {{ color: #1f2937; }}
@@ -1069,35 +1105,25 @@ def render_api_keys_page(
       {alerts}
 
       <section>
-        <h2>API Key Authentication</h2>
-        <div class="api-row">
-          <div class="api-card">
-            <h3>Status</h3>
-            <span class="status-pill">{status_text}</span>
-            <p>{note_text}</p>
-            <form method="post" action="/api-keys/require">
-              <label class="checkbox-row" for="require_api_key">
-                <input type="checkbox" id="require_api_key" name="require_api_key" value="true" {checkbox_state} />
-                <span>Require API key for requests</span>
-              </label>
-              <button type="submit">Save preference</button>
-            </form>
+        <h2>API Keys</h2>
+        <div class="api-card keys-card{disabled_class}">
+          <div class="api-card-header">
+            <h3>Authentication status</h3>
+            <span class="status-pill">{status_html}</span>
           </div>
-          <div class="api-card keys-card{disabled_class}">
-            <h3>API Keys</h3>
-            <p>Generate keys and distribute them to clients. Include the key in the <code>X-API-Key</code> header or <code>api_key</code> query parameter.</p>
-            <form method="post" action="/api-keys/generate">
-              <button type="submit"{disabled_attr}>Generate new key</button>
-            </form>
-            <table>
-              <thead>
-                <tr><th>Key</th><th>Created</th><th>Last used</th><th></th></tr>
-              </thead>
-              <tbody>
-                {''.join(rows)}
-              </tbody>
-            </table>
-          </div>
+          <p>{note_html}</p>
+          {settings_notice}
+          <form method="post" action="/api-keys/generate">
+            <button type="submit"{disabled_attr}>Generate new key</button>
+          </form>
+          <table>
+            <thead>
+              <tr><th>Key</th><th>Created</th><th>Last used</th><th></th></tr>
+            </thead>
+            <tbody>
+              {''.join(rows)}
+            </tbody>
+          </table>
         </div>
       </section>
     </body>
@@ -2540,6 +2566,23 @@ async def settings_logout(request: Request):
     response = RedirectResponse(url="/settings", status_code=303)
     response.delete_cookie(SESSION_COOKIE_NAME)
     return response
+
+
+@app.post("/settings/api-auth")
+async def settings_update_api_auth(request: Request):
+    if UI_AUTH.require_login and not is_authenticated(request):
+        query = urlencode({"error": "Authentication required to change API authentication"})
+        return RedirectResponse(url=f"/settings?{query}", status_code=303)
+
+    form = await request.form()
+    raw_value = form.get("require_api_key")
+    enable = False
+    if raw_value is not None:
+        enable = str(raw_value).lower() in {"true", "1", "on", "yes"}
+    API_KEYS.set_require_key(enable)
+    message = "API authentication enabled" if enable else "API authentication disabled"
+    query = urlencode({"message": message})
+    return RedirectResponse(url=f"/settings?{query}", status_code=303)
 
 
 @app.post("/settings/ui-auth")

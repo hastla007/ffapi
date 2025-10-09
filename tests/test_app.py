@@ -372,6 +372,10 @@ def test_settings_page_shows_auth_retention_and_storage_sections(patched_app):
     assert "twofactor-card is-disabled" in html
     assert "name=\"code\"" in html
     assert "Authentication code" in html
+    assert "Enable dashboard login to configure two-factor authentication." in html
+    assert "API Authentication" in html
+    assert "Require API key for API requests" in html
+    assert "Save API authentication" in html
     assert "Retention Settings" in html
     assert "Default retention (hours)" in html
     assert "name=\"retention_hours\"" in html
@@ -726,10 +730,12 @@ def test_api_keys_page_shows_controls(patched_app):
     status, _, body = call_app(patched_app.app, "GET", "/api-keys")
     assert status == 200
     html = body.decode()
-    assert "API Key Authentication" in html
-    assert "Require API key for requests" in html
+    assert "API Keys" in html
+    assert "Authentication status" in html
+    assert "Enable API authentication in <a href=\"/settings\">Settings</a>" in html
     assert "Generate new key" in html
     assert "No API keys yet" in html
+    assert "keys-card is-disabled" in html
 
 
 def test_api_keys_toggle_requires_login_when_ui_auth_enabled(patched_app):
@@ -747,6 +753,18 @@ def test_api_keys_toggle_requires_login_when_ui_auth_enabled(patched_app):
     assert status == 303
     assert headers["location"].startswith("/settings?next=%2Fapi-keys")
 
+    toggle_body = urlencode({"require_api_key": "true"}).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/api-auth",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=toggle_body,
+    )
+    assert status == 303
+    assert headers["location"].startswith("/settings?error=")
+    assert patched_app.API_KEYS.is_required() is False
+
     login_body = urlencode({"username": "admin", "password": "admin123"}).encode()
     status, headers, _ = call_app(
         patched_app.app,
@@ -762,7 +780,7 @@ def test_api_keys_toggle_requires_login_when_ui_auth_enabled(patched_app):
     status, headers, _ = call_app(
         patched_app.app,
         "POST",
-        "/api-keys/require",
+        "/settings/api-auth",
         headers=[
             ("Content-Type", "application/x-www-form-urlencoded"),
             ("Cookie", session_cookie),
@@ -770,7 +788,7 @@ def test_api_keys_toggle_requires_login_when_ui_auth_enabled(patched_app):
         body=toggle_body,
     )
     assert status == 303
-    assert headers["location"].startswith("/api-keys")
+    assert headers["location"].startswith("/settings?message=")
     assert patched_app.API_KEYS.is_required() is True
 
 
@@ -779,7 +797,7 @@ def test_api_key_generation_and_listing(patched_app):
     status, headers, _ = call_app(
         patched_app.app,
         "POST",
-        "/api-keys/require",
+        "/settings/api-auth",
         headers=[("Content-Type", "application/x-www-form-urlencoded")],
         body=toggle_body,
     )
@@ -808,6 +826,7 @@ def test_api_key_generation_and_listing(patched_app):
     assert status == 200
     html = body.decode()
     assert "New API key generated" in html
+    assert "keys-card is-disabled" not in html
     snippet = html.split("New API key generated", 1)[1]
     start = snippet.index("<code>") + len("<code>")
     end = snippet.index("</code>", start)
@@ -844,14 +863,15 @@ def test_api_requests_require_key_when_enabled(patched_app):
     assert result["ok"] is True
 
     toggle_body = urlencode({"require_api_key": "true"}).encode()
-    status, _, _ = call_app(
+    status, headers, _ = call_app(
         patched_app.app,
         "POST",
-        "/api-keys/require",
+        "/settings/api-auth",
         headers=[("Content-Type", "application/x-www-form-urlencoded")],
         body=toggle_body,
     )
     assert status == 303
+    assert headers["location"].startswith("/settings?message=")
 
     status, _, body = call_app(
         patched_app.app,
