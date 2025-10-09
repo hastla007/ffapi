@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block head_extra %}
+<style>
+  body {
+    background: #f8fafc;
+  }
+  .page-content {
+    background: #fff;
+  }
+  h2 {
+    margin-bottom: 10px;
+  }
+  h3 {
+    margin-top: 28px;
+  }
+  h4 {
+    margin-top: 30px;
+    margin-bottom: 15px;
+    color: #1f2937;
+    border-bottom: 2px solid #1d4ed8;
+    padding-bottom: 6px;
+  }
+  .intro {
+    background: #eff6ff;
+    padding: 20px;
+    border-radius: 10px;
+    margin-bottom: 28px;
+    border-left: 4px solid #1d4ed8;
+  }
+  .intro p {
+    margin: 8px 0;
+    line-height: 1.6;
+  }
+  .endpoint {
+    background: #f9fafb;
+    border-left: 4px solid #1d4ed8;
+    padding: 14px 16px;
+    margin-bottom: 14px;
+    border-radius: 6px;
+  }
+  .method {
+    display: inline-block;
+    background: #1d4ed8;
+    color: #fff;
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-weight: 600;
+    font-size: 12px;
+    margin-right: 12px;
+  }
+  .method.get {
+    background: #22c55e;
+  }
+  .method.post {
+    background: #0ea5e9;
+  }
+  .path {
+    display: inline-block;
+    font-family: "Courier New", monospace;
+    font-weight: 600;
+    color: #1f2937;
+  }
+  .desc {
+    margin-top: 8px;
+    color: #4b5563;
+    font-size: 14px;
+  }
+  .params {
+    margin-top: 10px;
+    padding: 10px;
+    background: #fff;
+    border-radius: 6px;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .param {
+    font-family: "Courier New", monospace;
+    color: #1d4ed8;
+    font-weight: 600;
+  }
+  .response {
+    margin-top: 10px;
+    padding: 10px;
+    background: #dcfce7;
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: "Courier New", monospace;
+  }
+  .example {
+    margin-top: 10px;
+    padding: 12px;
+    background: #fff7ed;
+    border-radius: 6px;
+    font-size: 12px;
+    font-family: "Courier New", monospace;
+    white-space: pre;
+    overflow-x: auto;
+  }
+</style>
+{% endblock %}
+{% block content %}
+  <h2>FFAPI Ultimate - API Documentation</h2>
+  <div class="intro">
+    <p><strong>Base URL:</strong> {{ base_url }}</p>
+    <p><strong>Response Formats:</strong> Most endpoints support both file responses and JSON (via <code>as_json=true</code> parameter)</p>
+    <p><strong>File Retention:</strong> Generated files are kept for {{ retention_days }} days</p>
+    <p><strong>Output Location:</strong> All generated files are available at <code>/files/{{ "{date}" }}/{{ "{filename}" }}</code></p>
+  </div>
+  {{ api_docs|safe }}
+{% endblock %}
