@@ -2809,6 +2809,7 @@ def downloads(
                     "name": name,
                     "rel": rel,
                     "size": size_mb,
+                    "size_display": f"{size_mb:.2f}",
                     "thumb": thumb_rel,
                     "mtime": stat.st_mtime,
                 }
@@ -2821,42 +2822,6 @@ def downloads(
     start = (page - 1) * page_size
     end = start + page_size
     current_entries = entries[start:end]
-
-    rows: List[str] = []
-    for item in current_entries:
-        thumb_html = (
-            f"<img src=\"{html.escape(item['thumb'], quote=True)}\" alt=\"Thumbnail\" class=\"thumb-image\" />"
-            if item["thumb"]
-            else "<span class=\"thumb-placeholder\">—</span>"
-        )
-        rows.append(
-            """
-            <tr>
-              <td>
-                <div class="file-entry">
-                  {thumb}
-                  <div class="file-meta">
-                    <a href="{href}">{name}</a>
-                    <div class="file-size">{size:.2f} MB</div>
-                  </div>
-                </div>
-              </td>
-              <td class="date-cell">{day}</td>
-            </tr>
-            """.format(
-                day=html.escape(item["day"]),
-                href=html.escape(item["rel"], quote=True),
-                name=html.escape(item["name"]),
-                size=item["size"],
-                thumb=thumb_html,
-            )
-        )
-
-    if not rows:
-        if total_items:
-            rows.append("<tr><td colspan='3'>No files match your filters.</td></tr>")
-        else:
-            rows.append("<tr><td colspan='3'>No files yet</td></tr>")
 
     def build_page_url(target_page: int) -> str:
         params: Dict[str, Any] = {"page": target_page}
@@ -2875,14 +2840,77 @@ def downloads(
     elif search:
         summary_text = "No files match your filters"
 
-    pagination_links = []
-    if page > 1:
-        pagination_links.append(
-            f"<a href=\"{html.escape(build_page_url(page - 1), quote=True)}\" class=\"pager-link\">&laquo; Prev</a>"
+    pagination = {
+        "page": page,
+        "total_pages": total_pages,
+        "has_prev": page > 1,
+        "has_next": page < total_pages,
+        "prev_url": build_page_url(page - 1) if page > 1 else None,
+        "next_url": build_page_url(page + 1) if page < total_pages else None,
+    }
+
+    clear_url = f"/downloads?page_size={page_size}" if search else None
+
+    if templates is not None:
+        context = {
+            "request": request,
+            "title": "Downloads",
+            "max_width": "1400px",
+            **nav_context("/downloads"),
+            "search": search,
+            "page_size": page_size,
+            "summary_text": summary_text,
+            "entries": current_entries,
+            "total_items": total_items,
+            "pagination": pagination,
+            "clear_url": clear_url,
+        }
+        return templates.TemplateResponse("downloads.html", context)
+
+    rows: List[str] = []
+    for item in current_entries:
+        thumb_html = (
+            f"<img src=\"{html.escape(item['thumb'], quote=True)}\" alt=\"Thumbnail\" class=\"thumb-image\" />"
+            if item["thumb"]
+            else "<span class=\"thumb-placeholder\">—</span>"
         )
-    if page < total_pages:
+        rows.append(
+            """
+            <tr>
+              <td>
+                <div class="file-entry">
+                  {thumb}
+                  <div class="file-meta">
+                    <a href="{href}">{name}</a>
+                    <div class="file-size">{size} MB</div>
+                  </div>
+                </div>
+              </td>
+              <td class="date-cell">{day}</td>
+            </tr>
+            """.format(
+                day=html.escape(item["day"]),
+                href=html.escape(item["rel"], quote=True),
+                name=html.escape(item["name"]),
+                size=item["size_display"],
+                thumb=thumb_html,
+            )
+        )
+
+    if not rows:
+        if total_items:
+            rows.append("<tr><td colspan='3'>No files match your filters.</td></tr>")
+        else:
+            rows.append("<tr><td colspan='3'>No files yet</td></tr>")
+
+    pagination_links = []
+    if pagination["has_prev"] and pagination["prev_url"]:
         pagination_links.append(
-            f"<a href=\"{html.escape(build_page_url(page + 1), quote=True)}\" class=\"pager-link\">Next &raquo;</a>"
+            f"<a href=\"{html.escape(pagination['prev_url'], quote=True)}\" class=\"pager-link\">&laquo; Prev</a>"
+        )
+    if pagination["has_next"] and pagination["next_url"]:
+        pagination_links.append(
+            f"<a href=\"{html.escape(pagination['next_url'], quote=True)}\" class=\"pager-link\">Next &raquo;</a>"
         )
     pagination_html = (
         "<div class=\"pagination\">" + "".join(pagination_links) + f"<span>Page {page} of {total_pages}</span></div>"
@@ -2890,10 +2918,10 @@ def downloads(
         else ""
     )
 
-    clear_link = (
-        f"<a class=\"clear-link\" href=\"/downloads?page_size={page_size}\">Clear</a>" if search else ""
-    )
     search_value = html.escape(search, quote=True)
+    clear_link = (
+        f"<a class=\"clear-link\" href=\"{html.escape(clear_url, quote=True)}\">Clear</a>" if clear_url else ""
+    )
 
     nav_html = fallback_nav_html("/downloads")
     html_content = f"""
@@ -2988,22 +3016,61 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
     end = start + page_size
     current_entries = entries[start:end]
 
+    def build_page_url(target_page: int) -> str:
+        params: Dict[str, Any] = {"page": target_page}
+        if page_size != 25:
+            params["page_size"] = page_size
+        query = urlencode(params)
+        return f"/logs?{query}" if query else "/logs"
+
+    pagination = {
+        "page": page,
+        "total_pages": total_pages,
+        "has_prev": page > 1,
+        "has_next": page < total_pages,
+        "prev_url": build_page_url(page - 1) if page > 1 else None,
+        "next_url": build_page_url(page + 1) if page < total_pages else None,
+    }
+
+    display_entries = [
+        {
+            "day": item["day"],
+            "name": item["name"],
+            "operation": item["operation"],
+            "size_display": f"{item['size']:.1f}",
+            "path": item["path"],
+        }
+        for item in current_entries
+    ]
+
+    if templates is not None:
+        context = {
+            "request": request,
+            "title": "FFmpeg Logs",
+            "max_width": "1400px",
+            **nav_context("/logs"),
+            "entries": display_entries,
+            "total_items": total_items,
+            "pagination": pagination,
+        }
+        return templates.TemplateResponse("logs.html", context)
+
     rows: List[str] = []
-    for item in current_entries:
+    for item in display_entries:
         rows.append(
             """
             <tr>
               <td>{day}</td>
               <td>{name}</td>
               <td>{operation}</td>
-              <td>{size:.1f} KB</td>
+              <td>{size} KB</td>
               <td><a href="/logs/view?path={path}" target="_blank">View</a></td>
             </tr>
             """.format(
                 day=html.escape(item["day"]),
                 name=html.escape(item["name"]),
                 operation=html.escape(item["operation"]),
-                size=item["size"],
+                size=item["size_display"],
                 path=html.escape(item["path"], quote=True),
             )
         )
@@ -3011,19 +3078,14 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
     if not rows:
         rows.append("<tr><td colspan='5'>No logs yet</td></tr>")
 
-    def build_page_url(target_page: int) -> str:
-        params = {"page": target_page, "page_size": page_size}
-        query = urlencode(params)
-        return f"/logs?{query}" if query else "/logs"
-
     pagination_links = []
-    if page > 1:
+    if pagination["has_prev"] and pagination["prev_url"]:
         pagination_links.append(
-            f"<a href=\"{html.escape(build_page_url(page - 1), quote=True)}\" class=\"pager-link\">&laquo; Prev</a>"
+            f"<a href=\"{html.escape(pagination['prev_url'], quote=True)}\" class=\"pager-link\">&laquo; Prev</a>"
         )
-    if page < total_pages:
+    if pagination["has_next"] and pagination["next_url"]:
         pagination_links.append(
-            f"<a href=\"{html.escape(build_page_url(page + 1), quote=True)}\" class=\"pager-link\">Next &raquo;</a>"
+            f"<a href=\"{html.escape(pagination['next_url'], quote=True)}\" class=\"pager-link\">Next &raquo;</a>"
         )
     pagination_html = (
         "<div class=\"pagination\">" + "".join(pagination_links) + f"<span>Page {page} of {total_pages}</span></div>"
@@ -3132,6 +3194,21 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
     # Current time
     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    if templates is not None:
+        context = {
+            "request": request,
+            "title": "FFmpeg Info",
+            "max_width": "1400px",
+            **nav_context("/ffmpeg"),
+            "version_output": version_output,
+            "app_logs": app_logs,
+            "log_info": log_info,
+            "auto_refresh": auto_refresh,
+            "refresh_status": refresh_status,
+            "current_time": current_time,
+        }
+        return templates.TemplateResponse("ffmpeg.html", context)
+
     version_output_safe = html.escape(version_output)
     app_logs_safe = html.escape(app_logs)
     log_info_safe = html.escape(log_info)
@@ -3155,20 +3232,20 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
         .main-nav a {{ color: #0066cc; text-decoration: none; }}
         .main-nav a:hover {{ text-decoration: underline; }}
         .section {{ margin-bottom: 40px; }}
-        .logs {{ 
-          height: 600px; 
-          overflow-y: scroll; 
-          background: #1e1e1e; 
-          color: #d4d4d4; 
+        .logs {{
+          height: 600px;
+          overflow-y: scroll;
+          background: #1e1e1e;
+          color: #d4d4d4;
           overflow-x: auto;
         }}
         .controls {{ margin-bottom: 15px; }}
-        .btn {{ 
-          background: #0066cc; 
-          color: white; 
-          padding: 8px 16px; 
-          border: none; 
-          border-radius: 4px; 
+        .btn {{
+          background: #0066cc;
+          color: white;
+          padding: 8px 16px;
+          border: none;
+          border-radius: 4px;
           cursor: pointer;
           margin-right: 10px;
           text-decoration: none;
@@ -3178,10 +3255,10 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
         .btn.secondary {{ background: #666; }}
         .btn.secondary:hover {{ background: #555; }}
         .info {{ color: #666; font-size: 13px; margin-bottom: 10px; }}
-        .status {{ 
-          padding: 6px 12px; 
-          background: #e8f4f8; 
-          border-radius: 4px; 
+        .status {{
+          padding: 6px 12px;
+          background: #e8f4f8;
+          border-radius: 4px;
           display: inline-block;
           margin-left: 10px;
           font-size: 13px;
@@ -3193,12 +3270,12 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
       <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
 {nav_html}
       <h2>FFmpeg & Container Information</h2>
-      
+
       <div class="section">
         <h3>FFmpeg Version & Build</h3>
         <pre>{version_output_safe}</pre>
       </div>
-      
+
       <div class="section">
         <h3>Application Logs (Docker Container Output - Last 1000 lines)</h3>
         <div class="controls">
@@ -4128,33 +4205,35 @@ def metrics_dashboard(request: Request):
     if redirect:
         return redirect
     snapshot = METRICS.snapshot()
-    endpoints_html = []
+    endpoint_rows = []
     for path, stats in sorted(snapshot["per_endpoint"].items()):
-        success_rate = stats.get("success_rate", 0.0) * 100.0
-        endpoints_html.append(
-            "<tr><td>{path}</td><td>{success}</td><td>{failure}</td><td>{avg:.2f} ms</td><td>{rate:.1f}%</td></tr>".format(
-                path=html.escape(path),
-                success=int(stats.get("success", 0)),
-                failure=int(stats.get("failure", 0)),
-                avg=stats.get("avg_duration_ms", 0.0),
-                rate=success_rate,
-            )
+        endpoint_rows.append(
+            {
+                "path": path,
+                "success": int(stats.get("success", 0)),
+                "failure": int(stats.get("failure", 0)),
+                "avg_duration": stats.get("avg_duration_ms", 0.0),
+                "success_percent": stats.get("success_rate", 0.0) * 100.0,
+            }
         )
 
-    if not endpoints_html:
-        endpoints_html.append(
-            "<tr><td colspan='5'>No requests recorded yet</td></tr>"
+    if not endpoint_rows:
+        endpoint_rows.append(
+            {
+                "path": "",
+                "success": None,
+                "failure": None,
+                "avg_duration": None,
+                "success_percent": None,
+            }
         )
 
-    errors_html = []
-    for name, count in sorted(snapshot["errors"].items(), key=lambda item: item[0]):
-        errors_html.append(
-            "<tr><td>{name}</td><td>{count}</td></tr>".format(
-                name=html.escape(name), count=int(count)
-            )
-        )
-    if not errors_html:
-        errors_html.append("<tr><td colspan='2'>No errors recorded</td></tr>")
+    error_rows = [
+        {"name": name, "count": int(count)}
+        for name, count in sorted(snapshot["errors"].items(), key=lambda item: item[0])
+    ]
+    if not error_rows:
+        error_rows.append({"name": "No errors recorded", "count": None})
 
     queue = snapshot["queue"]
     recent = snapshot["recent"]
@@ -4165,6 +4244,47 @@ def metrics_dashboard(request: Request):
         else "No recent activity"
     )
     recent_percent = f"{recent_rate * 100.0:.1f}%" if recent_rate is not None else "-"
+
+    if templates is not None:
+        context = {
+            "request": request,
+            "title": "Operational Metrics",
+            "max_width": "1400px",
+            **nav_context("/metrics"),
+            "endpoint_rows": endpoint_rows,
+            "error_rows": error_rows,
+            "queue": queue,
+            "recent": recent,
+            "recent_summary": recent_summary,
+            "recent_percent": recent_percent,
+        }
+        return templates.TemplateResponse("metrics.html", context)
+
+    endpoints_html = []
+    for row in endpoint_rows:
+        if row["success"] is None:
+            endpoints_html.append("<tr><td colspan='5'>No requests recorded yet</td></tr>")
+            continue
+        endpoints_html.append(
+            "<tr><td>{path}</td><td>{success}</td><td>{failure}</td><td>{avg:.2f} ms</td><td>{rate:.1f}%</td></tr>".format(
+                path=html.escape(row["path"]),
+                success=row["success"],
+                failure=row["failure"],
+                avg=row["avg_duration"],
+                rate=row["success_percent"],
+            )
+        )
+
+    errors_html = []
+    for row in error_rows:
+        if row["count"] is None:
+            errors_html.append("<tr><td colspan='2'>No errors recorded</td></tr>")
+        else:
+            errors_html.append(
+                "<tr><td>{name}</td><td>{count}</td></tr>".format(
+                    name=html.escape(row["name"]), count=row["count"]
+                )
+            )
 
     nav_html = fallback_nav_html("/metrics")
     html_content = f"""
@@ -5322,54 +5442,87 @@ def jobs_history(
     end = start + page_size
     jobs_slice = all_jobs[start:end]
 
-    rows: List[str] = []
+    status_classes = {
+        "finished": "success",
+        "failed": "error",
+        "processing": "warning",
+        "queued": "info",
+    }
+    job_rows = []
     for job in jobs_slice:
         job_id = job.get("job_id", "-")
         status_val = job.get("status", "unknown")
         created_ts = job.get("created") or 0
         created = datetime.fromtimestamp(created_ts, tz=timezone.utc)
         duration_ms = job.get("duration_ms")
-        duration_text = f"{(duration_ms or 0) / 1000:.1f}s" if duration_ms else "—"
-        status_class = {
-            "finished": "success",
-            "failed": "error",
-            "processing": "warning",
-            "queued": "info",
-        }.get(status_val, "")
-        rows.append(
-            """
-            <tr>
-                <td><code>{job_id}</code></td>
-                <td><span class="status {status_class}">{status_val}</span></td>
-                <td>{created}</td>
-                <td>{duration}</td>
-                <td><a href="/jobs/{job_id}" target="_blank">View</a></td>
-            </tr>
-            """.format(
-                job_id=html.escape(str(job_id)),
-                status_class=status_class,
-                status_val=html.escape(str(status_val)),
-                created=created.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                duration=duration_text,
-            )
+        job_rows.append(
+            {
+                "job_id": str(job_id),
+                "status": str(status_val),
+                "status_class": status_classes.get(status_val, ""),
+                "created": created.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "duration": f"{(duration_ms or 0) / 1000:.1f}s" if duration_ms else "—",
+            }
         )
 
-    if not rows:
-        rows.append("<tr><td colspan='5'>No jobs found</td></tr>")
-
-    filters: List[str] = []
+    filters_data = []
     for filter_status in [None, "finished", "failed", "processing", "queued"]:
         label = filter_status or "All"
         params = {"page": 1}
         if filter_status:
             params["status"] = filter_status
         query = urlencode(params)
-        css_class = "active" if filter_status == status else ""
-        filters.append(
-            f"<a href='/jobs?{query}' class='filter-link {css_class}'>{html.escape(label)}</a>"
+        filters_data.append(
+            {
+                "label": label,
+                "url": f"/jobs?{query}",
+                "active": filter_status == status,
+            }
         )
 
-    pagination = f"Page {page} of {total_pages}"
+    pagination_text = f"Page {page} of {total_pages}"
+
+    if templates is not None:
+        context = {
+            "request": request,
+            "title": "Job History",
+            "max_width": "1400px",
+            **nav_context("/jobs"),
+            "jobs": job_rows,
+            "filters": filters_data,
+            "pagination_text": pagination_text,
+        }
+        return templates.TemplateResponse("jobs.html", context)
+
+    rows: List[str] = []
+    for job in job_rows:
+        rows.append(
+            """
+            <tr>
+                <td><code>{job_id}</code></td>
+                <td><span class="status {status_class}">{status}</span></td>
+                <td>{created}</td>
+                <td>{duration}</td>
+                <td><a href="/jobs/{job_id}" target="_blank">View</a></td>
+            </tr>
+            """.format(
+                job_id=html.escape(job["job_id"]),
+                status_class=job["status_class"],
+                status=html.escape(job["status"]),
+                created=job["created"],
+                duration=job["duration"],
+            )
+        )
+
+    if not rows:
+        rows.append("<tr><td colspan='5'>No jobs found</td></tr>")
+
+    filter_links = []
+    for item in filters_data:
+        css_class = "active" if item["active"] else ""
+        filter_links.append(
+            f"<a href='{html.escape(item['url'], quote=True)}' class='filter-link {css_class}'>{html.escape(item['label'])}</a>"
+        )
 
     nav_html = fallback_nav_html("/jobs", indent="        ")
     html_content = f"""
@@ -5405,7 +5558,7 @@ def jobs_history(
         <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
 {nav_html}
         <h2>Job History</h2>
-        <div class="filters">{''.join(filters)}</div>
+        <div class="filters">{''.join(filter_links)}</div>
         <table>
             <thead>
                 <tr>
@@ -5418,7 +5571,7 @@ def jobs_history(
             </thead>
             <tbody>{''.join(rows)}</tbody>
         </table>
-        <p class="pagination">{pagination}</p>
+        <p class="pagination">{pagination_text}</p>
     </body>
     </html>
     """
