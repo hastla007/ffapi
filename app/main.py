@@ -394,7 +394,10 @@ async def metrics_middleware(request, call_next):
 @app.middleware("http")
 async def security_headers_middleware(request, call_next):
     response = await call_next(request)
-    response.headers.setdefault("Content-Security-Policy", "default-src 'self'")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
+    )
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     return response
@@ -698,6 +701,10 @@ def run_ffmpeg_with_timeout(cmd: List[str], log_handle) -> int:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
         logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
         _flush_logs()
         raise HTTPException(status_code=504, detail="Processing timeout")
@@ -1714,6 +1721,13 @@ class ComposeFromUrlsJob(BaseModel):
             raise ValueError(f"bgm_volume must be between 0 and 5, got {value}")
         return value
 
+    @field_validator("duration_ms")
+    @classmethod
+    def validate_duration(cls, value: int) -> int:
+        if not (1 <= value <= 3_600_000):
+            raise ValueError("duration_ms must be 1-3600000")
+        return value
+
     @field_validator("video_url", "audio_url", "bgm_url", mode="before")
     @classmethod
     def validate_url_scheme(cls, value):
@@ -2193,9 +2207,6 @@ async def video_concat_alias(job: ConcatAliasJob, as_json: bool = False):
 
 
 async def _compose_from_urls_impl(job: ComposeFromUrlsJob) -> Dict[str, str]:
-    if job.duration_ms <= 0 or job.duration_ms > 3600000:
-        raise HTTPException(status_code=400, detail="invalid duration_ms (1..3600000)")
-
     check_disk_space(WORK_DIR)
 
     with TemporaryDirectory(prefix="cfu_", dir=str(WORK_DIR)) as workdir:

@@ -139,7 +139,10 @@ def test_security_headers_and_generated_request_id(app_module):
     app_module.RATE_LIMITER.reset()
     status, headers, body = call_app(app_module.app, "GET", "/health")
     assert status == 200
-    assert headers["content-security-policy"] == "default-src 'self'"
+    assert (
+        headers["content-security-policy"]
+        == "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+    )
     assert headers["x-content-type-options"] == "nosniff"
     assert headers["x-frame-options"] == "DENY"
     assert "x-request-id" in headers
@@ -972,6 +975,14 @@ def test_compose_from_urls_rejects_non_http_urls(patched_app):
         patched_app.ComposeFromUrlsJob(video_url="ftp://example.com/video.mp4")
 
 
+def test_compose_from_urls_rejects_invalid_duration(patched_app):
+    with pytest.raises(ValidationError):
+        patched_app.ComposeFromUrlsJob(
+            video_url="https://example.com/video.mp4",
+            duration_ms=0,
+        )
+
+
 def test_compose_from_tracks_as_json(patched_app):
     job = patched_app.TracksComposeJob(
         tracks=[
@@ -1266,7 +1277,7 @@ def test_run_ffmpeg_with_timeout_handles_timeout(app_module, monkeypatch):
     assert exc.value.status_code == 504
     assert terminated is True
     assert killed is True
-    assert wait_calls == [app_module.FFMPEG_TIMEOUT_SECONDS, 5]
+    assert wait_calls == [app_module.FFMPEG_TIMEOUT_SECONDS, 5, 1]
 
 
 def test_probe_from_urls_returns_json(patched_app):
