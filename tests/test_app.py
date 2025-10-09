@@ -367,7 +367,9 @@ def test_settings_page_shows_auth_retention_and_storage_sections(patched_app):
     assert "button type=\"submit\" disabled" in html
     assert "Retention Settings" in html
     assert "Default retention (hours)" in html
+    assert "name=\"retention_hours\"" in html
     assert "Performance Settings" in html
+    assert "name=\"rate_limit_rpm\"" in html
     assert "Storage Management" in html
     assert "Total storage used" in html
 
@@ -447,6 +449,116 @@ def test_settings_rejects_short_password(patched_app):
     )
     assert status == 400
     assert "Password must be at least 6 characters long" in response_body.decode()
+
+
+def test_retention_settings_update_changes_value(patched_app):
+    original_days = patched_app.RETENTION_DAYS
+    try:
+        body = urlencode({"retention_hours": "48"}).encode()
+        status, headers, _ = call_app(
+            patched_app.app,
+            "POST",
+            "/settings/retention",
+            headers=[("Content-Type", "application/x-www-form-urlencoded")],
+            body=body,
+        )
+        assert status == 303
+        assert headers["location"].startswith("/settings")
+        assert pytest.approx(patched_app.RETENTION_DAYS, rel=1e-6) == pytest.approx(2.0, rel=1e-6)
+        assert pytest.approx(patched_app.settings.RETENTION_DAYS, rel=1e-6) == pytest.approx(2.0, rel=1e-6)
+    finally:
+        patched_app.RETENTION_DAYS = original_days
+        patched_app.settings.RETENTION_DAYS = original_days
+
+
+def test_retention_settings_rejects_invalid_hours(patched_app):
+    original_days = patched_app.RETENTION_DAYS
+    try:
+        body = urlencode({"retention_hours": "0"}).encode()
+        status, _, response_body = call_app(
+            patched_app.app,
+            "POST",
+            "/settings/retention",
+            headers=[("Content-Type", "application/x-www-form-urlencoded")],
+            body=body,
+        )
+        assert status == 400
+        html = response_body.decode()
+        assert "Retention must be between 1 hour" in html
+        assert pytest.approx(patched_app.RETENTION_DAYS, rel=1e-6) == pytest.approx(original_days, rel=1e-6)
+        assert pytest.approx(patched_app.settings.RETENTION_DAYS, rel=1e-6) == pytest.approx(original_days, rel=1e-6)
+    finally:
+        patched_app.RETENTION_DAYS = original_days
+        patched_app.settings.RETENTION_DAYS = original_days
+
+
+def test_performance_settings_update_changes_globals(patched_app):
+    original_rpm = patched_app.RATE_LIMITER.current_limit()
+    original_timeout = patched_app.FFMPEG_TIMEOUT_SECONDS
+    original_chunk = patched_app.UPLOAD_CHUNK_SIZE
+    original_file_mb = patched_app.MAX_FILE_SIZE_MB
+    try:
+        body = urlencode(
+            {
+                "rate_limit_rpm": "120",
+                "ffmpeg_timeout_minutes": "15",
+                "upload_chunk_mb": "2.5",
+                "max_file_size_mb": "5",
+            }
+        ).encode()
+        status, headers, _ = call_app(
+            patched_app.app,
+            "POST",
+            "/settings/performance",
+            headers=[("Content-Type", "application/x-www-form-urlencoded")],
+            body=body,
+        )
+        assert status == 303
+        assert headers["location"].startswith("/settings")
+        assert patched_app.RATE_LIMITER.current_limit() == 120
+        assert patched_app.settings.RATE_LIMIT_REQUESTS_PER_MINUTE == 120
+        assert patched_app.FFMPEG_TIMEOUT_SECONDS == 900
+        assert patched_app.settings.FFMPEG_TIMEOUT_SECONDS == 900
+        expected_chunk = int(2.5 * 1024 * 1024)
+        assert patched_app.UPLOAD_CHUNK_SIZE == expected_chunk
+        assert patched_app.settings.UPLOAD_CHUNK_SIZE == patched_app.UPLOAD_CHUNK_SIZE
+        assert patched_app.MAX_FILE_SIZE_MB == 5
+        assert patched_app.MAX_FILE_SIZE_BYTES == 5 * 1024 * 1024
+        assert patched_app.settings.MAX_FILE_SIZE_MB == 5
+    finally:
+        patched_app.RATE_LIMITER.update_limit(original_rpm)
+        patched_app.settings.RATE_LIMIT_REQUESTS_PER_MINUTE = original_rpm
+        patched_app.FFMPEG_TIMEOUT_SECONDS = original_timeout
+        patched_app.settings.FFMPEG_TIMEOUT_SECONDS = original_timeout
+        patched_app.UPLOAD_CHUNK_SIZE = original_chunk
+        patched_app.settings.UPLOAD_CHUNK_SIZE = original_chunk
+        patched_app.MAX_FILE_SIZE_MB = original_file_mb
+        patched_app.MAX_FILE_SIZE_BYTES = original_file_mb * 1024 * 1024
+        patched_app.settings.MAX_FILE_SIZE_MB = original_file_mb
+
+
+def test_performance_settings_rejects_bad_values(patched_app):
+    original_rpm = patched_app.RATE_LIMITER.current_limit()
+    body = urlencode(
+        {
+            "rate_limit_rpm": "0",
+            "ffmpeg_timeout_minutes": "15",
+            "upload_chunk_mb": "2",
+            "max_file_size_mb": "5",
+        }
+    ).encode()
+    status, _, response_body = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/performance",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=body,
+    )
+    assert status == 400
+    html = response_body.decode()
+    assert "Rate Limit Rpm must be between 1 and 100000" in html
+    assert patched_app.RATE_LIMITER.current_limit() == original_rpm
+    assert patched_app.settings.RATE_LIMIT_REQUESTS_PER_MINUTE == original_rpm
 
 
 def test_concurrent_requests_handle_independent_state(patched_app):

@@ -121,6 +121,15 @@ class RateLimiter:
         with self._lock:
             self._limits.clear()
 
+    def update_limit(self, requests_per_minute: int) -> None:
+        with self._lock:
+            self._rpm = max(requests_per_minute, 1)
+            self._limits.clear()
+
+    def current_limit(self) -> int:
+        with self._lock:
+            return self._rpm
+
 
 @dataclass
 class Settings:
@@ -423,10 +432,26 @@ def render_settings_page(
         </form>
         """
 
+    def format_number(value: float, digits: int = 2) -> str:
+        text = f"{value:.{digits}f}"
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text
+
     retention_hours = RETENTION_DAYS * 24
-    rate_limit_rpm = settings.RATE_LIMIT_REQUESTS_PER_MINUTE
+    retention_hours_display = format_number(retention_hours)
+    retention_days_display = format_number(RETENTION_DAYS)
+    rate_limit_rpm = RATE_LIMITER.current_limit()
     ffmpeg_timeout_minutes = FFMPEG_TIMEOUT_SECONDS / 60
+    ffmpeg_timeout_display = format_number(ffmpeg_timeout_minutes)
     upload_chunk_mb = UPLOAD_CHUNK_SIZE / (1024 * 1024)
+    upload_chunk_display = format_number(upload_chunk_mb)
+    retention_hours_value = html.escape(retention_hours_display)
+    retention_days_text = html.escape(retention_days_display)
+    rate_limit_value = html.escape(str(rate_limit_rpm))
+    ffmpeg_timeout_value = html.escape(ffmpeg_timeout_display)
+    upload_chunk_value = html.escape(upload_chunk_display)
+    max_file_size_value = html.escape(str(MAX_FILE_SIZE_MB))
 
     return f"""
     <!doctype html>
@@ -470,6 +495,12 @@ def render_settings_page(
         .credentials-grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
         .credentials-grid label {{ margin-bottom: 0; }}
         .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e8f5e9; color: #256029; border-radius: 999px; font-weight: 600; width: fit-content; }}
+        .card-form {{ background: #fff; padding: 16px; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; display: grid; gap: 12px; max-width: 420px; }}
+        .card-form.single {{ max-width: 320px; }}
+        .help-text {{ font-size: 13px; color: #526079; }}
+        .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
+        .field-card {{ background: #f9fbff; padding: 12px; border-radius: 8px; box-shadow: inset 0 0 0 1px #d6e2f1; display: grid; gap: 8px; }}
+        .field-card label {{ margin-bottom: 0; }}
       </style>
     </head>
     <body>
@@ -521,39 +552,86 @@ def render_settings_page(
 
       <section>
         <h2>Retention Settings</h2>
-        <div class="settings-grid">
-          <div class="storage-card">
-            <h3>Default retention (hours)</h3>
-            <p>{retention_hours}</p>
-            <span>Equivalent to {RETENTION_DAYS} day(s)</span>
-          </div>
-        </div>
+        <form method="post" action="/settings/retention" class="card-form single">
+          <label for="retention_hours">Default retention (hours)</label>
+          <input
+            id="retention_hours"
+            name="retention_hours"
+            type="number"
+            min="1"
+            max="8760"
+            step="0.5"
+            value="{retention_hours_value}"
+            required
+          />
+          <span class="help-text">Equivalent to {retention_days_text} day(s).</span>
+          <button type="submit">Update retention</button>
+        </form>
       </section>
 
       <section>
         <h2>Performance Settings</h2>
-        <div class="settings-grid">
-          <div class="storage-card">
-            <h3>Rate limit</h3>
-            <p>{rate_limit_rpm} rpm</p>
-            <span>Requests allowed per minute</span>
+        <form method="post" action="/settings/performance" class="card-form">
+          <div class="form-grid">
+            <div class="field-card">
+              <label for="rate_limit_rpm">Rate limit (requests/minute)</label>
+              <input
+                id="rate_limit_rpm"
+                name="rate_limit_rpm"
+                type="number"
+                min="1"
+                max="100000"
+                step="1"
+                value="{rate_limit_value}"
+                required
+              />
+              <span class="help-text">Requests allowed per minute.</span>
+            </div>
+            <div class="field-card">
+              <label for="ffmpeg_timeout_minutes">FFmpeg timeout (minutes)</label>
+              <input
+                id="ffmpeg_timeout_minutes"
+                name="ffmpeg_timeout_minutes"
+                type="number"
+                min="1"
+                max="720"
+                step="1"
+                value="{ffmpeg_timeout_value}"
+                required
+              />
+              <span class="help-text">Maximum processing duration.</span>
+            </div>
+            <div class="field-card">
+              <label for="upload_chunk_mb">Upload chunk size (MB)</label>
+              <input
+                id="upload_chunk_mb"
+                name="upload_chunk_mb"
+                type="number"
+                min="0.1"
+                max="512"
+                step="0.1"
+                value="{upload_chunk_value}"
+                required
+              />
+              <span class="help-text">Per-stream read buffer.</span>
+            </div>
+            <div class="field-card">
+              <label for="max_file_size_mb">File size limit (MB)</label>
+              <input
+                id="max_file_size_mb"
+                name="max_file_size_mb"
+                type="number"
+                min="1"
+                max="8192"
+                step="1"
+                value="{max_file_size_value}"
+                required
+              />
+              <span class="help-text">Maximum upload size.</span>
+            </div>
           </div>
-          <div class="storage-card">
-            <h3>FFmpeg timeout</h3>
-            <p>{ffmpeg_timeout_minutes:.0f} min</p>
-            <span>Maximum processing duration</span>
-          </div>
-          <div class="storage-card">
-            <h3>Upload chunk size</h3>
-            <p>{upload_chunk_mb:.1f} MB</p>
-            <span>Per-stream read buffer</span>
-          </div>
-          <div class="storage-card">
-            <h3>File size limit</h3>
-            <p>{MAX_FILE_SIZE_MB} MB</p>
-            <span>Maximum upload size</span>
-          </div>
-        </div>
+          <button type="submit">Update performance settings</button>
+        </form>
       </section>
 
       <section>
@@ -572,7 +650,7 @@ def render_settings_page(
           <div class=\"storage-card\">
             <h3>Expired files pending cleanup</h3>
             <p>{expired_files}</p>
-            <span>Older than {RETENTION_DAYS} days</span>
+            <span>Older than {retention_days_text} day(s)</span>
           </div>
           <div class=\"storage-card\">
             <h3>Storage quota limit</h3>
@@ -1108,11 +1186,12 @@ def run_ffmpeg_with_timeout(cmd: List[str], log_handle) -> int:
         _flush_logs()
         raise HTTPException(status_code=504, detail="Processing timeout")
 
-def cleanup_old_public(days: int = RETENTION_DAYS):
+def cleanup_old_public(days: Optional[float] = None) -> None:
     """Delete files older than specified days based on actual file modification time."""
-    if days <= 0:
+    retention_days = RETENTION_DAYS if days is None else days
+    if retention_days <= 0:
         return
-    cutoff_timestamp = time.time() - (days * 86400)  # days * seconds_per_day
+    cutoff_timestamp = time.time() - (retention_days * 86400)
     
     deleted_count = 0
     for child in PUBLIC_DIR.iterdir():
@@ -1148,7 +1227,9 @@ def cleanup_old_public(days: int = RETENTION_DAYS):
             logger.warning("Failed to remove empty directory %s: %s", child, exc)
     
     if deleted_count > 0:
-        logger.info(f"Cleanup: deleted {deleted_count} files older than {days} days")
+        logger.info(
+            "Cleanup: deleted %s files older than %s days", deleted_count, retention_days
+        )
 
 
 async def _periodic_public_cleanup():
@@ -2032,6 +2113,148 @@ async def settings_update_credentials(request: Request):
     response = RedirectResponse(url=f"/settings?{query}", status_code=303)
     response.delete_cookie(SESSION_COOKIE_NAME)
     return response
+
+
+@app.post("/settings/retention")
+async def settings_update_retention(request: Request):
+    form = await request.form()
+    authed = is_authenticated(request)
+    if UI_AUTH.require_login and not authed:
+        response = RedirectResponse(
+            url=f"/settings?{urlencode({'error': 'Authentication required to change retention'})}",
+            status_code=303,
+        )
+        response.delete_cookie(SESSION_COOKIE_NAME)
+        return response
+
+    raw_hours = str(form.get("retention_hours", "")).strip()
+    if not raw_hours:
+        storage = storage_management_snapshot()
+        html_content = render_settings_page(
+            storage,
+            error="Retention hours are required",
+            authenticated=authed,
+        )
+        return HTMLResponse(html_content, status_code=400)
+
+    try:
+        hours = float(raw_hours)
+    except ValueError:
+        storage = storage_management_snapshot()
+        html_content = render_settings_page(
+            storage,
+            error="Retention hours must be a number",
+            authenticated=authed,
+        )
+        return HTMLResponse(html_content, status_code=400)
+
+    if hours < 1 or hours > 24 * 365:
+        storage = storage_management_snapshot()
+        html_content = render_settings_page(
+            storage,
+            error="Retention must be between 1 hour and 8760 hours (365 days)",
+            authenticated=authed,
+        )
+        return HTMLResponse(html_content, status_code=400)
+
+    days = hours / 24
+    global RETENTION_DAYS
+    RETENTION_DAYS = days
+    settings.RETENTION_DAYS = days
+    cleanup_old_public()
+    formatted_hours = f"{hours:.1f}".rstrip("0").rstrip(".")
+    query = urlencode({"message": f"Retention updated to {formatted_hours} hour(s)"})
+    return RedirectResponse(url=f"/settings?{query}", status_code=303)
+
+
+@app.post("/settings/performance")
+async def settings_update_performance(request: Request):
+    form = await request.form()
+    authed = is_authenticated(request)
+    if UI_AUTH.require_login and not authed:
+        response = RedirectResponse(
+            url=f"/settings?{urlencode({'error': 'Authentication required to change performance settings'})}",
+            status_code=303,
+        )
+        response.delete_cookie(SESSION_COOKIE_NAME)
+        return response
+
+    errors: List[str] = []
+
+    def parse_int(name: str, minimum: int, maximum: int) -> Optional[int]:
+        raw_value = str(form.get(name, "")).strip()
+        if not raw_value:
+            errors.append(f"{name.replace('_', ' ').title()} is required")
+            return None
+        try:
+            value = int(raw_value)
+        except ValueError:
+            try:
+                float_value = float(raw_value)
+            except ValueError:
+                errors.append(f"{name.replace('_', ' ').title()} must be a number")
+                return None
+            if not float_value.is_integer():
+                errors.append(f"{name.replace('_', ' ').title()} must be a whole number")
+                return None
+            value = int(float_value)
+        if value < minimum or value > maximum:
+            errors.append(
+                f"{name.replace('_', ' ').title()} must be between {minimum} and {maximum}"
+            )
+            return None
+        return value
+
+    def parse_float(name: str, minimum: float, maximum: float) -> Optional[float]:
+        raw_value = str(form.get(name, "")).strip()
+        if not raw_value:
+            errors.append(f"{name.replace('_', ' ').title()} is required")
+            return None
+        try:
+            value = float(raw_value)
+        except ValueError:
+            errors.append(f"{name.replace('_', ' ').title()} must be a number")
+            return None
+        if value < minimum or value > maximum:
+            errors.append(
+                f"{name.replace('_', ' ').title()} must be between {minimum} and {maximum}"
+            )
+            return None
+        return value
+
+    rpm = parse_int("rate_limit_rpm", 1, 100000)
+    timeout_minutes = parse_float("ffmpeg_timeout_minutes", 1, 720)
+    chunk_mb = parse_float("upload_chunk_mb", 0.1, 512)
+    max_file_mb = parse_int("max_file_size_mb", 1, 8192)
+
+    if errors or rpm is None or timeout_minutes is None or chunk_mb is None or max_file_mb is None:
+        storage = storage_management_snapshot()
+        html_content = render_settings_page(
+            storage,
+            error="; ".join(errors) if errors else "Invalid performance settings",
+            authenticated=authed,
+        )
+        return HTMLResponse(html_content, status_code=400)
+
+    global FFMPEG_TIMEOUT_SECONDS, UPLOAD_CHUNK_SIZE, MAX_FILE_SIZE_MB, MAX_FILE_SIZE_BYTES
+
+    RATE_LIMITER.update_limit(rpm)
+    settings.RATE_LIMIT_REQUESTS_PER_MINUTE = rpm
+
+    FFMPEG_TIMEOUT_SECONDS = int(timeout_minutes * 60)
+    settings.FFMPEG_TIMEOUT_SECONDS = FFMPEG_TIMEOUT_SECONDS
+
+    upload_chunk_bytes = max(1, int(chunk_mb * 1024 * 1024))
+    UPLOAD_CHUNK_SIZE = upload_chunk_bytes
+    settings.UPLOAD_CHUNK_SIZE = upload_chunk_bytes
+
+    MAX_FILE_SIZE_MB = max_file_mb
+    MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+    settings.MAX_FILE_SIZE_MB = MAX_FILE_SIZE_MB
+
+    message = "Performance settings updated"
+    query = urlencode({"message": message})
+    return RedirectResponse(url=f"/settings?{query}", status_code=303)
 
 
 @app.get("/health")

@@ -6,6 +6,7 @@
 - `publish_file()` uses `shutil.move()` (works across devices / Docker volumes / Windows).
 - All `TemporaryDirectory(...)` calls use `dir=$WORK_DIR` (default `/data/work`) so temps are on the same volume.
 - **Fixed retention**: Files are deleted based on actual file age (modification time), not folder name. Files persist through restarts until they are truly RETENTION_DAYS old, and cleanup resumes automatically on startup and via a periodic background task.
+- **Runtime tuning**: Administrators can adjust retention windows, rate limits, FFmpeg timeouts, and upload limits directly from the `/settings` dashboard without restarting the service.
 - **Persistent FFmpeg logs**: All FFmpeg operations save logs to `/data/logs` for debugging.
 - **Application logging**: Container logs (stdout/stderr) are saved to `/data/logs/application.log` and viewable at `/ffmpeg` endpoint.
 
@@ -17,7 +18,7 @@
 - `/ffmpeg` - Display FFmpeg version and container logs (HTML)
 - `/documentation` - Complete API documentation (HTML)
 - `/metrics` - Operational dashboard with per-endpoint metrics
-- `/settings` - Settings page for UI auth and storage overview
+- `/settings` - Settings page for UI auth, runtime tuning, and storage overview
 - `/files/*` - Static file serving
 - `/image/to-mp4-loop` - Convert image to looping video
 - `/compose/from-binaries` - Compose video from uploaded files
@@ -46,7 +47,7 @@ docker compose up -d
 - `/logs` - View FFmpeg operation logs
 - `/ffmpeg` - Monitor container with live logs and FFmpeg version info (supports auto-refresh)
 - `/documentation` - Complete API reference with all endpoints and parameters
-- `/settings` - Toggle dashboard authentication and review storage usage
+- `/settings` - Toggle dashboard authentication, adjust retention/performance limits, and review storage usage
 
 Outputs persist in `./public` (mounted to `/data/public`).  
 Temporary work files live in `./work` (`/data/work`).  
