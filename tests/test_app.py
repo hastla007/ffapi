@@ -268,6 +268,7 @@ def app_module(tmp_path_factory: pytest.TempPathFactory):
     module = importlib.import_module(module_name)
     module._FFMPEG_VERSION_CACHE = None
     module.UI_AUTH.reset()
+    module.PROBE_CACHE.clear()
     module.csrf_protect.validate_csrf = lambda submitted, cookie: None
     return module
 
@@ -1478,6 +1479,12 @@ def test_documentation_page_loads(patched_app):
     assert "FFAPI Ultimate - API Documentation" in body.decode()
 
 
+def test_openapi_schema_includes_server(patched_app):
+    schema = patched_app.app.openapi()
+    assert schema["info"]["title"] == "FFAPI Ultimate"
+    assert schema["servers"][0]["url"] == "http://example.com"
+
+
 def test_health_endpoint(patched_app):
     # Prime metrics with a request so the tracker has data
     call_app(patched_app.app, "GET", "/downloads")
@@ -1576,6 +1583,73 @@ def test_async_compose_job_lifecycle(patched_app):
     assert job_info["result"]["thumbnail"] is None
     assert isinstance(job_info.get("history"), list)
     assert any(entry["message"] == "Completed" for entry in job_info["history"])
+
+
+def test_async_compose_job_sends_webhook(monkeypatch, patched_app):
+    calls = []
+
+    async def fake_notify(webhook_url, **kwargs):
+        calls.append({"webhook_url": webhook_url, **kwargs})
+
+    monkeypatch.setattr(patched_app, "_notify_webhook", fake_notify)
+
+    job = patched_app.ComposeFromUrlsJob(
+        video_url="https://example.com/video.mp4",
+        duration_ms=1000,
+        webhook_url="https://example.com/webhook",
+        webhook_headers={"X-Key": "value"},
+    )
+
+    asyncio.run(patched_app._process_compose_from_urls_job("job-webhook", job))
+
+    assert len(calls) == 1
+    payload = calls[0]
+    assert payload["webhook_url"] == "https://example.com/webhook"
+    assert payload["status"] == "finished"
+    assert payload["headers"] == {"X-Key": "value"}
+    assert payload["result"]["file_url"].startswith("http://example.com/")
+
+
+def test_async_compose_job_failed_webhook(monkeypatch, patched_app):
+    calls = []
+
+    async def fake_notify(webhook_url, **kwargs):
+        calls.append(kwargs["status"])
+
+    async def failing_impl(job, reporter):
+        raise patched_app.HTTPException(status_code=422, detail="bad input")
+
+    monkeypatch.setattr(patched_app, "_notify_webhook", fake_notify)
+    monkeypatch.setattr(patched_app, "_compose_from_urls_impl", failing_impl)
+
+    job = patched_app.ComposeFromUrlsJob(
+        video_url="https://example.com/video.mp4",
+        duration_ms=1000,
+        webhook_url="https://example.com/webhook",
+    )
+
+    asyncio.run(patched_app._process_compose_from_urls_job("job-fail", job))
+
+    assert calls == ["failed"]
+
+
+def test_jobs_history_page_lists_jobs(patched_app):
+    with patched_app.JOBS_LOCK:
+        patched_app.JOBS.clear()
+        patched_app.JOBS["job123"] = {
+            "status": "finished",
+            "created": time.time(),
+            "duration_ms": 2500,
+            "message": "Completed",
+            "history": [],
+        }
+
+    status, _, body = call_app(patched_app.app, "GET", "/jobs")
+    assert status == 200
+    text = body.decode()
+    assert "Job History" in text
+    assert "job123" in text
+    assert "Page 1 of 1" in text
 
 
 def test_static_file_serving(patched_app):
@@ -1790,6 +1864,25 @@ def test_compose_from_urls_rejects_invalid_duration(patched_app):
         patched_app.ComposeFromUrlsJob(
             video_url="https://example.com/video.mp4",
             duration_ms=0,
+        )
+
+
+def test_compose_from_urls_webhook_configuration(patched_app):
+    job = patched_app.ComposeFromUrlsJob(
+        video_url="https://example.com/video.mp4",
+        webhook_url="https://example.com/hook",
+        webhook_headers={"X-Test": 1, "  Extra  ": "value"},
+    )
+    assert str(job.webhook_url) == "https://example.com/hook"
+    assert job.webhook_headers == {"X-Test": "1", "Extra": "value"}
+
+
+def test_compose_from_urls_rejects_empty_webhook_header(patched_app):
+    with pytest.raises(ValidationError):
+        patched_app.ComposeFromUrlsJob(
+            video_url="https://example.com/video.mp4",
+            webhook_url="https://example.com/hook",
+            webhook_headers={" ": "value"},
         )
 
 
@@ -2094,6 +2187,26 @@ def test_probe_from_urls_returns_json(patched_app):
     job = patched_app.ProbeUrlJob(url="https://example.com/video.mp4", show_streams=True, count_frames=True)
     result = patched_app.probe_from_urls(job)
     assert result["format"]["format_name"] == "fake"
+
+
+def test_probe_from_urls_uses_cache(monkeypatch, patched_app):
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        payload = json.dumps({"format": {"format_name": "fake"}, "streams": []}).encode("utf-8")
+        return DummyCompletedProcess(returncode=0, stdout=payload, stderr=b"")
+
+    monkeypatch.setattr(patched_app.subprocess, "run", fake_run)
+    patched_app.PROBE_CACHE.clear()
+
+    job = patched_app.ProbeUrlJob(url="https://example.com/video.mp4", show_streams=True)
+    first = patched_app.probe_from_urls(job)
+    second = patched_app.probe_from_urls(job)
+
+    assert first == second
+    assert len(calls) == 1
+    patched_app.PROBE_CACHE.clear()
 
 
 def test_probe_from_binary_returns_json(patched_app):

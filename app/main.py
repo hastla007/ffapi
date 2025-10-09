@@ -11,6 +11,18 @@ from uuid import uuid4
 
 import threading
 
+try:  # pragma: no cover - structlog may be unavailable in minimal environments
+    import structlog
+    from structlog.contextvars import bind_contextvars, clear_contextvars
+except ModuleNotFoundError:  # pragma: no cover - fallback when structlog isn't installed
+    structlog = None  # type: ignore
+
+    def bind_contextvars(**_: Any) -> None:
+        return None
+
+    def clear_contextvars() -> None:
+        return None
+
 import importlib.util
 
 try:  # pragma: no cover - optional dependency
@@ -82,6 +94,16 @@ else:  # pragma: no cover - minimal environments without httpx
             )
             return _StreamResponse(response)
 
+        async def post(self, url: str, json=None, headers=None, timeout=None):
+            response = await asyncio.to_thread(
+                self._session.post,
+                url,
+                headers=headers,
+                json=json,
+                timeout=timeout,
+            )
+            return _HeadResponse(response)
+
         async def aclose(self) -> None:
             await asyncio.to_thread(self._session.close)
 
@@ -89,6 +111,7 @@ else:  # pragma: no cover - minimal environments without httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, HttpUrl, field_validator
 
 from fastapi_csrf_protect import CsrfProtect, CsrfProtectException
@@ -239,6 +262,9 @@ BACKUP_CODE_COUNT = 10
 VIDEO_THUMBNAIL_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 THUMBNAIL_DIR_NAME = "thumbnails"
 JOB_HISTORY_LIMIT = 20
+PROBE_CACHE_TTL = 3600
+PROBE_CACHE: Dict[str, Tuple[dict, float]] = {}
+PROBE_CACHE_LOCK = threading.Lock()
 
 
 def _generate_totp_secret(length: int = 20) -> str:
@@ -1117,6 +1143,7 @@ def render_settings_page(
         <a href=\"/logs\">Logs</a>
         <a href=\"/ffmpeg\">FFmpeg Info</a>
         <a href=\"/metrics\">Metrics</a>
+        <a href=\"/jobs\">Jobs</a>
         <a href=\"/documentation\">API Docs</a>
         <a href=\"/api-keys\">API Keys</a>
         <a href=\"/settings\">Settings</a>
@@ -1507,6 +1534,7 @@ def render_api_keys_page(
         <a href=\"/logs\">Logs</a>
         <a href=\"/ffmpeg\">FFmpeg Info</a>
         <a href=\"/metrics\">Metrics</a>
+        <a href=\"/jobs\">Jobs</a>
         <a href=\"/documentation\">API Docs</a>
         <a href=\"/api-keys\">API Keys</a>
         <a href=\"/settings\">Settings</a>
@@ -1738,6 +1766,7 @@ async def metrics_middleware(request, call_next):
     arrival = time.perf_counter()
     request_id = request.headers.get("X-Request-ID") or uuid4().hex
     token = REQUEST_ID_CTX.set(request_id)
+    bind_contextvars(request_id=request_id)
     METRICS.request_started()
 
     identifier = "unknown"
@@ -1795,6 +1824,7 @@ async def metrics_middleware(request, call_next):
         raise
     finally:
         METRICS.request_completed()
+        clear_contextvars()
         REQUEST_ID_CTX.reset(token)
 
 
@@ -1887,6 +1917,35 @@ logging.basicConfig(
 
 logger = logging.getLogger("ffapi")
 
+if structlog is not None:  # pragma: no branch - configuration depends on availability
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=False,
+    )
+    struct_logger = structlog.get_logger("ffapi")
+else:
+    class _FallbackStructLogger:
+        def __init__(self, base_logger: logging.Logger) -> None:
+            self._logger = base_logger
+
+        def info(self, event: str, **context: Any) -> None:
+            self._logger.info("%s %s", event, context)
+
+        def error(self, event: str, **context: Any) -> None:
+            self._logger.error("%s %s", event, context)
+
+    struct_logger = _FallbackStructLogger(logger)
+
 # Also capture uvicorn logs
 uvicorn_logger = logging.getLogger("uvicorn")
 uvicorn_logger.addHandler(file_handler)
@@ -1916,6 +1975,8 @@ async def startup_event():
         asyncio.create_task(_periodic_jobs_cleanup())
     asyncio.create_task(_periodic_session_cleanup())
     asyncio.create_task(_periodic_rate_limiter_cleanup())
+    if PROBE_CACHE_TTL > 0:
+        asyncio.create_task(_periodic_cache_cleanup())
     _flush_logs()
 
 
@@ -2320,6 +2381,33 @@ async def _periodic_jobs_cleanup():
             raise
 
 
+async def _periodic_cache_cleanup():
+    try:
+        await asyncio.sleep(1800)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            cutoff = time.time() - PROBE_CACHE_TTL
+            expired: List[str] = []
+            with PROBE_CACHE_LOCK:
+                for key, (_, timestamp) in list(PROBE_CACHE.items()):
+                    if timestamp < cutoff:
+                        expired.append(key)
+                for key in expired:
+                    PROBE_CACHE.pop(key, None)
+            if expired:
+                logger.info("Cleaned %d expired probe cache entries", len(expired))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Cache cleanup failed: %s", exc)
+        try:
+            await asyncio.sleep(1800)
+        except asyncio.CancelledError:
+            raise
+
+
 async def _periodic_session_cleanup():
     """Periodically reap expired UI authentication sessions."""
     try:
@@ -2575,6 +2663,7 @@ def downloads(
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
+        <a href="/jobs">Jobs</a>
         <a href="/documentation">API Docs</a>
         <a href="/api-keys">API Keys</a>
         <a href="/settings">Settings</a>
@@ -2705,6 +2794,7 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
+        <a href="/jobs">Jobs</a>
         <a href="/documentation">API Docs</a>
         <a href="/api-keys">API Keys</a>
         <a href="/settings">Settings</a>
@@ -2847,6 +2937,7 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
+        <a href="/jobs">Jobs</a>
         <a href="/documentation">API Docs</a>
         <a href="/api-keys">API Keys</a>
         <a href="/settings">Settings</a>
@@ -3270,6 +3361,7 @@ def documentation(request: Request):
         <a href="/logs">Logs</a>
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
+        <a href="/jobs">Jobs</a>
         <a href="/documentation">API Docs</a>
         <a href="/api-keys">API Keys</a>
         <a href="/settings">Settings</a>
@@ -3927,6 +4019,90 @@ class ComposeFromUrlsJob(BaseModel):
     fps: int = 30
     bgm_volume: float = 0.3
     headers: Optional[Dict[str, str]] = None  # forwarded header subset
+    webhook_url: Optional[HttpUrl] = None
+    webhook_headers: Optional[Dict[str, str]] = None
+
+    @field_validator("duration", mode="before")
+    @classmethod
+    def parse_duration(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError as exc:
+                raise ValueError(f"duration must be a valid number, got '{value}'") from exc
+        return float(value)
+
+    @field_validator("duration")
+    @classmethod
+    def validate_duration_seconds(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None:
+            if not (0.001 <= value <= 3600.0):
+                raise ValueError("duration must be 0.001-3600 seconds")
+        return value
+
+    @field_validator("width", "height")
+    @classmethod
+    def validate_dimensions(cls, value: int) -> int:
+        if not (1 <= value <= 7680):
+            raise ValueError(f"Dimension must be 1-7680, got {value}")
+        return value
+
+    @field_validator("fps")
+    @classmethod
+    def validate_fps(cls, value: int) -> int:
+        if not (1 <= value <= 240):
+            raise ValueError(f"FPS must be 1-240, got {value}")
+        return value
+
+    @field_validator("bgm_volume")
+    @classmethod
+    def validate_volume(cls, value: float) -> float:
+        if not (0.0 <= value <= 5.0):
+            raise ValueError(f"bgm_volume must be between 0 and 5, got {value}")
+        return value
+
+    @field_validator("duration_ms")
+    @classmethod
+    def validate_duration_ms(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None:
+            if not (1 <= value <= 3_600_000):
+                raise ValueError("duration_ms must be 1-3600000")
+        return value
+
+    @field_validator("video_url", "audio_url", "bgm_url", "webhook_url", mode="before")
+    @classmethod
+    def validate_url_scheme(cls, value):
+        if value is None:
+            return value
+        value_str = str(value)
+        if not value_str.startswith(("http://", "https://")):
+            raise ValueError("Only http:// and https:// URLs are supported")
+        return value
+
+    @field_validator("webhook_headers", mode="before")
+    @classmethod
+    def normalize_webhook_headers(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            normalized: Dict[str, str] = {}
+            for raw_key, raw_value in value.items():
+                key = str(raw_key).strip()
+                if not key:
+                    raise ValueError("Webhook header names cannot be empty")
+                normalized[key] = str(raw_value)
+            return normalized
+        raise ValueError("webhook_headers must be a mapping of header names to values")
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.duration is None and self.duration_ms is None:
+            self.duration_ms = 30000
+        elif self.duration is not None and self.duration_ms is not None:
+            raise ValueError("Provide either 'duration' or 'duration_ms', not both")
+        elif self.duration is not None:
+            self.duration_ms = int(self.duration * 1000)
 
     @field_validator("duration", mode="before")
     @classmethod
@@ -4047,6 +4223,11 @@ ALLOWED_FORWARD_HEADERS_LOWER = {
 
 def _escape_ffmpeg_concat_path(path: Path) -> str:
     return path.as_posix().replace("'", "'\\''")
+
+
+def _probe_cache_key(url: str, params: Dict[str, Any]) -> str:
+    cache_data = f"{url}:{json.dumps(params, sort_keys=True)}"
+    return hashlib.sha256(cache_data.encode("utf-8")).hexdigest()[:16]
 
 
 def _make_async_client() -> httpx.AsyncClient:
@@ -4575,6 +4756,58 @@ async def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
     return resp
 
 
+async def _notify_webhook(
+    webhook_url: Optional[str],
+    *,
+    job_id: str,
+    status: str,
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
+) -> None:
+    if not webhook_url:
+        return
+
+    payload: Dict[str, Any] = {
+        "job_id": job_id,
+        "status": status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if result is not None:
+        payload["result"] = result
+    if error is not None:
+        payload["error"] = error
+
+    request_headers = {str(k): str(v) for k, v in (headers or {}).items()}
+    client = _make_async_client()
+    try:
+        response = await client.post(
+            webhook_url,
+            json=payload,
+            headers=request_headers,
+            timeout=10,
+        )
+        status_code = getattr(response, "status_code", None)
+        try:
+            response.raise_for_status()
+        except Exception as exc:  # pragma: no cover - relies on httpx internals
+            logger.warning("Webhook notification failed for job %s: %s", job_id, exc)
+            return
+        struct_logger.info(
+            "webhook_notified",
+            job_id=job_id,
+            status=status,
+            status_code=status_code,
+        )
+    except Exception as exc:
+        logger.warning("Webhook notification failed for job %s: %s", job_id, exc)
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
 async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -> None:
     with JOBS_LOCK:
         existing = JOBS.get(job_id, {})
@@ -4597,11 +4830,19 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
 
     reporter = JobProgressReporter(job_id)
     start = time.perf_counter()
+    struct_logger.info("job_started", job_id=job_id, job_type="compose_from_urls")
     try:
         pub = await _compose_from_urls_impl(job, reporter)
     except HTTPException as exc:
         reporter.update(100, "Composition failed")
         detail = exc.detail if isinstance(exc.detail, (str, dict)) else str(exc.detail)
+        struct_logger.error(
+            "job_failed",
+            job_id=job_id,
+            job_type="compose_from_urls",
+            status_code=exc.status_code,
+            error=detail,
+        )
         with JOBS_LOCK:
             existing = JOBS.get(job_id, {})
             created = existing.get("created", time.time())
@@ -4620,10 +4861,24 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
                 "updated": time.time(),
                 "history": history,
             }
+        await _notify_webhook(
+            str(job.webhook_url) if job.webhook_url else None,
+            job_id=job_id,
+            status="failed",
+            error=detail,
+            headers=job.webhook_headers,
+        )
         return
     except Exception as exc:
         reporter.update(100, "Unexpected failure")
         logger.exception("Async compose job %s failed", job_id)
+        struct_logger.error(
+            "job_failed",
+            job_id=job_id,
+            job_type="compose_from_urls",
+            status_code=500,
+            error=str(exc),
+        )
         with JOBS_LOCK:
             existing = JOBS.get(job_id, {})
             created = existing.get("created", time.time())
@@ -4642,6 +4897,13 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
                 "updated": time.time(),
                 "history": history,
             }
+        await _notify_webhook(
+            str(job.webhook_url) if job.webhook_url else None,
+            job_id=job_id,
+            status="failed",
+            error=str(exc),
+            headers=job.webhook_headers,
+        )
         return
 
     reporter.update(100, "Completed")
@@ -4669,6 +4931,25 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
             "updated": time.time(),
             "history": history,
         }
+    struct_logger.info(
+        "job_completed",
+        job_id=job_id,
+        job_type="compose_from_urls",
+        duration_ms=duration_ms,
+        output_rel=pub["rel"],
+    )
+    await _notify_webhook(
+        str(job.webhook_url) if job.webhook_url else None,
+        job_id=job_id,
+        status="finished",
+        result={
+            "file_url": pub["url"],
+            "path": pub["dst"],
+            "rel": pub["rel"],
+            "thumbnail": pub.get("thumbnail"),
+        },
+        headers=job.webhook_headers,
+    )
 
 
 @app.post("/compose/from-urls/async")
@@ -4688,6 +4969,145 @@ async def compose_from_urls_async(job: ComposeFromUrlsJob):
     job_copy = job.model_copy(deep=True)
     asyncio.create_task(_process_compose_from_urls_job(job_id, job_copy))
     return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}
+
+
+@app.get("/jobs", response_class=HTMLResponse)
+def jobs_history(
+    request: Request,
+    status: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+):
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
+
+    with JOBS_LOCK:
+        all_jobs = [
+            {**data, "job_id": job_id}
+            for job_id, data in JOBS.items()
+        ]
+
+    all_jobs.sort(key=lambda item: item.get("created", 0), reverse=True)
+    if status:
+        all_jobs = [job for job in all_jobs if job.get("status") == status]
+
+    total_items = len(all_jobs)
+    total_pages = max(1, math.ceil(total_items / page_size))
+    page = min(max(page, 1), total_pages)
+    start = (page - 1) * page_size
+    end = start + page_size
+    jobs_slice = all_jobs[start:end]
+
+    rows: List[str] = []
+    for job in jobs_slice:
+        job_id = job.get("job_id", "-")
+        status_val = job.get("status", "unknown")
+        created_ts = job.get("created") or 0
+        created = datetime.fromtimestamp(created_ts, tz=timezone.utc)
+        duration_ms = job.get("duration_ms")
+        duration_text = f"{(duration_ms or 0) / 1000:.1f}s" if duration_ms else "—"
+        status_class = {
+            "finished": "success",
+            "failed": "error",
+            "processing": "warning",
+            "queued": "info",
+        }.get(status_val, "")
+        rows.append(
+            """
+            <tr>
+                <td><code>{job_id}</code></td>
+                <td><span class="status {status_class}">{status_val}</span></td>
+                <td>{created}</td>
+                <td>{duration}</td>
+                <td><a href="/jobs/{job_id}" target="_blank">View</a></td>
+            </tr>
+            """.format(
+                job_id=html.escape(str(job_id)),
+                status_class=status_class,
+                status_val=html.escape(str(status_val)),
+                created=created.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                duration=duration_text,
+            )
+        )
+
+    if not rows:
+        rows.append("<tr><td colspan='5'>No jobs found</td></tr>")
+
+    filters: List[str] = []
+    for filter_status in [None, "finished", "failed", "processing", "queued"]:
+        label = filter_status or "All"
+        params = {"page": 1}
+        if filter_status:
+            params["status"] = filter_status
+        query = urlencode(params)
+        css_class = "active" if filter_status == status else ""
+        filters.append(
+            f"<a href='/jobs?{query}' class='filter-link {css_class}'>{html.escape(label)}</a>"
+        )
+
+    pagination = f"Page {page} of {total_pages}"
+
+    html_content = f"""
+    <!doctype html>
+    <html>
+    <head>
+        <meta charset="utf-8" />
+        <title>Job History</title>
+        <style>
+            body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
+            .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+            .brand .ff {{ color: #28a745; }}
+            .brand .api {{ color: #000; }}
+            nav {{ margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
+            nav a {{ color: #0066cc; text-decoration: none; font-weight: 500; }}
+            nav a:hover {{ text-decoration: underline; }}
+            .filters {{ margin-bottom: 16px; display: flex; gap: 12px; flex-wrap: wrap; }}
+            .filter-link {{ padding: 6px 12px; border-radius: 4px; background: #f0f0f0; text-decoration: none; color: #333; }}
+            .filter-link.active {{ background: #0066cc; color: white; }}
+            table {{ border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }}
+            th, td {{ border-bottom: 1px solid #e2e8f0; padding: 12px 14px; font-size: 14px; text-align: left; }}
+            th {{ background: #f8fafc; color: #1f2937; }}
+            code {{ background: #f3f4f6; padding: 2px 6px; border-radius: 3px; }}
+            .status {{ padding: 4px 8px; border-radius: 4px; font-weight: 600; text-transform: capitalize; }}
+            .status.success {{ background: #e8f5e9; color: #256029; }}
+            .status.error {{ background: #fdecea; color: #b3261e; }}
+            .status.warning {{ background: #fff3cd; color: #856404; }}
+            .status.info {{ background: #e0f2fe; color: #0369a1; }}
+            .pagination {{ margin-top: 16px; color: #666; }}
+        </style>
+    </head>
+    <body>
+        <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
+        <nav>
+            <a href="/downloads">Downloads</a>
+            <a href="/logs">Logs</a>
+            <a href="/ffmpeg">FFmpeg Info</a>
+            <a href="/metrics">Metrics</a>
+            <a href="/jobs" class="active">Jobs</a>
+            <a href="/documentation">API Docs</a>
+            <a href="/api-keys">API Keys</a>
+            <a href="/settings">Settings</a>
+        </nav>
+        <h2>Job History</h2>
+        <div class="filters">{''.join(filters)}</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Job ID</th>
+                    <th>Status</th>
+                    <th>Created</th>
+                    <th>Duration</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>{''.join(rows)}</tbody>
+        </table>
+        <p class="pagination">{pagination}</p>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html_content)
 
 
 @app.get("/jobs/{job_id}")
@@ -4932,8 +5352,43 @@ def _headers_kv_list(h: Optional[Dict[str, str]]) -> List[str]:
 
 @app.post("/probe/from-urls")
 def probe_from_urls(job: ProbeUrlJob):
-    cmd = _ffprobe_cmd_base(job.show_format, job.show_streams, job.show_chapters, job.show_programs, job.show_packets,
-                            job.count_frames, job.count_packets, job.probe_size, job.analyze_duration, job.select_streams)
+    cache_params = {
+        "show_format": job.show_format,
+        "show_streams": job.show_streams,
+        "show_chapters": job.show_chapters,
+        "show_programs": job.show_programs,
+        "show_packets": job.show_packets,
+        "count_frames": job.count_frames,
+        "count_packets": job.count_packets,
+        "probe_size": job.probe_size,
+        "analyze_duration": job.analyze_duration,
+        "select_streams": job.select_streams,
+        "headers": sorted((k.lower(), v) for k, v in (job.headers or {}).items()),
+    }
+    cache_key = _probe_cache_key(str(job.url), cache_params)
+    cached: Optional[Tuple[dict, float]] = None
+    now = time.time()
+    if PROBE_CACHE_TTL > 0:
+        with PROBE_CACHE_LOCK:
+            cached = PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        result, timestamp = cached
+        if now - timestamp < PROBE_CACHE_TTL:
+            logger.info("Probe cache hit for %s", job.url)
+            return result
+
+    cmd = _ffprobe_cmd_base(
+        job.show_format,
+        job.show_streams,
+        job.show_chapters,
+        job.show_programs,
+        job.show_packets,
+        job.count_frames,
+        job.count_packets,
+        job.probe_size,
+        job.analyze_duration,
+        job.select_streams,
+    )
     cmd += _headers_kv_list(job.headers)
     cmd += [str(job.url)]
     proc = subprocess.run(
@@ -4943,11 +5398,24 @@ def probe_from_urls(job: ProbeUrlJob):
         timeout=60,
     )
     if proc.returncode != 0:
-        raise HTTPException(status_code=500, detail={"error": "ffprobe_failed", "stderr": proc.stderr.decode("utf-8", "ignore"), "cmd": cmd})
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "ffprobe_failed",
+                "stderr": proc.stderr.decode("utf-8", "ignore"),
+                "cmd": cmd,
+            },
+        )
     try:
-        return json.loads(proc.stdout.decode("utf-8", "ignore"))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "parse_failed", "msg": str(e)})
+        result = json.loads(proc.stdout.decode("utf-8", "ignore"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"error": "parse_failed", "msg": str(exc)}) from exc
+
+    if PROBE_CACHE_TTL > 0:
+        with PROBE_CACHE_LOCK:
+            PROBE_CACHE[cache_key] = (result, time.time())
+        logger.info("Probe result cached for %s", job.url)
+    return result
 
 @app.post("/probe/from-binary")
 async def probe_from_binary(
@@ -5015,3 +5483,41 @@ def probe_public(
         return json.loads(proc.stdout.decode("utf-8", "ignore"))
     except Exception as e:
         raise HTTPException(status_code=500, detail={"error": "parse_failed", "msg": str(e)})
+
+
+def custom_openapi():
+    """Enhanced OpenAPI schema with descriptive metadata and server info."""
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    openapi_schema = get_openapi(
+        title="FFAPI Ultimate",
+        version="2.0.0",
+        description=(
+            "## FFmpeg-powered Media Processing API\n\n"
+            "Complete video/audio processing toolkit with:\n"
+            "- 🎬 Video composition and editing\n"
+            "- 🔗 URL concatenation\n"
+            "- 🖼️ Image to video conversion\n"
+            "- 🔍 Media inspection (FFprobe)\n"
+            "- ⚡ Async job processing\n"
+            "- 🔐 Optional authentication\n\n"
+            "### Quick Start\n"
+            "1. Enable API authentication in `/settings` (optional)\n"
+            "2. Generate API key in `/api-keys` (optional)\n"
+            "3. Use endpoints with `X-API-Key` header or `api_key` param\n"
+            "4. Poll `/jobs/{job_id}` for async operations\n"
+        ),
+        routes=app.routes,
+    )
+    openapi_schema["servers"] = [
+        {
+            "url": PUBLIC_BASE_URL or "http://localhost:3000",
+            "description": "Current server",
+        }
+    ]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi

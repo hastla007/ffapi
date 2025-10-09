@@ -11,6 +11,7 @@
 - **Optional dashboard MFA**: Enable TOTP-based two-factor authentication with QR setup, backup codes, and recovery enforcement for the settings and dashboard pages when UI authentication is required. (Install `qrcode[pil]` to render setup QR codes—otherwise a placeholder image is shown.)
 - **Rich browsing experience**: The `/downloads` page now supports search, pagination, and inline video thumbnails while `/logs` offers paginated browsing for large histories.
 - **Job telemetry**: Asynchronous compose jobs expose granular progress updates, status messages, and a capped history log via the `/jobs/{job_id}` endpoint.
+- **Webhook-ready background jobs**: Async URL compositions can notify external systems on completion or failure and expose a browsable `/jobs` history dashboard.
 - **Persistent FFmpeg logs**: All FFmpeg operations save logs to `/data/logs` for debugging.
 - **Application logging**: Container logs (stdout/stderr) are saved to `/data/logs/application.log` and viewable at `/ffmpeg` endpoint.
 
@@ -29,6 +30,7 @@
 - `/compose/from-binaries` - Compose video from uploaded files
 - `/compose/from-urls` - Compose video from URLs
 - `/compose/from-urls/async` - Queue URL composition job
+- `/jobs` - Review recent async job history (HTML dashboard)
 - `/jobs/{job_id}` - Check asynchronous job status
 - `/compose/from-tracks` - Compose from track definitions
 - `/video/concat-from-urls` - Concatenate videos

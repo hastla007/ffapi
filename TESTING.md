@@ -2,6 +2,6 @@
 
 ## Test Run: Pytest
 - **Command:** `pytest`
-- **Result:** Passed (80 tests)
-- **Notes:** Coverage now spans concurrent request simulation, retry cleanup races, oversized upload rejection, download error recovery (including immediate restart when resume is ignored), FFmpeg timeout/spawn safeguards with guaranteed shutdown waits, resume rejection for unexpected HTTP statuses, the rate-limiter guard with its periodic identifier vacuuming, the asynchronous compose job lifecycle with TTL cleanup, multi-video track composition, the enriched health/metrics dashboards, CSP/request-ID security headers, Compose-from-URLs duration validation (milliseconds and seconds inputs), upload content-length enforcement, the configurable settings dashboard (retention, performance, storage, TOTP with backup code downloads), the relocated API authentication controls with their settings card, and the API key management workflows including greyed-out states until enforcement is enabled plus key generation/revocation with authenticated endpoint access.
-- **Last verified:** `2025-10-09T06:16:49Z`
+- **Result:** Passed (87 tests)
+- **Notes:** Coverage now spans webhook-enabled compose jobs (success and failure notifications), the `/jobs` history dashboard, probe result caching, the customized OpenAPI schema, plus the existing suites for concurrent handling, cleanup races, FFmpeg timeouts, download safeguards, rate limiting, dashboard security headers, runtime settings controls, MFA with backup codes, and API key enforcement workflows.
+- **Last verified:** `2025-10-09T06:58:16Z`
