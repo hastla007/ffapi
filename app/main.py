@@ -1,5 +1,6 @@
 import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit
 from collections import Counter, defaultdict, deque
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -203,6 +204,9 @@ JOBS: Dict[str, Dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
 
 
+REQUEST_ID_CTX: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
+
+
 def cleanup_old_jobs(max_age_seconds: int = 3600) -> None:
     cutoff = time.time() - max_age_seconds
     with JOBS_LOCK:
@@ -343,6 +347,8 @@ app.mount("/files", StaticFiles(directory=str(PUBLIC_DIR)), name="files")
 async def metrics_middleware(request, call_next):
     path = request.url.path
     arrival = time.perf_counter()
+    request_id = request.headers.get("X-Request-ID") or uuid4().hex
+    token = REQUEST_ID_CTX.set(request_id)
     METRICS.request_started()
 
     identifier = "unknown"
@@ -355,18 +361,24 @@ async def metrics_middleware(request, call_next):
     try:
         if not RATE_LIMITER.check(identifier):
             METRICS.request_finished(path, 429, 0.0, wait_time, "rate_limited")
-            return PlainTextResponse("Too Many Requests", status_code=429)
+            response = PlainTextResponse("Too Many Requests", status_code=429)
+            response.headers["X-Request-ID"] = request_id
+            return response
 
         processing_start = time.perf_counter()
         wait_time = processing_start - arrival
         response = await call_next(request)
         duration = time.perf_counter() - processing_start
         METRICS.request_finished(path, response.status_code, duration, wait_time)
+        response.headers.setdefault("X-Request-ID", request_id)
         return response
     except HTTPException as exc:
         now = time.perf_counter()
         duration = now - processing_start if processing_start is not None else 0.0
         detail = exc.detail if isinstance(exc.detail, str) else exc.__class__.__name__
+        headers = dict(exc.headers or {})
+        headers.setdefault("X-Request-ID", request_id)
+        exc.headers = headers
         METRICS.request_finished(path, exc.status_code, duration, wait_time, detail)
         raise
     except Exception as exc:
@@ -376,6 +388,16 @@ async def metrics_middleware(request, call_next):
         raise
     finally:
         METRICS.request_completed()
+        REQUEST_ID_CTX.reset(token)
+
+
+@app.middleware("http")
+async def security_headers_middleware(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("Content-Security-Policy", "default-src 'self'")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    return response
 
 
 # Setup logging to file
@@ -393,14 +415,27 @@ except (AttributeError, io.UnsupportedOperation):
 # Create file handler with line buffering to avoid manual flush storms
 file_stream = open(APP_LOG_FILE, "a", encoding="utf-8", buffering=1)
 atexit.register(file_stream.close)
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover - logging infrastructure
+        record.request_id = REQUEST_ID_CTX.get(None) or "-"
+        return True
+
+
+log_format = '%(asctime)s - %(name)s - %(levelname)s - [%(request_id)s] %(message)s'
+request_id_filter = RequestIdFilter()
+
 file_handler = logging.StreamHandler(file_stream)
 file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+file_handler.addFilter(request_id_filter)
+file_handler.setFormatter(logging.Formatter(log_format))
 
 # Create console handler
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+console_handler.addFilter(request_id_filter)
+console_handler.setFormatter(logging.Formatter(log_format))
 
 # Configure root logger to catch everything (including uvicorn)
 logging.basicConfig(

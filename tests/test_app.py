@@ -135,6 +135,31 @@ def call_app(app, method: str, path: str, *, headers=None, body: bytes = b"", qu
     return asyncio.run(_call_app(app, method, path, headers=headers, body=body, query=query))
 
 
+def test_security_headers_and_generated_request_id(app_module):
+    app_module.RATE_LIMITER.reset()
+    status, headers, body = call_app(app_module.app, "GET", "/health")
+    assert status == 200
+    assert headers["content-security-policy"] == "default-src 'self'"
+    assert headers["x-content-type-options"] == "nosniff"
+    assert headers["x-frame-options"] == "DENY"
+    assert "x-request-id" in headers
+    payload = json.loads(body.decode("utf-8"))
+    assert isinstance(payload["ok"], bool)
+
+
+def test_request_id_preserved_from_header(app_module):
+    app_module.RATE_LIMITER.reset()
+    provided = "req-123"
+    status, headers, _ = call_app(
+        app_module.app,
+        "GET",
+        "/health",
+        headers=[("X-Request-ID", provided)],
+    )
+    assert status == 200
+    assert headers["x-request-id"] == provided
+
+
 @pytest.fixture(scope="session")
 def app_module(tmp_path_factory: pytest.TempPathFactory):
     base = tmp_path_factory.mktemp("data")
