@@ -17,6 +17,7 @@
 - **Operational Visibility:** `/ffmpeg` page aggregates FFmpeg version info and recent application logs, improving debugging experience.
 - **Resilience:** Download helper now streams asynchronously via `httpx`, retries with exponential backoff, supports resuming partial downloads, and cleans up partial files after repeated failures.
 - **Safety:** Path validation in `/logs/view` prevents directory traversal attacks when inspecting stored log files.
+- **Access Control:** Dashboard authentication supports optional TOTP-based two-factor verification alongside configurable rate limiting.
 - **Resource Guardrails:** Built-in rate limiting, disk-space checks, and asynchronous job orchestration help protect the service from overload.
 
 ## Risks & Limitations

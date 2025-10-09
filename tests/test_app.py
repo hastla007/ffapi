@@ -365,13 +365,19 @@ def test_settings_page_shows_auth_retention_and_storage_sections(patched_app):
     assert "auth-row" in html
     assert "credentials-card is-disabled" in html
     assert "button type=\"submit\" disabled" in html
+    assert "Two-factor authentication" in html
+    assert "twofactor-card is-disabled" in html
+    assert "name=\"code\"" in html
+    assert "Authentication code" in html
     assert "Retention Settings" in html
     assert "Default retention (hours)" in html
     assert "name=\"retention_hours\"" in html
+    assert "storage-table" in html
     assert "Performance Settings" in html
     assert "name=\"rate_limit_rpm\"" in html
     assert "Storage Management" in html
     assert "Total storage used" in html
+    assert html.index("Update retention") < html.index("Storage Management")
 
 
 def test_dashboard_requires_login_when_enabled(patched_app):
@@ -421,6 +427,158 @@ def test_dashboard_requires_login_when_enabled(patched_app):
         headers=[("Cookie", f"{patched_app.SESSION_COOKIE_NAME}={session_token}")],
     )
     assert status == 200
+
+
+def test_two_factor_toggle_requires_valid_code(patched_app):
+    enable_body = urlencode({"require_login": "true"}).encode()
+    status, _, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/ui-auth",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=enable_body,
+    )
+    assert status == 303
+
+    login_body = urlencode({"username": "admin", "password": "admin123"}).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/login",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=login_body,
+    )
+    assert status == 303
+    session_cookie = headers["set-cookie"].split(";", 1)[0]
+
+    bad_enable = urlencode({"action": "enable", "code": "000000"}).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/two-factor",
+        headers=[
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Cookie", session_cookie),
+        ],
+        body=bad_enable,
+    )
+    assert status == 303
+    assert "error=Invalid+authentication+code" in headers["location"]
+    assert not patched_app.UI_AUTH.is_two_factor_enabled()
+
+    secret = patched_app.UI_AUTH.get_two_factor_secret()
+    code = patched_app.generate_totp_code(secret)
+    good_enable = urlencode({"action": "enable", "code": code}).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/two-factor",
+        headers=[
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Cookie", session_cookie),
+        ],
+        body=good_enable,
+    )
+    assert status == 303
+    assert "message=Two-factor+authentication+enabled" in headers["location"]
+    assert patched_app.UI_AUTH.is_two_factor_enabled()
+
+
+def test_login_requires_totp_when_two_factor_enabled(patched_app):
+    enable_body = urlencode({"require_login": "true"}).encode()
+    status, _, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/ui-auth",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=enable_body,
+    )
+    assert status == 303
+
+    login_body = urlencode({"username": "admin", "password": "admin123"}).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/login",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=login_body,
+    )
+    assert status == 303
+    session_cookie = headers["set-cookie"].split(";", 1)[0]
+
+    secret = patched_app.UI_AUTH.get_two_factor_secret()
+    code = patched_app.generate_totp_code(secret)
+    enable_two_factor = urlencode({"action": "enable", "code": code}).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/two-factor",
+        headers=[
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Cookie", session_cookie),
+        ],
+        body=enable_two_factor,
+    )
+    assert status == 303
+    assert patched_app.UI_AUTH.is_two_factor_enabled()
+
+    status, _, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/logout",
+        headers=[("Cookie", session_cookie)],
+    )
+    assert status == 303
+
+    password_only = urlencode({"username": "admin", "password": "admin123", "next": "/downloads"}).encode()
+    status, _, body = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/login",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=password_only,
+    )
+    assert status == 401
+    html = body.decode()
+    assert "Authentication code required" in html
+    assert "name=\"totp\"" in html
+
+    wrong_totp = urlencode(
+        {
+            "username": "admin",
+            "password": "admin123",
+            "totp": "000000",
+            "next": "/downloads",
+        }
+    ).encode()
+    status, _, body = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/login",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=wrong_totp,
+    )
+    assert status == 401
+    assert "Invalid authentication code" in body.decode()
+
+    final_code = patched_app.generate_totp_code(patched_app.UI_AUTH.get_two_factor_secret())
+    full_login = urlencode(
+        {
+            "username": "admin",
+            "password": "admin123",
+            "totp": final_code,
+            "next": "/downloads",
+        }
+    ).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/login",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=full_login,
+    )
+    assert status == 303
+    assert headers["location"] == "/downloads"
 
 
 def test_settings_page_enables_credentials_when_authentication_required(patched_app):

@@ -1,4 +1,4 @@
-import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit, hashlib, secrets
+import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit, hmac, hashlib, secrets, base64, struct
 from collections import Counter, defaultdict, deque
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Literal
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from uuid import uuid4
 
 import threading
@@ -216,6 +216,51 @@ JOBS_LOCK = threading.Lock()
 
 SESSION_COOKIE_NAME = "ffapi_session"
 SESSION_TTL_SECONDS = 3600
+
+TOTP_STEP_SECONDS = 30
+TOTP_DIGITS = 6
+
+
+def _generate_totp_secret(length: int = 20) -> str:
+    raw = secrets.token_bytes(length)
+    secret = base64.b32encode(raw).decode("utf-8").rstrip("=")
+    return secret.upper()
+
+
+def _normalize_base32(secret: str) -> bytes:
+    padding = "=" * ((8 - len(secret) % 8) % 8)
+    return base64.b32decode((secret + padding).upper(), casefold=True)
+
+
+def _totp_at(secret_bytes: bytes, counter: int, digits: int = TOTP_DIGITS) -> str:
+    message = struct.pack(">Q", counter)
+    digest = hmac.new(secret_bytes, message, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    truncated = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    return f"{truncated % (10 ** digits):0{digits}d}"
+
+
+def generate_totp_code(secret: str, for_time: Optional[int] = None) -> str:
+    if for_time is None:
+        for_time = int(time.time())
+    counter = int(for_time // TOTP_STEP_SECONDS)
+    secret_bytes = _normalize_base32(secret)
+    return _totp_at(secret_bytes, counter)
+
+
+def verify_totp_code(secret: str, code: str, window: int = 1) -> bool:
+    code = code.strip()
+    if not code.isdigit() or len(code) != TOTP_DIGITS:
+        return False
+    try:
+        secret_bytes = _normalize_base32(secret)
+    except Exception:
+        return False
+    now_counter = int(time.time() // TOTP_STEP_SECONDS)
+    for offset in range(-window, window + 1):
+        if _totp_at(secret_bytes, now_counter + offset) == code:
+            return True
+    return False
 DEFAULT_UI_USERNAME = "admin"
 DEFAULT_UI_PASSWORD = "admin123"
 
@@ -227,6 +272,8 @@ class UIAuthManager:
         self.username = DEFAULT_UI_USERNAME
         self._password_hash = self._hash(DEFAULT_UI_PASSWORD)
         self._sessions: Dict[str, float] = {}
+        self.two_factor_enabled = False
+        self._totp_secret = _generate_totp_secret()
 
     def _hash(self, password: str) -> str:
         return hashlib.sha256(password.encode("utf-8")).hexdigest()
@@ -237,6 +284,8 @@ class UIAuthManager:
             self.username = DEFAULT_UI_USERNAME
             self._password_hash = self._hash(DEFAULT_UI_PASSWORD)
             self._sessions.clear()
+            self.two_factor_enabled = False
+            self._totp_secret = _generate_totp_secret()
 
     def set_require_login(self, enabled: bool) -> None:
         with self._lock:
@@ -256,6 +305,9 @@ class UIAuthManager:
             self.username = username
             self._password_hash = self._hash(password)
             self._sessions.clear()
+            # Enabling new credentials invalidates existing second-factor sessions
+            self.two_factor_enabled = False
+            self._totp_secret = _generate_totp_secret()
 
     def verify(self, username: str, password: str) -> bool:
         with self._lock:
@@ -290,6 +342,43 @@ class UIAuthManager:
     def clear_session(self, token: str) -> None:
         with self._lock:
             self._sessions.pop(token, None)
+
+    def get_two_factor_secret(self) -> str:
+        with self._lock:
+            return self._totp_secret
+
+    def get_otpauth_uri(self) -> str:
+        secret = self.get_two_factor_secret()
+        username = self.get_username()
+        label = quote(f"FFAPI:{username}")
+        issuer = quote("FFAPI")
+        return f"otpauth://totp/{label}?secret={secret}&issuer={issuer}"
+
+    def get_username(self) -> str:
+        with self._lock:
+            return self.username
+
+    def set_two_factor_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self.two_factor_enabled = enabled
+            if not enabled:
+                self._sessions.clear()
+
+    def regenerate_two_factor_secret(self) -> str:
+        secret = _generate_totp_secret()
+        with self._lock:
+            self._totp_secret = secret
+            self.two_factor_enabled = False
+            self._sessions.clear()
+        return secret
+
+    def is_two_factor_enabled(self) -> bool:
+        with self._lock:
+            return self.two_factor_enabled
+
+    def verify_totp(self, code: str) -> bool:
+        secret = self.get_two_factor_secret()
+        return verify_totp_code(secret, code)
 
 
 UI_AUTH = UIAuthManager()
@@ -358,6 +447,13 @@ def render_login_page(next_path: str, error: Optional[str] = None) -> str:
     alert = ""
     if error:
         alert = f"<div class=\"alert error\">{html.escape(error)}</div>"
+    require_code = UI_AUTH.is_two_factor_enabled()
+    code_field = ""
+    if require_code:
+        code_field = """
+        <label for=\"totp\">Authentication code</label>
+        <input id=\"totp\" name=\"totp\" type=\"text\" inputmode=\"numeric\" pattern=\"\\d*\" autocomplete=\"one-time-code\" required />
+        """
     return f"""
     <!doctype html>
     <html>
@@ -388,6 +484,7 @@ def render_login_page(next_path: str, error: Optional[str] = None) -> str:
         <input id=\"username\" name=\"username\" type=\"text\" autocomplete=\"username\" required />
         <label for=\"password\">Password</label>
         <input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required />
+        {code_field}
         <button type=\"submit\">Sign in</button>
       </form>
       <div class=\"help\">Default credentials: {html.escape(DEFAULT_UI_USERNAME)} / {html.escape(DEFAULT_UI_PASSWORD)}</div>
@@ -452,6 +549,56 @@ def render_settings_page(
     ffmpeg_timeout_value = html.escape(ffmpeg_timeout_display)
     upload_chunk_value = html.escape(upload_chunk_display)
     max_file_size_value = html.escape(str(MAX_FILE_SIZE_MB))
+    total_used_text = html.escape(f"{format_number(total_used_mb)} MB")
+    active_files_text = html.escape(str(active_files))
+    expired_files_text = html.escape(str(expired_files))
+    quota_text = html.escape(quota_display)
+    two_factor_enabled = UI_AUTH.is_two_factor_enabled()
+    two_factor_status_text = "Enabled" if two_factor_enabled else "Disabled"
+    two_factor_note = (
+        "One-time codes are required when signing in."
+        if two_factor_enabled
+        else "Protect the dashboard with an authenticator app."
+    )
+    two_factor_note_text = html.escape(two_factor_note)
+    secret_raw = UI_AUTH.get_two_factor_secret()
+    grouped_secret = " ".join(
+        secret_raw[i : i + 4] for i in range(0, len(secret_raw), 4)
+    )
+    secret_display = html.escape(grouped_secret)
+    otpauth_uri = html.escape(UI_AUTH.get_otpauth_uri(), quote=True)
+    two_factor_disabled_attr = disabled_attr
+    two_factor_card_class = disabled_class
+    two_factor_status_class = "status-pill enabled" if two_factor_enabled else "status-pill"
+    if two_factor_enabled:
+        two_factor_actions = f"""
+            <div class=\"twofactor-actions\">
+              <form method=\"post\" action=\"/settings/two-factor\">
+                <input type=\"hidden\" name=\"action\" value=\"disable\" />
+                <button type=\"submit\" class=\"secondary\"{two_factor_disabled_attr}>Disable two-factor</button>
+              </form>
+              <form method=\"post\" action=\"/settings/two-factor\">
+                <input type=\"hidden\" name=\"action\" value=\"regenerate\" />
+                <button type=\"submit\" class=\"secondary\"{two_factor_disabled_attr}>Generate new secret</button>
+              </form>
+            </div>
+        """
+    else:
+        two_factor_actions = f"""
+            <div class=\"twofactor-actions\">
+              <form method=\"post\" action=\"/settings/two-factor\">
+                <input type=\"hidden\" name=\"action\" value=\"enable\" />
+                <label for=\"totp_code\">Authentication code</label>
+                <input id=\"totp_code\" name=\"code\" type=\"text\" inputmode=\"numeric\" pattern=\"\\d*\" placeholder=\"123456\"{two_factor_disabled_attr} />
+                <span class=\"help-text\">Enter a code from your authenticator app.</span>
+                <button type=\"submit\"{two_factor_disabled_attr}>Enable two-factor</button>
+              </form>
+              <form method=\"post\" action=\"/settings/two-factor\">
+                <input type=\"hidden\" name=\"action\" value=\"regenerate\" />
+                <button type=\"submit\" class=\"secondary\"{two_factor_disabled_attr}>Generate new secret</button>
+              </form>
+            </div>
+        """
 
     return f"""
     <!doctype html>
@@ -478,14 +625,18 @@ def render_settings_page(
         .checkbox-row {{ display: flex; align-items: center; gap: 10px; font-weight: 600; }}
         .checkbox-row input {{ width: auto; margin: 0; transform: scale(1.2); }}
         .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-top: 16px; }}
+        .section-pair {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; margin-bottom: 24px; }}
+        .section-pair section {{ margin-bottom: 0; }}
         .alert {{ padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }}
         .alert.success {{ background: #e8f5e9; color: #256029; border: 1px solid #c8e6c9; }}
         .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
-        .storage-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-top: 16px; }}
-        .storage-card {{ background: #fff; padding: 16px; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; }}
-        .storage-card h3 {{ margin: 0 0 6px 0; font-size: 15px; color: #2f3b52; }}
-        .storage-card p {{ margin: 0; font-size: 24px; font-weight: 600; color: #0f172a; }}
-        .storage-card span {{ display: block; margin-top: 4px; font-size: 13px; color: #526079; }}
+        .storage-table {{ margin-top: 20px; background: #fff; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; overflow: hidden; }}
+        .storage-table h3 {{ margin: 0; padding: 16px; font-size: 16px; color: #1f2937; border-bottom: 1px solid #d6e2f1; }}
+        .storage-table table {{ width: 100%; border-collapse: collapse; }}
+        .storage-table th {{ width: 220px; font-weight: 600; color: #2f3b52; }}
+        .storage-table td {{ color: #334155; }}
+        .storage-table th, .storage-table td {{ padding: 12px 16px; font-size: 14px; vertical-align: top; }}
+        .storage-table tr:not(:last-child) td, .storage-table tr:not(:last-child) th {{ border-bottom: 1px solid #edf2f7; }}
         .auth-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; align-items: stretch; margin-top: 16px; }}
         .auth-card {{ background: #fff; padding: 16px; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; display: flex; flex-direction: column; gap: 12px; }}
         .auth-card h3 {{ margin: 0; font-size: 16px; color: #1f2937; }}
@@ -494,9 +645,15 @@ def render_settings_page(
         .auth-card.is-disabled {{ opacity: 0.5; }}
         .credentials-grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
         .credentials-grid label {{ margin-bottom: 0; }}
+        .twofactor-card .status-pill {{ background: #e0f2fe; color: #0369a1; }}
+        .twofactor-card .status-pill.enabled {{ background: #e8f5e9; color: #256029; }}
+        .secret-box {{ background: #f1f5f9; border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }}
+        .secret-box span {{ font-size: 12px; color: #526079; text-transform: uppercase; letter-spacing: 0.1em; }}
+        .secret-box code {{ font-size: 18px; letter-spacing: 2px; font-weight: 600; }}
+        .twofactor-actions {{ display: flex; flex-direction: column; gap: 12px; margin-top: 4px; }}
+        .twofactor-actions form {{ margin: 0; }}
+        .twofactor-actions button {{ width: 100%; }}
         .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e8f5e9; color: #256029; border-radius: 999px; font-weight: 600; width: fit-content; }}
-        .card-form {{ background: #fff; padding: 16px; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; display: grid; gap: 12px; max-width: 420px; }}
-        .card-form.single {{ max-width: 320px; }}
         .help-text {{ font-size: 13px; color: #526079; }}
         .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
         .field-card {{ background: #f9fbff; padding: 12px; border-radius: 8px; box-shadow: inset 0 0 0 1px #d6e2f1; display: grid; gap: 8px; }}
@@ -531,10 +688,6 @@ def render_settings_page(
             </form>
             {logout_button}
           </div>
-          <div class="auth-card current-card{disabled_class}">
-            <h3>Current username</h3>
-            <p>{html.escape(UI_AUTH.username)}</p>
-          </div>
           <div class="auth-card credentials-card{disabled_class}">
             <h3>Update credentials</h3>
             <form method="post" action="/settings/credentials">
@@ -547,118 +700,132 @@ def render_settings_page(
               <button type="submit"{disabled_attr}>Update credentials</button>
             </form>
           </div>
+          <div class="auth-card twofactor-card{two_factor_card_class}">
+            <h3>Two-factor authentication</h3>
+            <span class="{two_factor_status_class}">{two_factor_status_text}</span>
+            <p>{two_factor_note_text}</p>
+            <div class="secret-box">
+              <span>Secret</span>
+              <code>{secret_display}</code>
+            </div>
+            <p class="help-text">Scan or add the secret manually, then use<br><a href="{otpauth_uri}">{otpauth_uri}</a> in your authenticator.</p>
+            {two_factor_actions}
+          </div>
         </div>
       </section>
 
+      <div class="section-pair">
       <section>
         <h2>Retention Settings</h2>
-        <form method="post" action="/settings/retention" class="card-form single">
+        <form method="post" action="/settings/retention">
           <label for="retention_hours">Default retention (hours)</label>
           <input
-            id="retention_hours"
-            name="retention_hours"
-            type="number"
-            min="1"
-            max="8760"
-            step="0.5"
-            value="{retention_hours_value}"
-            required
-          />
-          <span class="help-text">Equivalent to {retention_days_text} day(s).</span>
-          <button type="submit">Update retention</button>
+              id="retention_hours"
+              name="retention_hours"
+              type="number"
+              min="1"
+              max="8760"
+              step="0.5"
+              value="{retention_hours_value}"
+              required
+            />
+            <span class="help-text">Equivalent to {retention_days_text} day(s).</span>
+            <button type="submit">Update retention</button>
         </form>
+        <div class="storage-table">
+          <h3>Storage Management</h3>
+          <table>
+            <tbody>
+              <tr>
+                <th>Total storage used</th>
+                <td>{total_used_text}</td>
+                <td>Across all published files</td>
+              </tr>
+              <tr>
+                <th>Active files</th>
+                <td>{active_files_text}</td>
+                <td>Within retention window</td>
+              </tr>
+              <tr>
+                <th>Expired files pending cleanup</th>
+                <td>{expired_files_text}</td>
+                <td>Older than {retention_days_text} day(s)</td>
+              </tr>
+              <tr>
+                <th>Storage quota limit</th>
+                <td>{quota_text}</td>
+                <td>Based on current volume size</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <section>
         <h2>Performance Settings</h2>
-        <form method="post" action="/settings/performance" class="card-form">
-          <div class="form-grid">
-            <div class="field-card">
-              <label for="rate_limit_rpm">Rate limit (requests/minute)</label>
-              <input
-                id="rate_limit_rpm"
-                name="rate_limit_rpm"
-                type="number"
-                min="1"
-                max="100000"
-                step="1"
-                value="{rate_limit_value}"
-                required
-              />
-              <span class="help-text">Requests allowed per minute.</span>
+          <form method="post" action="/settings/performance">
+            <div class="form-grid">
+              <div class="field-card">
+                <label for="rate_limit_rpm">Rate limit (requests/minute)</label>
+                <input
+                  id="rate_limit_rpm"
+                  name="rate_limit_rpm"
+                  type="number"
+                  min="1"
+                  max="100000"
+                  step="1"
+                  value="{rate_limit_value}"
+                  required
+                />
+                <span class="help-text">Requests allowed per minute.</span>
+              </div>
+              <div class="field-card">
+                <label for="ffmpeg_timeout_minutes">FFmpeg timeout (minutes)</label>
+                <input
+                  id="ffmpeg_timeout_minutes"
+                  name="ffmpeg_timeout_minutes"
+                  type="number"
+                  min="1"
+                  max="720"
+                  step="1"
+                  value="{ffmpeg_timeout_value}"
+                  required
+                />
+                <span class="help-text">Maximum processing duration.</span>
+              </div>
+              <div class="field-card">
+                <label for="upload_chunk_mb">Upload chunk size (MB)</label>
+                <input
+                  id="upload_chunk_mb"
+                  name="upload_chunk_mb"
+                  type="number"
+                  min="0.1"
+                  max="512"
+                  step="0.1"
+                  value="{upload_chunk_value}"
+                  required
+                />
+                <span class="help-text">Per-stream read buffer.</span>
+              </div>
+              <div class="field-card">
+                <label for="max_file_size_mb">File size limit (MB)</label>
+                <input
+                  id="max_file_size_mb"
+                  name="max_file_size_mb"
+                  type="number"
+                  min="1"
+                  max="8192"
+                  step="1"
+                  value="{max_file_size_value}"
+                  required
+                />
+                <span class="help-text">Maximum upload size.</span>
+              </div>
             </div>
-            <div class="field-card">
-              <label for="ffmpeg_timeout_minutes">FFmpeg timeout (minutes)</label>
-              <input
-                id="ffmpeg_timeout_minutes"
-                name="ffmpeg_timeout_minutes"
-                type="number"
-                min="1"
-                max="720"
-                step="1"
-                value="{ffmpeg_timeout_value}"
-                required
-              />
-              <span class="help-text">Maximum processing duration.</span>
-            </div>
-            <div class="field-card">
-              <label for="upload_chunk_mb">Upload chunk size (MB)</label>
-              <input
-                id="upload_chunk_mb"
-                name="upload_chunk_mb"
-                type="number"
-                min="0.1"
-                max="512"
-                step="0.1"
-                value="{upload_chunk_value}"
-                required
-              />
-              <span class="help-text">Per-stream read buffer.</span>
-            </div>
-            <div class="field-card">
-              <label for="max_file_size_mb">File size limit (MB)</label>
-              <input
-                id="max_file_size_mb"
-                name="max_file_size_mb"
-                type="number"
-                min="1"
-                max="8192"
-                step="1"
-                value="{max_file_size_value}"
-                required
-              />
-              <span class="help-text">Maximum upload size.</span>
-            </div>
-          </div>
-          <button type="submit">Update performance settings</button>
-        </form>
-      </section>
-
-      <section>
-        <h2>Storage Management</h2>
-        <div class=\"storage-grid\">
-          <div class=\"storage-card\">
-            <h3>Total storage used</h3>
-            <p>{total_used_mb:.2f} MB</p>
-            <span>Across all published files</span>
-          </div>
-          <div class=\"storage-card\">
-            <h3>Active files</h3>
-            <p>{active_files}</p>
-            <span>Within retention window</span>
-          </div>
-          <div class=\"storage-card\">
-            <h3>Expired files pending cleanup</h3>
-            <p>{expired_files}</p>
-            <span>Older than {retention_days_text} day(s)</span>
-          </div>
-          <div class=\"storage-card\">
-            <h3>Storage quota limit</h3>
-            <p>{quota_display}</p>
-            <span>Based on current volume size</span>
-          </div>
-        </div>
-      </section>
+            <button type="submit">Update performance settings</button>
+          </form>
+        </section>
+      </div>
     </body>
     </html>
     """
@@ -2025,11 +2192,19 @@ async def settings_login(request: Request):
     form = await request.form()
     username = str(form.get("username", ""))
     password = str(form.get("password", ""))
+    totp_code = str(form.get("totp", "")).strip()
     next_path = str(form.get("next", "/settings")) or "/settings"
     if not next_path.startswith("/"):
         next_path = "/settings"
 
     if UI_AUTH.verify(username, password):
+        if UI_AUTH.is_two_factor_enabled():
+            if not totp_code:
+                html_content = render_login_page(next_path, "Authentication code required")
+                return HTMLResponse(html_content, status_code=401)
+            if not UI_AUTH.verify_totp(totp_code):
+                html_content = render_login_page(next_path, "Invalid authentication code")
+                return HTMLResponse(html_content, status_code=401)
         token = UI_AUTH.create_session()
         response = RedirectResponse(url=next_path, status_code=303)
         response.set_cookie(
@@ -2115,6 +2290,51 @@ async def settings_update_credentials(request: Request):
     return response
 
 
+
+
+
+@app.post("/settings/two-factor")
+async def settings_update_two_factor(request: Request):
+    form = await request.form()
+    action = str(form.get("action", "")).strip().lower()
+    authed = is_authenticated(request)
+    if UI_AUTH.require_login and not authed:
+        response = RedirectResponse(
+            url=f"/settings?{urlencode({'error': 'Authentication required to change security settings'})}",
+            status_code=303,
+        )
+        response.delete_cookie(SESSION_COOKIE_NAME)
+        return response
+
+    message: Optional[str] = None
+    error: Optional[str] = None
+
+    if action == "enable":
+        code = str(form.get("code", "")).strip()
+        if not code:
+            error = "Authentication code is required to enable two-factor"
+        elif not UI_AUTH.verify_totp(code):
+            error = "Invalid authentication code"
+        else:
+            UI_AUTH.set_two_factor_enabled(True)
+            message = "Two-factor authentication enabled"
+    elif action == "disable":
+        UI_AUTH.set_two_factor_enabled(False)
+        message = "Two-factor authentication disabled"
+    elif action == "regenerate":
+        UI_AUTH.regenerate_two_factor_secret()
+        message = "Generated a new authentication secret. Two-factor authentication has been disabled."
+    else:
+        error = "Unknown two-factor action"
+
+    query_parts = {}
+    if message:
+        query_parts["message"] = message
+    if error:
+        query_parts["error"] = error
+    query = urlencode(query_parts) if query_parts else ""
+    target = "/settings" if not query else f"/settings?{query}"
+    return RedirectResponse(url=target, status_code=303)
 @app.post("/settings/retention")
 async def settings_update_retention(request: Request):
     form = await request.form()

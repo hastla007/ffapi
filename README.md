@@ -7,6 +7,7 @@
 - All `TemporaryDirectory(...)` calls use `dir=$WORK_DIR` (default `/data/work`) so temps are on the same volume.
 - **Fixed retention**: Files are deleted based on actual file age (modification time), not folder name. Files persist through restarts until they are truly RETENTION_DAYS old, and cleanup resumes automatically on startup and via a periodic background task.
 - **Runtime tuning**: Administrators can adjust retention windows, rate limits, FFmpeg timeouts, and upload limits directly from the `/settings` dashboard without restarting the service.
+- **Optional dashboard MFA**: Enable TOTP-based two-factor authentication for the settings and dashboard pages when UI authentication is required.
 - **Persistent FFmpeg logs**: All FFmpeg operations save logs to `/data/logs` for debugging.
 - **Application logging**: Container logs (stdout/stderr) are saved to `/data/logs/application.log` and viewable at `/ffmpeg` endpoint.
 
@@ -47,7 +48,7 @@ docker compose up -d
 - `/logs` - View FFmpeg operation logs
 - `/ffmpeg` - Monitor container with live logs and FFmpeg version info (supports auto-refresh)
 - `/documentation` - Complete API reference with all endpoints and parameters
-- `/settings` - Toggle dashboard authentication, adjust retention/performance limits, and review storage usage
+- `/settings` - Toggle dashboard authentication, configure two-factor login, adjust retention/performance limits, and review storage usage
 
 Outputs persist in `./public` (mounted to `/data/public`).  
 Temporary work files live in `./work` (`/data/work`).  
