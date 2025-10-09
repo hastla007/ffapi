@@ -211,6 +211,7 @@ def cleanup_old_jobs(max_age_seconds: int = 3600) -> None:
             created = data.get("created")
             status = data.get("status")
             if created is None:
+                to_remove.append(job_id)
                 continue
             if created < cutoff and status in {"finished", "failed"}:
                 to_remove.append(job_id)
@@ -914,11 +915,19 @@ def logs():
 
 
 @app.get("/logs/view", response_class=PlainTextResponse)
-def view_log(path: str):
+def view_log(path: str, max_size_mb: int = 10):
     """View individual log file content."""
     target = safe_path_check(LOGS_DIR, path)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="Log not found")
+
+    size_mb = target.stat().st_size / (1024 * 1024)
+    if size_mb > max_size_mb:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Log file too large ({size_mb:.1f}MB). Maximum {max_size_mb}MB.",
+        )
+
     return target.read_text(encoding="utf-8", errors="ignore")
 
 
@@ -1590,12 +1599,38 @@ class RendiJob(BaseModel):
     output_files: Dict[str, str]
     ffmpeg_command: str
 
+    @field_validator("input_files", mode="before")
+    @classmethod
+    def validate_input_urls(cls, value):
+        if value is None:
+            raise ValueError("input_files is required")
+        for key, item in value.items():
+            item_str = str(item)
+            if not item_str.startswith(("http://", "https://")):
+                raise ValueError(f"input file '{key}' must use http:// or https://")
+        return value
+
 
 class ConcatJob(BaseModel):
     clips: List[HttpUrl]
     width: int = 1920
     height: int = 1080
     fps: int = 30
+
+    @field_validator("clips", mode="before")
+    @classmethod
+    def validate_clips(cls, value):
+        if not value:
+            raise ValueError("At least one clip is required")
+        if isinstance(value, (str, bytes)):
+            raise ValueError("Clips must be provided as a list of URLs")
+        if len(value) > 100:
+            raise ValueError("Too many clips (max 100)")
+        for clip in value:
+            clip_str = str(clip)
+            if not clip_str.startswith(("http://", "https://")):
+                raise ValueError("Only http:// and https:// clip URLs are supported")
+        return value
 
     @field_validator("width", "height")
     @classmethod
@@ -1644,11 +1679,31 @@ class ComposeFromUrlsJob(BaseModel):
             raise ValueError(f"bgm_volume must be between 0 and 5, got {value}")
         return value
 
+    @field_validator("video_url", "audio_url", "bgm_url", mode="before")
+    @classmethod
+    def validate_url_scheme(cls, value):
+        if value is None:
+            return value
+        value_str = str(value)
+        if not value_str.startswith(("http://", "https://")):
+            raise ValueError("Only http:// and https:// URLs are supported")
+        return value
+
 
 class Keyframe(BaseModel):
     url: Optional[HttpUrl] = None
     timestamp: int = 0
     duration: int
+
+    @field_validator("url", mode="before")
+    @classmethod
+    def validate_keyframe_url(cls, value):
+        if value is None:
+            return value
+        value_str = str(value)
+        if not value_str.startswith(("http://", "https://")):
+            raise ValueError("Keyframe URLs must use http:// or https://")
+        return value
 
 
 class Track(BaseModel):
@@ -1682,6 +1737,10 @@ class TracksComposeJob(BaseModel):
 ALLOWED_FORWARD_HEADERS_LOWER = {
     "cookie", "authorization", "x-n8n-api-key", "ngrok-skip-browser-warning"
 }
+
+
+def _escape_ffmpeg_concat_path(path: Path) -> str:
+    return path.as_posix().replace("'", "'\\''")
 
 
 def _make_async_client() -> httpx.AsyncClient:
@@ -1772,10 +1831,14 @@ async def _download_to(
                                 try:
                                     dest.unlink()
                                 except Exception as cleanup_exc:
-                                    logger.warning(
+                                    logger.error(
                                         "Failed to remove stale partial %s: %s", dest, cleanup_exc
                                     )
                                     _flush_logs()
+                                    raise HTTPException(
+                                        status_code=500,
+                                        detail="Failed to reset partial download",
+                                    ) from cleanup_exc
                             mode = "wb"
                             existing_size = 0
                             can_resume = False
@@ -2027,7 +2090,7 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
         listfile = work / "list.txt"
         with listfile.open("w", encoding="utf-8") as f:
             for p in norm:
-                f.write(f"file '{p.as_posix()}'\n")
+                f.write(f"file '{_escape_ffmpeg_concat_path(p)}'\n")
         out_path = work / "output.mp4"
         cmd2 = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile), "-c", "copy", "-movflags", "+faststart", str(out_path)]
         log2 = work / "concat.log"
@@ -2053,6 +2116,23 @@ class ConcatAliasJob(BaseModel):
     width: int = 1920
     height: int = 1080
     fps: int = 30
+
+    @field_validator("clips", "urls", mode="before")
+    @classmethod
+    def validate_optional_clips(cls, value):
+        if value is None:
+            return value
+        if not value:
+            raise ValueError("Clip list cannot be empty")
+        if isinstance(value, (str, bytes)):
+            raise ValueError("Clips must be provided as a list of URLs")
+        if len(value) > 100:
+            raise ValueError("Too many clips (max 100)")
+        for clip in value:
+            clip_str = str(clip)
+            if not clip_str.startswith(("http://", "https://")):
+                raise ValueError("Only http:// and https:// clip URLs are supported")
+        return value
 
     @field_validator("width", "height")
     @classmethod
@@ -2297,8 +2377,7 @@ async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
             concat_list = work / "videos.txt"
             with concat_list.open("w", encoding="utf-8") as handle:
                 for path in video_paths:
-                    safe_path = path.as_posix().replace("'", "'\\''")
-                    handle.write(f"file '{safe_path}'\n")
+                    handle.write(f"file '{_escape_ffmpeg_concat_path(path)}'\n")
             v_in = work / "video_concat.mp4"
             concat_log = work / "ffmpeg_concat.log"
             concat_cmd = [
@@ -2440,6 +2519,16 @@ class ProbeUrlJob(BaseModel):
     analyze_duration: Optional[str] = None
     select_streams: Optional[str] = None
 
+    @field_validator("url", mode="before")
+    @classmethod
+    def validate_probe_url(cls, value):
+        if value is None:
+            raise ValueError("url is required")
+        value_str = str(value)
+        if not value_str.startswith(("http://", "https://")):
+            raise ValueError("Only http:// and https:// URLs are supported")
+        return value
+
 def _ffprobe_cmd_base(
     show_format: bool,
     show_streams: bool,
@@ -2479,7 +2568,12 @@ def probe_from_urls(job: ProbeUrlJob):
                             job.count_frames, job.count_packets, job.probe_size, job.analyze_duration, job.select_streams)
     cmd += _headers_kv_list(job.headers)
     cmd += [str(job.url)]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
     if proc.returncode != 0:
         raise HTTPException(status_code=500, detail={"error": "ffprobe_failed", "stderr": proc.stderr.decode("utf-8", "ignore"), "cmd": cmd})
     try:
@@ -2509,7 +2603,12 @@ async def probe_from_binary(
 
         cmd = _ffprobe_cmd_base(show_format, show_streams, show_chapters, show_programs, show_packets,
                                 count_frames, count_packets, probe_size, analyze_duration, select_streams) + [str(p)]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
         if proc.returncode != 0:
             raise HTTPException(status_code=500, detail={"error": "ffprobe_failed", "stderr": proc.stderr.decode("utf-8", "ignore"), "cmd": cmd})
         try:
@@ -2536,7 +2635,12 @@ def probe_public(
         raise HTTPException(status_code=404, detail="file not found")
     cmd = _ffprobe_cmd_base(show_format, show_streams, show_chapters, show_programs, show_packets,
                             count_frames, count_packets, probe_size, analyze_duration, select_streams) + [str(target)]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
     if proc.returncode != 0:
         raise HTTPException(status_code=500, detail={"error": "ffprobe_failed", "stderr": proc.stderr.decode("utf-8", "ignore"), "cmd": cmd})
     try:

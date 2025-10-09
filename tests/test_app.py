@@ -15,6 +15,7 @@ from unittest.mock import Mock
 import pytest
 from fastapi import HTTPException, UploadFile
 from starlette.datastructures import Headers
+from pydantic import ValidationError
 
 
 class StubHeadResponse:
@@ -409,6 +410,41 @@ def test_download_to_scales_timeout_and_disk_check(app_module, monkeypatch, tmp_
     assert disk_checks[-1] == 70
 
 
+def test_download_to_raises_when_partial_cannot_reset(app_module, monkeypatch, tmp_path):
+    dest = tmp_path / "asset.bin"
+    dest.write_bytes(b"abcd")
+
+    original_unlink = Path.unlink
+
+    def fake_unlink(self, missing_ok=False):
+        if self == dest:
+            raise PermissionError("cannot remove")
+        return original_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fake_unlink)
+
+    client = StubAsyncClient(
+        head_responses=[StubHeadResponse(length=8)],
+        stream_responses=[
+            StubStreamResponse(status_code=200, chunks=[b"efgh"], fail_after_first_chunk=False),
+        ],
+    )
+
+    with pytest.raises(app_module.HTTPException) as exc:
+        asyncio.run(
+            app_module._download_to(
+                "https://example.com/file",
+                dest,
+                headers=None,
+                max_retries=1,
+                chunk_size=4,
+                client=client,
+            )
+        )
+
+    assert exc.value.status_code == 500
+
+
 def test_download_to_appends_when_resume_supported(app_module, tmp_path):
     dest = tmp_path / "resume.bin"
     dest.write_bytes(b"old")
@@ -609,6 +645,21 @@ def test_view_log_endpoint(patched_app):
         query=urlencode({"path": "../outside.log"}),
     )
     assert status == 403
+
+
+def test_view_log_rejects_large_files(patched_app):
+    day_dir = patched_app.LOGS_DIR / "20240107"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    large = day_dir / "big.log"
+    large.write_bytes(b"x" * (11 * 1024 * 1024))
+
+    status, _, _ = call_app(
+        patched_app.app,
+        "GET",
+        "/logs/view",
+        query=urlencode({"path": "20240107/big.log"}),
+    )
+    assert status == 413
 
 
 def test_ffmpeg_page_includes_version_and_auto_refresh(patched_app):
@@ -891,6 +942,11 @@ def test_compose_from_urls_as_json(patched_app):
     assert result["ok"] is True
 
 
+def test_compose_from_urls_rejects_non_http_urls(patched_app):
+    with pytest.raises(ValidationError):
+        patched_app.ComposeFromUrlsJob(video_url="ftp://example.com/video.mp4")
+
+
 def test_compose_from_tracks_as_json(patched_app):
     job = patched_app.TracksComposeJob(
         tracks=[
@@ -929,6 +985,11 @@ def test_compose_from_tracks_requires_valid_video_keyframe(patched_app):
     with pytest.raises(patched_app.HTTPException) as exc:
         asyncio.run(patched_app.compose_from_tracks(job, as_json=True))
     assert exc.value.status_code == 400
+
+
+def test_keyframe_rejects_non_http_url(patched_app):
+    with pytest.raises(ValidationError):
+        patched_app.Keyframe(url="ftp://example.com/video.mp4", timestamp=0, duration=1000)
 
 
 def test_compose_from_tracks_rejects_non_positive_duration(patched_app):
@@ -1009,6 +1070,12 @@ def test_compose_from_tracks_concats_multiple_videos(patched_app, monkeypatch):
     assert any("concat" in cmd for cmd in commands)
 
 
+def test_escape_ffmpeg_concat_path_handles_quotes(patched_app):
+    sample = Path("/tmp/weird name with 'quote.mp4")
+    escaped = patched_app._escape_ffmpeg_concat_path(sample)
+    assert escaped == "/tmp/weird name with '\\''quote.mp4"
+
+
 def test_cleanup_old_jobs_removes_finished_entries(patched_app):
     with patched_app.JOBS_LOCK:
         patched_app.JOBS.clear()
@@ -1024,6 +1091,7 @@ def test_cleanup_old_jobs_removes_finished_entries(patched_app):
             "status": "finished",
             "created": time.time(),
         }
+        patched_app.JOBS["malformed"] = {"status": "finished"}
 
     patched_app.cleanup_old_jobs(max_age_seconds=3600)
 
@@ -1031,6 +1099,7 @@ def test_cleanup_old_jobs_removes_finished_entries(patched_app):
         assert "expired" not in patched_app.JOBS
         assert "fresh" in patched_app.JOBS
         assert "active" in patched_app.JOBS
+        assert "malformed" not in patched_app.JOBS
 
 
 def test_rate_limiter_cleanup_removes_stale_identifiers(patched_app):
@@ -1063,6 +1132,11 @@ def test_video_concat_from_urls_as_json(patched_app):
     assert result["ok"] is True
 
 
+def test_video_concat_job_rejects_empty_list(patched_app):
+    with pytest.raises(ValidationError):
+        patched_app.ConcatJob(clips=[], width=1920, height=1080, fps=30)
+
+
 def test_video_concat_alias_requires_clips(patched_app):
     job = patched_app.ConcatAliasJob(width=640, height=360, fps=30)
     with pytest.raises(patched_app.HTTPException) as exc:
@@ -1085,6 +1159,15 @@ def test_run_ffmpeg_command_returns_outputs(patched_app):
     result = asyncio.run(patched_app.run_rendi(job))
     assert result["ok"] is True
     assert "out" in result["outputs"]
+
+
+def test_rendi_job_rejects_non_http_inputs(patched_app):
+    with pytest.raises(ValidationError):
+        patched_app.RendiJob(
+            input_files={"video": "file:///tmp/input.mp4"},
+            output_files={"out": "result.mp4"},
+            ffmpeg_command="-i {{video}} -t 1 {{out}}",
+        )
 
 
 def test_run_ffmpeg_command_rejects_dangerous_patterns(patched_app):
@@ -1185,3 +1268,28 @@ def test_probe_public_returns_json(patched_app):
         show_streams=True,
     )
     assert result["format"]["format_name"] == "fake"
+
+
+def test_probe_endpoints_use_timeout(patched_app, monkeypatch):
+    captured: List[int | None] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured.append(kwargs.get("timeout"))
+        payload = json.dumps({"format": {"format_name": "fake"}, "streams": []}).encode("utf-8")
+        return DummyCompletedProcess(returncode=0, stdout=payload, stderr=b"")
+
+    monkeypatch.setattr(patched_app.subprocess, "run", fake_run)
+
+    job = patched_app.ProbeUrlJob(url="https://example.com/video.mp4")
+    patched_app.probe_from_urls(job)
+
+    upload = UploadFile(file=io.BytesIO(b"binary"), filename="upload.mp4", headers=Headers({"content-type": "video/mp4"}))
+    asyncio.run(patched_app.probe_from_binary(upload, show_format=True, show_streams=True))
+
+    day_dir = patched_app.PUBLIC_DIR / "20240108"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    media = day_dir / "clip.mp4"
+    media.write_bytes(b"data")
+    patched_app.probe_public(rel=f"{day_dir.name}/{media.name}", show_format=True, show_streams=True)
+
+    assert captured == [60, 60, 60]
