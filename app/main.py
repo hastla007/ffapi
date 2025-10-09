@@ -432,6 +432,7 @@ async def startup_event():
         logger.warning("Initial public cleanup failed: %s", exc)
     if PUBLIC_CLEANUP_INTERVAL_SECONDS > 0:
         asyncio.create_task(_periodic_public_cleanup())
+        asyncio.create_task(_periodic_jobs_cleanup())
     _flush_logs()
 
 
@@ -725,6 +726,25 @@ async def _periodic_public_cleanup():
             raise
 
 
+async def _periodic_jobs_cleanup():
+    """Periodically purge completed jobs from the in-memory registry."""
+    try:
+        await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            cleanup_old_jobs()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Periodic jobs cleanup failed: %s", exc)
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise
+
+
 def publish_file(src: Path, ext: str) -> Dict[str, str]:
     """Move a finished file into PUBLIC_DIR/YYYYMMDD/ and return URLs/paths.
        Uses shutil.move to be cross-device safe (works across Docker volumes/Windows)."""
@@ -921,7 +941,7 @@ def ffmpeg_info(auto_refresh: int = 0):
         try:
             stat = APP_LOG_FILE.stat()
             size_kb = stat.st_size / 1024
-            mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             log_info = f"Log file: {size_kb:.1f} KB, Last modified: {mtime}"
             app_logs = tail_file(APP_LOG_FILE, 1000) or "No logs yet"
         except Exception as e:
