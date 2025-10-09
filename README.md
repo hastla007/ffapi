@@ -5,7 +5,7 @@
 ### Key features
 - `publish_file()` uses `shutil.move()` (works across devices / Docker volumes / Windows).
 - All `TemporaryDirectory(...)` calls use `dir=$WORK_DIR` (default `/data/work`) so temps are on the same volume.
-- **Fixed retention**: Files are deleted based on actual file age (modification time), not folder name. Files persist through restarts until truly RETENTION_DAYS old.
+- **Fixed retention**: Files are deleted based on actual file age (modification time), not folder name. Files persist through restarts until they are truly RETENTION_DAYS old, and cleanup resumes automatically on startup and via a periodic background task.
 - **Persistent FFmpeg logs**: All FFmpeg operations save logs to `/data/logs` for debugging.
 - **Application logging**: Container logs (stdout/stderr) are saved to `/data/logs/application.log` and viewable at `/ffmpeg` endpoint.
 
@@ -16,10 +16,14 @@
 - `/logs/view?path=...` - View individual log file
 - `/ffmpeg` - Display FFmpeg version and container logs (HTML)
 - `/documentation` - Complete API documentation (HTML)
+- `/metrics` - Operational dashboard with per-endpoint metrics
+- `/settings` - Settings page for UI auth and storage overview
 - `/files/*` - Static file serving
 - `/image/to-mp4-loop` - Convert image to looping video
 - `/compose/from-binaries` - Compose video from uploaded files
 - `/compose/from-urls` - Compose video from URLs
+- `/compose/from-urls/async` - Queue URL composition job
+- `/jobs/{job_id}` - Check asynchronous job status
 - `/compose/from-tracks` - Compose from track definitions
 - `/video/concat-from-urls` - Concatenate videos
 - `/video/concat` - Concat alias (accepts `clips` or `urls`)
@@ -42,6 +46,7 @@ docker compose up -d
 - `/logs` - View FFmpeg operation logs
 - `/ffmpeg` - Monitor container with live logs and FFmpeg version info (supports auto-refresh)
 - `/documentation` - Complete API reference with all endpoints and parameters
+- `/settings` - Toggle dashboard authentication and review storage usage
 
 Outputs persist in `./public` (mounted to `/data/public`).  
 Temporary work files live in `./work` (`/data/work`).  
@@ -56,7 +61,8 @@ For complete API documentation with all parameters and examples, visit `/documen
 
 **Video Composition:**
 - `/compose/from-binaries` - Compose from uploaded files
-- `/compose/from-urls` - Compose from URLs  
+- `/compose/from-urls` - Compose from URLs
+- `/compose/from-urls/async` - Start background job and poll `/jobs/{job_id}` for results
 - `/compose/from-tracks` - Compose from track definitions
 
 **Video Concatenation:**
@@ -65,6 +71,7 @@ For complete API documentation with all parameters and examples, visit `/documen
 
 **Custom Commands:**
 - `/v1/run-ffmpeg-command` - Run custom FFmpeg command
+- `/jobs/{job_id}` - Fetch asynchronous job status
 
 **Media Inspection:**
 - `/probe/from-urls` - Inspect media from URL
@@ -77,9 +84,15 @@ For complete API documentation with all parameters and examples, visit `/documen
 - `WORK_DIR` - Directory for temporary work files (default: /data/work)
 - `LOGS_DIR` - Directory for FFmpeg logs (default: /data/logs)
 - `RETENTION_DAYS` - Days to keep files before deletion (default: 7)
+- `MAX_FILE_SIZE_MB` - Maximum upload size enforced during streaming (default: 2048)
+- `FFMPEG_TIMEOUT_SECONDS` - Maximum FFmpeg runtime before timeout (default: 7200)
+- `MIN_FREE_SPACE_MB` - Minimum free disk space required before processing (default: 1000)
+- `PUBLIC_CLEANUP_INTERVAL_SECONDS` - Interval between retention sweeps (default: 3600)
+- `REQUIRE_DURATION_LIMIT` - Enforce `-t` or `-frames` on custom FFmpeg commands (default: false)
+- `RATE_LIMIT_REQUESTS_PER_MINUTE` - Requests per minute per client before 429 responses (default: 60)
 
 ### Retention Logic
 Files are automatically cleaned up based on their **actual modification time**, not the folder date. This means:
-- Files survive machine restarts
+- Files survive machine restarts but are still removed once their modification time exceeds RETENTION_DAYS, even after container restarts
 - Only truly old files are deleted
 - RETENTION_DAYS works as expected
