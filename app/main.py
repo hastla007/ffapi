@@ -5,10 +5,11 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, List, Optional, Literal, Tuple
+from typing import Any, Dict, List, Optional, Literal, Tuple, Callable
 from urllib.parse import urlencode, quote, parse_qs
 from uuid import uuid4
 
+import re
 import threading
 
 try:  # pragma: no cover - structlog may be unavailable in minimal environments
@@ -1640,6 +1641,40 @@ class JobProgressReporter:
             JOBS[self.job_id] = updated
 
 
+class FFmpegProgressParser:
+    _TIME_PATTERN = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+    def __init__(
+        self,
+        total_seconds: float,
+        reporter: JobProgressReporter,
+        stage_message: str,
+    ) -> None:
+        self._total = max(total_seconds, 0.001)
+        self._reporter = reporter
+        self._stage_message = stage_message
+        self._last_percent = -1.0
+
+    def __call__(self, line: str) -> None:
+        match = self._TIME_PATTERN.search(line)
+        if not match:
+            return
+        hours, minutes, seconds = match.groups()
+        try:
+            elapsed = (
+                int(hours) * 3600
+                + int(minutes) * 60
+                + float(seconds)
+            )
+        except ValueError:
+            return
+        percent = min(99.0, (elapsed / self._total) * 100.0)
+        if percent <= self._last_percent + 0.5:
+            return
+        self._last_percent = percent
+        self._reporter.update(percent, self._stage_message, detail=line.strip())
+
+
 class MetricsTracker:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -2211,13 +2246,55 @@ def ensure_upload_type(upload: UploadFile, expected_prefix: str, field: str) -> 
         )
 
 
-def run_ffmpeg_with_timeout(cmd: List[str], log_handle) -> int:
+def run_ffmpeg_with_timeout(
+    cmd: List[str],
+    log_handle,
+    *,
+    progress_parser: Optional[Callable[[str], None]] = None,
+) -> int:
+    reader_thread: Optional[threading.Thread] = None
+    reader_error: Optional[BaseException] = None
+
     try:
-        proc = subprocess.Popen(cmd, stdout=log_handle, stderr=log_handle)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_handle,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            bufsize=1,
+        )
     except Exception as exc:
         logger.error("Failed to launch ffmpeg command %s: %s", cmd, exc)
         _flush_logs()
         raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from exc
+
+    if proc.stderr is not None:
+        def _reader() -> None:
+            nonlocal reader_error
+            try:
+                for line in proc.stderr:  # pragma: no branch - sequential iteration
+                    try:
+                        log_handle.write(line)
+                        if hasattr(log_handle, "flush"):
+                            log_handle.flush()
+                    except Exception as log_exc:  # pragma: no cover - defensive logging
+                        reader_error = log_exc
+                    if progress_parser is not None:
+                        try:
+                            progress_parser(line)
+                        except Exception:
+                            logger.debug("Progress parser failed for line: %s", line.strip())
+            finally:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
     try:
         return proc.wait(timeout=FFMPEG_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -2233,6 +2310,11 @@ def run_ffmpeg_with_timeout(cmd: List[str], log_handle) -> int:
         logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
         _flush_logs()
         raise HTTPException(status_code=504, detail="Processing timeout")
+    finally:
+        if reader_thread is not None:
+            reader_thread.join(timeout=1)
+        if reader_error is not None:
+            logger.debug("FFmpeg log writer encountered error: %s", reader_error)
 
 
 def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
@@ -2261,7 +2343,7 @@ def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
         str(thumb_path),
     ]
     try:
-        with temp_log.open("wb") as log_handle:
+        with temp_log.open("w", encoding="utf-8", errors="ignore") as log_handle:
             code = run_ffmpeg_with_timeout(cmd, log_handle)
     except HTTPException:
         if thumb_path.exists():
@@ -2446,7 +2528,7 @@ async def _periodic_rate_limiter_cleanup():
             raise
 
 
-def publish_file(src: Path, ext: str) -> Dict[str, str]:
+def publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None) -> Dict[str, str]:
     """Move a finished file into PUBLIC_DIR/YYYYMMDD/ and return URLs/paths.
        Uses shutil.move to be cross-device safe (works across Docker volumes/Windows)."""
     check_disk_space(PUBLIC_DIR)
@@ -2461,7 +2543,14 @@ def publish_file(src: Path, ext: str) -> Dict[str, str]:
     # Cross-device safe move
     shutil.move(str(src), str(dst))
 
-    logger.info(f"Published file: {name} ({dst.stat().st_size / (1024*1024):.2f} MB)")
+    size_mb = dst.stat().st_size / (1024 * 1024)
+    logger.info(f"Published file: {name} ({size_mb:.2f} MB)")
+    struct_logger.info(
+        "file_published",
+        filename=name,
+        size_mb=round(size_mb, 4),
+        duration_ms=duration_ms,
+    )
 
     thumbnail_rel: Optional[str] = None
     try:
@@ -3954,6 +4043,72 @@ def metrics_dashboard(request: Request):
     return HTMLResponse(html_content)
 
 
+def _prometheus_escape(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\"", "\\\"")
+    )
+
+
+@app.get("/metrics/prometheus", response_class=PlainTextResponse, include_in_schema=False)
+def metrics_prometheus() -> PlainTextResponse:
+    snapshot = METRICS.snapshot()
+    lines: List[str] = []
+
+    lines.append("# HELP ffapi_requests_total Total requests processed by endpoint and result")
+    lines.append("# TYPE ffapi_requests_total counter")
+    for path, stats in sorted(snapshot.get("per_endpoint", {}).items()):
+        label = _prometheus_escape(path or "unknown")
+        lines.append(f'ffapi_requests_total{{path="{label}",result="success"}} {stats.get("success", 0)}')
+        lines.append(f'ffapi_requests_total{{path="{label}",result="failure"}} {stats.get("failure", 0)}')
+
+    lines.append("# HELP ffapi_request_duration_average_ms Average request duration per endpoint")
+    lines.append("# TYPE ffapi_request_duration_average_ms gauge")
+    for path, stats in sorted(snapshot.get("per_endpoint", {}).items()):
+        label = _prometheus_escape(path or "unknown")
+        lines.append(f'ffapi_request_duration_average_ms{{path="{label}"}} {stats.get("avg_duration_ms", 0.0)}')
+
+    lines.append("# HELP ffapi_request_success_rate_ratio Success ratio per endpoint")
+    lines.append("# TYPE ffapi_request_success_rate_ratio gauge")
+    for path, stats in sorted(snapshot.get("per_endpoint", {}).items()):
+        label = _prometheus_escape(path or "unknown")
+        lines.append(f'ffapi_request_success_rate_ratio{{path="{label}"}} {stats.get("success_rate", 0.0)}')
+
+    errors = snapshot.get("errors", {})
+    lines.append("# HELP ffapi_request_errors_total Total request errors by key")
+    lines.append("# TYPE ffapi_request_errors_total counter")
+    if errors:
+        for key, count in sorted(errors.items()):
+            label = _prometheus_escape(str(key))
+            lines.append(f'ffapi_request_errors_total{{error="{label}"}} {count}')
+    else:
+        lines.append('ffapi_request_errors_total{error="none"} 0')
+
+    queue = snapshot.get("queue", {})
+    lines.append("# HELP ffapi_queue_current_requests Current in-flight requests")
+    lines.append("# TYPE ffapi_queue_current_requests gauge")
+    lines.append(f"ffapi_queue_current_requests {queue.get('current', 0)}")
+    lines.append("# HELP ffapi_queue_max_depth Maximum concurrent requests observed")
+    lines.append("# TYPE ffapi_queue_max_depth gauge")
+    lines.append(f"ffapi_queue_max_depth {queue.get('max', 0)}")
+    lines.append("# HELP ffapi_queue_avg_wait_ms Average request wait time in milliseconds")
+    lines.append("# TYPE ffapi_queue_avg_wait_ms gauge")
+    lines.append(f"ffapi_queue_avg_wait_ms {queue.get('avg_wait_ms', 0.0)}")
+
+    recent = snapshot.get("recent", {})
+    lines.append("# HELP ffapi_recent_success_rate_ratio Success ratio across the recent window")
+    lines.append("# TYPE ffapi_recent_success_rate_ratio gauge")
+    success_rate = recent.get("success_rate")
+    lines.append(f"ffapi_recent_success_rate_ratio {success_rate if success_rate is not None else 0.0}")
+    lines.append("# HELP ffapi_recent_window_total Total recent requests considered in success ratio")
+    lines.append("# TYPE ffapi_recent_window_total gauge")
+    lines.append(f"ffapi_recent_window_total {recent.get('window', 0)}")
+
+    body = "\n".join(lines) + "\n"
+    return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
+
+
 # ---------- models ----------
 class RendiJob(BaseModel):
     input_files: Dict[str, HttpUrl]
@@ -4095,73 +4250,6 @@ class ComposeFromUrlsJob(BaseModel):
                 normalized[key] = str(raw_value)
             return normalized
         raise ValueError("webhook_headers must be a mapping of header names to values")
-
-    def model_post_init(self, __context: Any) -> None:
-        if self.duration is None and self.duration_ms is None:
-            self.duration_ms = 30000
-        elif self.duration is not None and self.duration_ms is not None:
-            raise ValueError("Provide either 'duration' or 'duration_ms', not both")
-        elif self.duration is not None:
-            self.duration_ms = int(self.duration * 1000)
-
-    @field_validator("duration", mode="before")
-    @classmethod
-    def parse_duration(cls, value):
-        if value is None:
-            return None
-        if isinstance(value, str):
-            try:
-                return float(value)
-            except ValueError as exc:
-                raise ValueError(f"duration must be a valid number, got '{value}'") from exc
-        return float(value)
-
-    @field_validator("duration")
-    @classmethod
-    def validate_duration_seconds(cls, value: Optional[float]) -> Optional[float]:
-        if value is not None:
-            if not (0.001 <= value <= 3600.0):
-                raise ValueError("duration must be 0.001-3600 seconds")
-        return value
-
-    @field_validator("width", "height")
-    @classmethod
-    def validate_dimensions(cls, value: int) -> int:
-        if not (1 <= value <= 7680):
-            raise ValueError(f"Dimension must be 1-7680, got {value}")
-        return value
-
-    @field_validator("fps")
-    @classmethod
-    def validate_fps(cls, value: int) -> int:
-        if not (1 <= value <= 240):
-            raise ValueError(f"FPS must be 1-240, got {value}")
-        return value
-
-    @field_validator("bgm_volume")
-    @classmethod
-    def validate_volume(cls, value: float) -> float:
-        if not (0.0 <= value <= 5.0):
-            raise ValueError(f"bgm_volume must be between 0 and 5, got {value}")
-        return value
-
-    @field_validator("duration_ms")
-    @classmethod
-    def validate_duration_ms(cls, value: Optional[int]) -> Optional[int]:
-        if value is not None:
-            if not (1 <= value <= 3_600_000):
-                raise ValueError("duration_ms must be 1-3600000")
-        return value
-
-    @field_validator("video_url", "audio_url", "bgm_url", mode="before")
-    @classmethod
-    def validate_url_scheme(cls, value):
-        if value is None:
-            return value
-        value_str = str(value)
-        if not value_str.startswith(("http://", "https://")):
-            raise ValueError("Only http:// and https:// URLs are supported")
-        return value
 
     def model_post_init(self, __context: Any) -> None:
         if self.duration is None and self.duration_ms is None:
@@ -4451,14 +4539,14 @@ async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as
             str(out_path),
         ]
         log = work / "ffmpeg.log"
-        with log.open("wb") as lf:
+        with log.open("w", encoding="utf-8", errors="ignore") as lf:
             code = run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "image-to-mp4")
         if code != 0 or not out_path.exists():
             logger.error(f"image-to-mp4-loop failed for {file.filename}")
             _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
-        pub = publish_file(out_path, ".mp4")
+        pub = publish_file(out_path, ".mp4", duration_ms=duration * 1000)
         logger.info(f"image-to-mp4-loop completed: {pub['rel']}")
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
@@ -4530,7 +4618,7 @@ async def compose_from_binaries(
         cmd += maps + [str(out_path)]
 
         log = work / "ffmpeg.log"
-        with log.open("wb") as lf:
+        with log.open("w", encoding="utf-8", errors="ignore") as lf:
             code = run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "compose-binaries")
         if code != 0 or not out_path.exists():
@@ -4538,7 +4626,7 @@ async def compose_from_binaries(
             _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": cmd, "log": log.read_text()})
 
-        pub = publish_file(out_path, ".mp4")
+        pub = publish_file(out_path, ".mp4", duration_ms=duration_ms)
         logger.info(f"compose-from-binaries completed: {pub['rel']}")
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
@@ -4568,7 +4656,7 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
                 str(out),
             ]
             log = work / f"norm_{i:03d}.log"
-            with log.open("wb") as lf:
+            with log.open("w", encoding="utf-8", errors="ignore") as lf:
                 code = run_ffmpeg_with_timeout(cmd, lf)
             save_log(log, f"concat-norm-{i}")
             if code != 0 or not out.exists():
@@ -4581,7 +4669,7 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
         out_path = work / "output.mp4"
         cmd2 = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile), "-c", "copy", "-movflags", "+faststart", str(out_path)]
         log2 = work / "concat.log"
-        with log2.open("wb") as lf:
+        with log2.open("w", encoding="utf-8", errors="ignore") as lf:
             code2 = run_ffmpeg_with_timeout(cmd2, lf)
         save_log(log2, "concat-final")
         if code2 != 0 or not out_path.exists():
@@ -4720,10 +4808,12 @@ async def _compose_from_urls_impl(
             cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
 
         cmd += maps + [str(out_path)]
+        parser: Optional[FFmpegProgressParser] = None
         if progress:
             progress.update(70, "Rendering composition")
-        with log_path.open("wb") as logf:
-            code = run_ffmpeg_with_timeout(cmd, logf)
+            parser = FFmpegProgressParser(job.duration_ms / 1000.0, progress, "Rendering composition")
+        with log_path.open("w", encoding="utf-8", errors="ignore") as logf:
+            code = run_ffmpeg_with_timeout(cmd, logf, progress_parser=parser)
         save_log(log_path, "compose-urls")
         if code != 0 or not out_path.exists():
             logger.error("compose-from-urls failed")
@@ -4739,7 +4829,7 @@ async def _compose_from_urls_impl(
 
         if progress:
             progress.update(85, "Saving rendered output")
-        pub = publish_file(out_path, ".mp4")
+        pub = publish_file(out_path, ".mp4", duration_ms=job.duration_ms)
         if progress:
             progress.update(95, "Publishing file")
         logger.info("compose-from-urls completed: %s", pub["rel"])
@@ -4754,6 +4844,60 @@ async def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
     resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
     resp.headers["X-File-URL"] = pub["url"]
     return resp
+
+
+async def _notify_webhook_with_retry(
+    client,
+    webhook_url: str,
+    payload: Dict[str, Any],
+    headers: Dict[str, str],
+    *,
+    job_id: str,
+    status: str,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+) -> None:
+    delay = base_delay
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = await client.post(
+                webhook_url,
+                json=payload,
+                headers=headers,
+                timeout=10,
+            )
+            status_code = getattr(response, "status_code", None)
+            response.raise_for_status()
+            struct_logger.info(
+                "webhook_notified",
+                job_id=job_id,
+                status=status,
+                status_code=status_code,
+                attempt=attempt,
+            )
+            return
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Webhook notification attempt %s failed for job %s: %s",
+                attempt,
+                job_id,
+                exc,
+            )
+            if attempt == max_retries:
+                break
+            await asyncio.sleep(delay)
+            delay *= 2
+
+    if last_error is not None:
+        struct_logger.error(
+            "webhook_failed",
+            job_id=job_id,
+            status=status,
+            attempts=max_retries,
+            error=str(last_error),
+        )
 
 
 async def _notify_webhook(
@@ -4781,26 +4925,14 @@ async def _notify_webhook(
     request_headers = {str(k): str(v) for k, v in (headers or {}).items()}
     client = _make_async_client()
     try:
-        response = await client.post(
+        await _notify_webhook_with_retry(
+            client,
             webhook_url,
-            json=payload,
-            headers=request_headers,
-            timeout=10,
-        )
-        status_code = getattr(response, "status_code", None)
-        try:
-            response.raise_for_status()
-        except Exception as exc:  # pragma: no cover - relies on httpx internals
-            logger.warning("Webhook notification failed for job %s: %s", job_id, exc)
-            return
-        struct_logger.info(
-            "webhook_notified",
+            payload,
+            request_headers,
             job_id=job_id,
             status=status,
-            status_code=status_code,
         )
-    except Exception as exc:
-        logger.warning("Webhook notification failed for job %s: %s", job_id, exc)
     finally:
         try:
             await client.aclose()
@@ -5186,7 +5318,7 @@ async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
                 "-an",
                 str(v_in),
             ]
-            with concat_log.open("wb") as lf:
+            with concat_log.open("w", encoding="utf-8", errors="ignore") as lf:
                 concat_code = run_ffmpeg_with_timeout(concat_cmd, lf)
             save_log(concat_log, "compose-tracks-concat")
             if concat_code != 0 or not v_in.exists():
@@ -5218,7 +5350,7 @@ async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
         cmd += maps + [str(work / "output.mp4")]
 
         log = work / "ffmpeg.log"
-        with log.open("wb") as lf:
+        with log.open("w", encoding="utf-8", errors="ignore") as lf:
             code = run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "compose-tracks")
         out_path = work / "output.mp4"
@@ -5274,7 +5406,7 @@ async def run_rendi(job: RendiJob):
 
         log = work / "ffmpeg.log"
         run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args
-        with log.open("wb") as lf:
+        with log.open("w", encoding="utf-8", errors="ignore") as lf:
             code = run_ffmpeg_with_timeout(run_args, lf)
         save_log(log, "rendi-command")
         if code != 0:

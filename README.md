@@ -24,6 +24,7 @@
 - `/documentation` - Complete API documentation (HTML)
 - `/api-keys` - Manage API key authentication and generate keys
 - `/metrics` - Operational dashboard with per-endpoint metrics
+- `/metrics/prometheus` - Prometheus text-format metrics export
 - `/settings` - Settings page for UI auth, runtime tuning, and storage overview
 - `/files/*` - Static file serving
 - `/image/to-mp4-loop` - Convert image to looping video

@@ -9,7 +9,7 @@ import time
 from http.cookies import SimpleCookie
 from itertools import count
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from urllib.parse import urlencode, urlparse, parse_qs
 from unittest.mock import Mock
 
@@ -279,19 +279,21 @@ def patched_app(app_module, monkeypatch, tmp_path):
     publish_root.mkdir(parents=True, exist_ok=True)
     counter = count()
 
-    def fake_publish_file(src: Path, ext: str):
+    def fake_publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None):
         dst = publish_root / f"file_{next(counter)}{ext}"
         src_path = Path(src)
         if src_path.exists():
             dst.write_bytes(src_path.read_bytes())
         else:
             dst.write_bytes(b"")
+        fake_publish_file.last_duration = duration_ms
         return {
             "dst": str(dst),
             "url": f"http://example.com/{dst.name}",
             "rel": f"/files/{dst.name}",
             "thumbnail": None,
         }
+    fake_publish_file.last_duration = None
 
     async def fake_download_to(url: str, dest: Path, headers=None, max_retries: int = 3, chunk_size: int = 1024 * 1024, client=None):
         dest_path = Path(dest)
@@ -313,7 +315,7 @@ def patched_app(app_module, monkeypatch, tmp_path):
             command = cmd.split()
 
         def write_stream(target, data: bytes | str):
-            if target is None:
+            if target is None or not hasattr(target, "write"):
                 return
             try:
                 target.write(data)
@@ -356,8 +358,8 @@ def patched_app(app_module, monkeypatch, tmp_path):
     class DummyPopen:
         def __init__(self, cmd, stdout=None, stderr=None, **kwargs):
             self.cmd = cmd
-            self.stdout = stdout
-            self.stderr = stderr
+            self.stdout = stdout if hasattr(stdout, "write") else io.StringIO()
+            self.stderr = stderr if hasattr(stderr, "write") else io.StringIO()
             self.returncode = 0
             payload = b"run"
             output_path = None
@@ -369,16 +371,16 @@ def patched_app(app_module, monkeypatch, tmp_path):
             if output_path is not None:
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 output_path.write_bytes(b"fake output")
-            if stdout is not None:
+            payload_text = payload.decode("utf-8")
+            try:
+                self.stdout.write(payload_text)
+            except Exception:
+                pass
+            if self.stderr is not self.stdout:
                 try:
-                    stdout.write(payload)
-                except TypeError:
-                    stdout.write(payload.decode("utf-8"))
-            if stderr is not None and stderr is not stdout:
-                try:
-                    stderr.write(payload)
-                except TypeError:
-                    stderr.write(payload.decode("utf-8"))
+                    self.stderr.write(payload_text)
+                except Exception:
+                    pass
 
         def wait(self, timeout=None):
             return self.returncode
@@ -1511,6 +1513,16 @@ def test_metrics_dashboard_reports_activity(patched_app):
     assert "Recent Success Rate" in html
 
 
+def test_prometheus_metrics_export(patched_app):
+    call_app(patched_app.app, "GET", "/downloads")
+    status, headers, body = call_app(patched_app.app, "GET", "/metrics/prometheus")
+    assert status == 200
+    assert headers["content-type"].startswith("text/plain")
+    text = body.decode()
+    assert "ffapi_requests_total" in text
+    assert "ffapi_queue_current_requests" in text
+
+
 def test_rate_limiter_blocks_excess_requests(patched_app, monkeypatch):
     monkeypatch.setattr(patched_app.RATE_LIMITER, "_rpm", 1)
     patched_app.RATE_LIMITER.reset()
@@ -1583,6 +1595,8 @@ def test_async_compose_job_lifecycle(patched_app):
     assert job_info["result"]["thumbnail"] is None
     assert isinstance(job_info.get("history"), list)
     assert any(entry["message"] == "Completed" for entry in job_info["history"])
+    assert any(entry["message"] == "Rendering composition" for entry in job_info["history"])
+    assert patched_app.publish_file.last_duration == 5000
 
 
 def test_async_compose_job_sends_webhook(monkeypatch, patched_app):
@@ -1631,6 +1645,47 @@ def test_async_compose_job_failed_webhook(monkeypatch, patched_app):
     asyncio.run(patched_app._process_compose_from_urls_job("job-fail", job))
 
     assert calls == ["failed"]
+
+
+def test_notify_webhook_retries(monkeypatch, patched_app):
+    attempts: List[int] = []
+    sleep_delays: List[float] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise RuntimeError("boom")
+
+    class FakeClient:
+        async def post(self, url, json=None, headers=None, timeout=None):
+            attempts.append(len(attempts) + 1)
+            if len(attempts) < 3:
+                raise RuntimeError("fail")
+            return FakeResponse(200)
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr(patched_app, "_make_async_client", lambda: FakeClient())
+    monkeypatch.setattr(patched_app.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(
+        patched_app._notify_webhook(
+            "https://example.com/webhook",
+            job_id="job-retry",
+            status="finished",
+            result={"file_url": "http://example.com/file.mp4"},
+        )
+    )
+
+    assert attempts == [1, 2, 3]
+    assert sleep_delays == [1.0, 2.0]
 
 
 def test_jobs_history_page_lists_jobs(patched_app):
@@ -1959,7 +2014,12 @@ def test_compose_from_tracks_concats_multiple_videos(patched_app, monkeypatch):
 
     commands: List[List[str]] = []
 
-    def fake_run_ffmpeg_with_timeout(cmd: List[str], log_handle) -> int:
+    def fake_run_ffmpeg_with_timeout(
+        cmd: List[str],
+        log_handle,
+        *,
+        progress_parser=None,
+    ) -> int:
         commands.append(list(cmd))
         output_path = None
         for token in reversed(cmd):
@@ -1969,10 +2029,9 @@ def test_compose_from_tracks_concats_multiple_videos(patched_app, monkeypatch):
         if output_path is not None:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(b"video")
-        try:
-            log_handle.write(b"log")
-        except TypeError:
-            log_handle.write("log")
+        log_handle.write("log\n")
+        if progress_parser is not None:
+            progress_parser("frame= 120 fps=30.0 q=28.0 size=1024kB time=00:00:04.00")
         return 0
 
     monkeypatch.setattr(patched_app, "_download_to", tracking_download)
@@ -2135,7 +2194,7 @@ def test_run_ffmpeg_command_requires_duration_limit(patched_app, monkeypatch):
 
 
 def test_run_ffmpeg_with_timeout_handles_spawn_failure(app_module, monkeypatch):
-    def boom_popen(cmd, stdout=None, stderr=None):
+    def boom_popen(cmd, stdout=None, stderr=None, **kwargs):
         raise RuntimeError("spawn failed")
 
     monkeypatch.setattr(app_module.subprocess, "Popen", boom_popen)
@@ -2152,9 +2211,10 @@ def test_run_ffmpeg_with_timeout_handles_timeout(app_module, monkeypatch):
     killed = False
 
     class SlowProc:
-        def __init__(self, cmd, stdout=None, stderr=None):
+        def __init__(self, cmd, stdout=None, stderr=None, **kwargs):
             self.cmd = cmd
             self._wait_count = 0
+            self.stderr = io.StringIO("")
 
         def wait(self, timeout=None):
             self._wait_count += 1
@@ -2169,8 +2229,8 @@ def test_run_ffmpeg_with_timeout_handles_timeout(app_module, monkeypatch):
             nonlocal killed
             killed = True
 
-    def slow_popen(cmd, stdout=None, stderr=None):
-        return SlowProc(cmd, stdout=stdout, stderr=stderr)
+    def slow_popen(cmd, stdout=None, stderr=None, **kwargs):
+        return SlowProc(cmd, stdout=stdout, stderr=stderr, **kwargs)
 
     monkeypatch.setattr(app_module.subprocess, "Popen", slow_popen)
 
