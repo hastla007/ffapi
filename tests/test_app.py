@@ -845,6 +845,20 @@ def test_image_upload_rejects_oversized_file(patched_app):
     assert exc.value.status_code == 413
 
 
+def test_stream_upload_rejects_declared_length(patched_app, tmp_path):
+    too_large = str(patched_app.MAX_FILE_SIZE_BYTES + 1024)
+    upload = UploadFile(
+        file=io.BytesIO(b"123"),
+        filename="clip.mp4",
+        headers=Headers({"content-type": "video/mp4", "content-length": too_large}),
+    )
+    destination = tmp_path / "clip.mp4"
+    with pytest.raises(patched_app.HTTPException) as exc:
+        asyncio.run(patched_app.stream_upload_to_path(upload, destination))
+    assert exc.value.status_code == 413
+    assert not destination.exists()
+
+
 def test_compose_from_binaries_with_all_inputs(patched_app):
     video = UploadFile(file=io.BytesIO(b"video"), filename="video.mp4", headers=Headers({"content-type": "video/mp4"}))
     audio = UploadFile(file=io.BytesIO(b"audio"), filename="audio.mp3", headers=Headers({"content-type": "audio/mpeg"}))

@@ -645,6 +645,24 @@ async def stream_upload_to_path(upload: UploadFile, dest: Path) -> int:
     await upload.seek(0)
     total = 0
     try:
+        header_value = upload.headers.get("content-length") if upload.headers else None
+    except AttributeError:
+        header_value = None
+    if header_value:
+        try:
+            declared_length = int(header_value)
+        except (TypeError, ValueError):
+            logger.warning("Invalid content-length header on upload %s: %s", upload.filename, header_value)
+        else:
+            if declared_length > MAX_FILE_SIZE_BYTES:
+                logger.warning(
+                    "Upload %s declared size %s exceeds max bytes %s",
+                    upload.filename,
+                    declared_length,
+                    MAX_FILE_SIZE_BYTES,
+                )
+                raise HTTPException(status_code=413, detail="File too large")
+    try:
         with dest.open("wb") as buffer:
             while chunk := await upload.read(UPLOAD_CHUNK_SIZE):
                 total += len(chunk)
@@ -2600,7 +2618,7 @@ def _ffprobe_cmd_base(
     if select_streams: cmd += ["-select_streams", select_streams]
     return cmd
 
-def _headers_kv_list(h: Optional[Dict[str, str]]) -> list:
+def _headers_kv_list(h: Optional[Dict[str, str]]) -> List[str]:
     if not h: return []
     out = []
     for k, v in h.items():
