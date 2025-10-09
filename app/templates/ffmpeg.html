@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+
+{% block head_extra %}
+  {% if auto_refresh and auto_refresh > 0 %}
+    <meta http-equiv="refresh" content="{{ auto_refresh }}" />
+  {% endif %}
+  <style>
+    h1 {
+      margin-top: 0;
+      margin-bottom: 24px;
+    }
+    .section {
+      margin-bottom: 36px;
+    }
+    pre {
+      background: #f5f5f5;
+      padding: 15px;
+      border-radius: 4px;
+      overflow-x: auto;
+      font-size: 12px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+    }
+    .logs {
+      height: 600px;
+      background: #1e1e1e;
+      color: #d4d4d4;
+    }
+    .controls {
+      margin-bottom: 15px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .btn {
+      background: #28a745;
+      color: #fff;
+      padding: 8px 16px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      text-decoration: none;
+      font-weight: 600;
+      display: inline-block;
+    }
+    .btn:hover {
+      background: #1f7a34;
+    }
+    .btn.secondary {
+      background: #475569;
+    }
+    .btn.secondary:hover {
+      background: #334155;
+    }
+    .info {
+      color: #64748b;
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+    .status {
+      padding: 6px 12px;
+      background: #e8f4f8;
+      border-radius: 4px;
+      font-size: 13px;
+      color: #1f7a34;
+    }
+    .status.active {
+      background: #d4edda;
+      color: #166534;
+    }
+  </style>
+{% endblock %}
+
+{% block content %}
+  <h1>FFmpeg &amp; Container Information</h1>
+  <div class="section">
+    <h2>FFmpeg Version &amp; Build</h2>
+    <pre>{{ version_output | e }}</pre>
+  </div>
+  <div class="section">
+    <h2>Application Logs (Last 1000 lines)</h2>
+    <div class="controls">
+      <a class="btn" href="/ffmpeg">Manual Refresh</a>
+      <a class="btn secondary" href="/ffmpeg?auto_refresh=5">Auto 5s</a>
+      <a class="btn secondary" href="/ffmpeg?auto_refresh=10">Auto 10s</a>
+      <a class="btn secondary" href="/ffmpeg?auto_refresh=30">Auto 30s</a>
+      <a class="btn secondary" href="/ffmpeg">Stop Auto</a>
+      <span class="status{% if auto_refresh and auto_refresh > 0 %} active{% endif %}">{{ refresh_status }}</span>
+    </div>
+    <div class="info">Page loaded: {{ current_time }}{% if log_info %} | {{ log_info }}{% endif %}</div>
+    <pre class="logs" id="logContainer">{{ app_logs | e }}</pre>
+  </div>
+  <script>
+    window.addEventListener('DOMContentLoaded', function () {
+      var logContainer = document.getElementById('logContainer');
+      if (logContainer) {
+        logContainer.scrollTop = logContainer.scrollHeight;
+      }
+    });
+  </script>
+{% endblock %}

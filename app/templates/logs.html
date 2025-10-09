@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+
+{% block head_extra %}
+  <style>
+    h1 {
+      margin-top: 0;
+      margin-bottom: 20px;
+    }
+    table.logs-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+    }
+    table.logs-table th,
+    table.logs-table td {
+      border-bottom: 1px solid #e2e8f0;
+      padding: 12px 14px;
+      font-size: 14px;
+      text-align: left;
+    }
+    table.logs-table th {
+      background: #f8fafc;
+      color: #1f2937;
+    }
+    table.logs-table a {
+      color: #0f172a;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    table.logs-table a:hover {
+      text-decoration: underline;
+    }
+    .pagination {
+      margin-top: 16px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      font-size: 14px;
+      color: #475569;
+    }
+    .pagination a {
+      color: #1f7a34;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .pagination a:hover {
+      text-decoration: underline;
+    }
+  </style>
+{% endblock %}
+
+{% block content %}
+  <h1>FFmpeg Logs</h1>
+  <table class="logs-table">
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Filename</th>
+        <th>Operation</th>
+        <th>Size</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if entries %}
+        {% for entry in entries %}
+          <tr>
+            <td>{{ entry.day }}</td>
+            <td>{{ entry.name }}</td>
+            <td>{{ entry.operation }}</td>
+            <td>{{ entry.size_display }} KB</td>
+            <td><a href="/logs/view?path={{ entry.path }}" target="_blank">View</a></td>
+          </tr>
+        {% endfor %}
+      {% else %}
+        <tr>
+          <td colspan="5">No logs yet</td>
+        </tr>
+      {% endif %}
+    </tbody>
+  </table>
+  {% if total_items %}
+    <div class="pagination">
+      {% if pagination.has_prev and pagination.prev_url %}
+        <a href="{{ pagination.prev_url }}">&laquo; Prev</a>
+      {% endif %}
+      <span>Page {{ pagination.page }} of {{ pagination.total_pages }}</span>
+      {% if pagination.has_next and pagination.next_url %}
+        <a href="{{ pagination.next_url }}">Next &raquo;</a>
+      {% endif %}
+    </div>
+  {% endif %}
+{% endblock %}
