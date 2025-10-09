@@ -220,7 +220,7 @@ def test_security_headers_and_generated_request_id(app_module):
     assert status == 200
     assert (
         headers["content-security-policy"]
-        == "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+        == "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:"
     )
     assert headers["x-content-type-options"] == "nosniff"
     assert headers["x-frame-options"] == "DENY"
