@@ -363,7 +363,7 @@ def test_settings_page_shows_auth_retention_and_storage_sections(patched_app):
     assert "UI Authentication" in html
     assert "Require login for dashboard pages" in html
     assert "auth-row" in html
-    assert "credentials-card is-disabled" in html
+    assert "credentials-block is-disabled" in html
     assert "button type=\"submit\" disabled" in html
     assert "Two-factor authentication" in html
     assert "twofactor-card is-disabled" in html
@@ -592,7 +592,7 @@ def test_settings_page_enables_credentials_when_authentication_required(patched_
     )
     assert status == 200
     html = body.decode()
-    assert "credentials-card is-disabled" not in html
+    assert "credentials-block is-disabled" not in html
     assert "button type=\"submit\" disabled" not in html
 
 

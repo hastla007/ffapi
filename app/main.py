@@ -642,7 +642,8 @@ def render_settings_page(
         .auth-card h3 {{ margin: 0; font-size: 16px; color: #1f2937; }}
         .auth-card p {{ margin: 0; font-size: 14px; color: #334155; }}
         .auth-card form {{ margin-top: 0; display: flex; flex-direction: column; gap: 12px; }}
-        .auth-card.is-disabled {{ opacity: 0.5; }}
+        .credentials-block {{ margin-top: 20px; padding-top: 16px; border-top: 1px solid #e1e7ef; display: flex; flex-direction: column; gap: 12px; }}
+        .credentials-block.is-disabled {{ opacity: 0.5; }}
         .credentials-grid {{ display: grid; grid-template-columns: 1fr; gap: 12px; }}
         .credentials-grid label {{ margin-bottom: 0; }}
         .twofactor-card .status-pill {{ background: #e0f2fe; color: #0369a1; }}
@@ -687,18 +688,18 @@ def render_settings_page(
               <button type="submit">Save preference</button>
             </form>
             {logout_button}
-          </div>
-          <div class="auth-card credentials-card{disabled_class}">
-            <h3>Update credentials</h3>
-            <form method="post" action="/settings/credentials">
-              <div class="credentials-grid">
-                <label for="username">Username</label>
-                <input id="username" name="username" type="text" value="{html.escape(UI_AUTH.username, quote=True)}" required{disabled_attr} />
-                <label for="password">New password</label>
-                <input id="password" name="password" type="password" placeholder="Enter a new password" required{disabled_attr} />
-              </div>
-              <button type="submit"{disabled_attr}>Update credentials</button>
-            </form>
+            <div class="credentials-block{disabled_class}">
+              <h4>Update credentials</h4>
+              <form method="post" action="/settings/credentials">
+                <div class="credentials-grid">
+                  <label for="username">Username</label>
+                  <input id="username" name="username" type="text" value="{html.escape(UI_AUTH.username, quote=True)}" required{disabled_attr} />
+                  <label for="password">New password</label>
+                  <input id="password" name="password" type="password" placeholder="Enter a new password" required{disabled_attr} />
+                </div>
+                <button type="submit"{disabled_attr}>Update credentials</button>
+              </form>
+            </div>
           </div>
           <div class="auth-card twofactor-card{two_factor_card_class}">
             <h3>Two-factor authentication</h3>
