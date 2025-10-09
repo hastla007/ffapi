@@ -172,6 +172,9 @@
     .whitelist-card button {
       width: fit-content;
     }
+    .whitelist-form .whitelist-submit {
+      margin-top: 20px;
+    }
     .whitelist-header {
       display: flex;
       align-items: center;
@@ -611,8 +614,11 @@
             </label>
             <label for="whitelist_entries">Allowed IPs or CIDR ranges</label>
             <textarea id="whitelist_entries" name="whitelist_entries" rows="5"{% if api_whitelist.disabled %} disabled{% endif %}>{{ api_whitelist.entries_text }}</textarea>
-            <span class="help-text">{{ api_whitelist.help_text }}</span>
-            <button type="submit"{% if api_whitelist.disabled %} disabled{% endif %}>Save API whitelist</button>
+            <span class="help-text">Enter one IPv4/IPv6 address or CIDR range per line.</span>
+            {% if api_whitelist.help_text %}
+              <span class="help-text">{{ api_whitelist.help_text }}</span>
+            {% endif %}
+            <button type="submit"{% if api_whitelist.disabled %} disabled{% endif %} class="whitelist-submit">Save API whitelist</button>
           </form>
         </div>
       </section>
