@@ -1,0 +1,5 @@
+<nav class="main-nav">
+  {% for link in nav_links %}
+    <a href="{{ link.href }}"{% if link.href == active_path %} class="active"{% endif %}>{{ link.label }}</a>
+  {% endfor %}
+</nav>
