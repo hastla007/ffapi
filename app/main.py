@@ -791,6 +791,27 @@ def storage_management_snapshot() -> Dict[str, Any]:
     }
 
 
+NAV_LINKS: Tuple[Tuple[str, str], ...] = (
+    ("/downloads", "Downloads"),
+    ("/logs", "Logs"),
+    ("/ffmpeg", "FFmpeg Info"),
+    ("/metrics", "Metrics"),
+    ("/jobs", "Jobs"),
+    ("/documentation", "API Docs"),
+    ("/api-keys", "API Keys"),
+    ("/settings", "Settings"),
+)
+
+
+def render_nav(active: Optional[str] = None, *, indent: str = "      ") -> str:
+    lines = ["<nav>"]
+    for href, label in NAV_LINKS:
+        class_attr = ' class="active"' if active == href else ""
+        lines.append(f'  <a href="{href}"{class_attr}>{label}</a>')
+    lines.append("</nav>")
+    return "\n".join(f"{indent}{line}" for line in lines)
+
+
 def render_login_page(next_path: str, csrf_token: str, error: Optional[str] = None) -> str:
     alert = ""
     if error:
@@ -1051,6 +1072,7 @@ def render_settings_page(
             </div>
     """
 
+    nav_html = render_nav("/settings")
     return f"""
     <!doctype html>
     <html>
@@ -1140,16 +1162,7 @@ def render_settings_page(
     </head>
     <body>
       <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
-      <nav>
-        <a href=\"/downloads\">Downloads</a>
-        <a href=\"/logs\">Logs</a>
-        <a href=\"/ffmpeg\">FFmpeg Info</a>
-        <a href=\"/metrics\">Metrics</a>
-        <a href=\"/jobs\">Jobs</a>
-        <a href=\"/documentation\">API Docs</a>
-        <a href=\"/api-keys\">API Keys</a>
-        <a href=\"/settings\">Settings</a>
-      </nav>
+{nav_html}
       {alerts}
 
       <section>
@@ -1486,6 +1499,7 @@ def render_api_keys_page(
             "<p class=\"help-text\">Enable API authentication in <a href=\"/settings\">Settings</a> before generating keys.</p>"
         )
 
+    nav_html = render_nav("/api-keys")
     return f"""
     <!doctype html>
     <html>
@@ -1531,16 +1545,7 @@ def render_api_keys_page(
     </head>
     <body>
       <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
-      <nav>
-        <a href=\"/downloads\">Downloads</a>
-        <a href=\"/logs\">Logs</a>
-        <a href=\"/ffmpeg\">FFmpeg Info</a>
-        <a href=\"/metrics\">Metrics</a>
-        <a href=\"/jobs\">Jobs</a>
-        <a href=\"/documentation\">API Docs</a>
-        <a href=\"/api-keys\">API Keys</a>
-        <a href=\"/settings\">Settings</a>
-      </nav>
+{nav_html}
       {alerts}
 
       <section>
@@ -2731,6 +2736,7 @@ def downloads(
     )
     search_value = html.escape(search, quote=True)
 
+    nav_html = render_nav("/downloads")
     html_content = f"""
     <!doctype html>
     <html>
@@ -2766,16 +2772,7 @@ def downloads(
     </head>
     <body>
       <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-      <nav>
-        <a href="/downloads">Downloads</a>
-        <a href="/logs">Logs</a>
-        <a href="/ffmpeg">FFmpeg Info</a>
-        <a href="/metrics">Metrics</a>
-        <a href="/jobs">Jobs</a>
-        <a href="/documentation">API Docs</a>
-        <a href="/api-keys">API Keys</a>
-        <a href="/settings">Settings</a>
-      </nav>
+{nav_html}
       <h2>Generated Files</h2>
       <form method="get" class="filters">
         <input type="text" name="q" value="{search_value}" placeholder="Search by filename or date" />
@@ -2874,6 +2871,7 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
         else ""
     )
 
+    nav_html = render_nav("/logs")
     html_content = f"""
     <!doctype html>
     <html>
@@ -2897,16 +2895,7 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
     </head>
     <body>
       <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-      <nav>
-        <a href="/downloads">Downloads</a>
-        <a href="/logs">Logs</a>
-        <a href="/ffmpeg">FFmpeg Info</a>
-        <a href="/metrics">Metrics</a>
-        <a href="/jobs">Jobs</a>
-        <a href="/documentation">API Docs</a>
-        <a href="/api-keys">API Keys</a>
-        <a href="/settings">Settings</a>
-      </nav>
+{nav_html}
       <h2>FFmpeg Logs</h2>
       <table>
         <thead><tr><th>Date</th><th>Filename</th><th>Operation</th><th>Size</th><th>Action</th></tr></thead>
@@ -2986,6 +2975,7 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
     app_logs_safe = html.escape(app_logs)
     log_info_safe = html.escape(log_info)
 
+    nav_html = render_nav("/ffmpeg")
     html_content = f"""
     <!doctype html>
     <html>
@@ -3040,16 +3030,7 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
     </head>
     <body>
       <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-      <nav>
-        <a href="/downloads">Downloads</a>
-        <a href="/logs">Logs</a>
-        <a href="/ffmpeg">FFmpeg Info</a>
-        <a href="/metrics">Metrics</a>
-        <a href="/jobs">Jobs</a>
-        <a href="/documentation">API Docs</a>
-        <a href="/api-keys">API Keys</a>
-        <a href="/settings">Settings</a>
-      </nav>
+{nav_html}
       <h2>FFmpeg & Container Information</h2>
       
       <div class="section">
@@ -3373,7 +3354,8 @@ def documentation(request: Request):
   <div class="example">Example:<br>curl "http://localhost:3000/probe/public?rel=20241008/20241008_143022_12345678.mp4&show_format=true&show_streams=true"</div>
 </div>
 """
-    
+
+    nav_html = render_nav("/documentation")
     html_content = f"""
     <!doctype html>
     <html>
@@ -3464,16 +3446,7 @@ def documentation(request: Request):
     </head>
     <body>
       <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-      <nav>
-        <a href="/downloads">Downloads</a>
-        <a href="/logs">Logs</a>
-        <a href="/ffmpeg">FFmpeg Info</a>
-        <a href="/metrics">Metrics</a>
-        <a href="/jobs">Jobs</a>
-        <a href="/documentation">API Docs</a>
-        <a href="/api-keys">API Keys</a>
-        <a href="/settings">Settings</a>
-      </nav>
+{nav_html}
       <h2>FFAPI Ultimate - API Documentation</h2>
       
       <div class="intro">
@@ -3992,6 +3965,7 @@ def metrics_dashboard(request: Request):
     )
     recent_percent = f"{recent_rate * 100.0:.1f}%" if recent_rate is not None else "-"
 
+    nav_html = render_nav("/metrics")
     html_content = f"""
     <!doctype html>
     <html>
@@ -4022,15 +3996,7 @@ def metrics_dashboard(request: Request):
     </head>
     <body>
       <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-      <nav>
-        <a href="/downloads">Downloads</a>
-        <a href="/logs">Logs</a>
-        <a href="/ffmpeg">FFmpeg Info</a>
-        <a href="/metrics">Metrics</a>
-        <a href="/documentation">API Docs</a>
-        <a href="/api-keys">API Keys</a>
-        <a href="/settings">Settings</a>
-      </nav>
+{nav_html}
 
       <div class="cards">
         <div class="card">
@@ -5203,6 +5169,7 @@ def jobs_history(
 
     pagination = f"Page {page} of {total_pages}"
 
+    nav_html = render_nav("/jobs", indent="        ")
     html_content = f"""
     <!doctype html>
     <html>
@@ -5234,16 +5201,7 @@ def jobs_history(
     </head>
     <body>
         <div class="brand"><span class="ff">ff</span><span class="api">api</span></div>
-        <nav>
-            <a href="/downloads">Downloads</a>
-            <a href="/logs">Logs</a>
-            <a href="/ffmpeg">FFmpeg Info</a>
-            <a href="/metrics">Metrics</a>
-            <a href="/jobs" class="active">Jobs</a>
-            <a href="/documentation">API Docs</a>
-            <a href="/api-keys">API Keys</a>
-            <a href="/settings">Settings</a>
-        </nav>
+{nav_html}
         <h2>Job History</h2>
         <div class="filters">{''.join(filters)}</div>
         <table>
