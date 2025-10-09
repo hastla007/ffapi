@@ -249,6 +249,7 @@ _FFMPEG_VERSION_CACHE: Optional[Dict[str, Optional[str]]] = None
 
 JOBS: Dict[str, Dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
+SETTINGS_LOCK = threading.Lock()
 
 
 SESSION_COOKIE_NAME = "ffapi_session"
@@ -3729,8 +3730,9 @@ async def settings_update_retention(request: Request):
 
     days = hours / 24
     global RETENTION_DAYS
-    RETENTION_DAYS = days
-    settings.RETENTION_DAYS = days
+    with SETTINGS_LOCK:
+        RETENTION_DAYS = days
+        settings.RETENTION_DAYS = days
     cleanup_old_public()
     formatted_hours = f"{hours:.1f}".rstrip("0").rstrip(".")
     query = urlencode({"message": f"Retention updated to {formatted_hours} hour(s)"})
@@ -3814,19 +3816,20 @@ async def settings_update_performance(request: Request):
 
     global FFMPEG_TIMEOUT_SECONDS, UPLOAD_CHUNK_SIZE, MAX_FILE_SIZE_MB, MAX_FILE_SIZE_BYTES
 
-    RATE_LIMITER.update_limit(rpm)
-    settings.RATE_LIMIT_REQUESTS_PER_MINUTE = rpm
+    with SETTINGS_LOCK:
+        RATE_LIMITER.update_limit(rpm)
+        settings.RATE_LIMIT_REQUESTS_PER_MINUTE = rpm
 
-    FFMPEG_TIMEOUT_SECONDS = int(timeout_minutes * 60)
-    settings.FFMPEG_TIMEOUT_SECONDS = FFMPEG_TIMEOUT_SECONDS
+        FFMPEG_TIMEOUT_SECONDS = int(timeout_minutes * 60)
+        settings.FFMPEG_TIMEOUT_SECONDS = FFMPEG_TIMEOUT_SECONDS
 
-    upload_chunk_bytes = max(1, int(chunk_mb * 1024 * 1024))
-    UPLOAD_CHUNK_SIZE = upload_chunk_bytes
-    settings.UPLOAD_CHUNK_SIZE = upload_chunk_bytes
+        upload_chunk_bytes = max(1, int(chunk_mb * 1024 * 1024))
+        UPLOAD_CHUNK_SIZE = upload_chunk_bytes
+        settings.UPLOAD_CHUNK_SIZE = upload_chunk_bytes
 
-    MAX_FILE_SIZE_MB = max_file_mb
-    MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-    settings.MAX_FILE_SIZE_MB = MAX_FILE_SIZE_MB
+        MAX_FILE_SIZE_MB = max_file_mb
+        MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+        settings.MAX_FILE_SIZE_MB = MAX_FILE_SIZE_MB
 
     message = "Performance settings updated"
     query = urlencode({"message": message})

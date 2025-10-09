@@ -1408,18 +1408,18 @@ def test_cleanup_old_public_handles_missing_file_race(app_module, monkeypatch):
     cutoff = time.time() - ((app_module.RETENTION_DAYS + 1) * 86400)
     os.utime(old_file, (cutoff, cutoff))
 
-    original_unlink = app_module.os.unlink
+    original_unlink = Path.unlink
     triggered = {"count": 0}
 
-    def flaky_unlink(path, *args, **kwargs):
-        if Path(path) == old_file and not triggered["count"]:
+    def flaky_unlink(self, *args, **kwargs):
+        if self == old_file and not triggered["count"]:
             triggered["count"] = 1
             if old_file.exists():
-                original_unlink(path)
+                original_unlink(self, *args, **kwargs)
             raise FileNotFoundError("already removed")
-        return original_unlink(path, *args, **kwargs)
+        return original_unlink(self, *args, **kwargs)
 
-    monkeypatch.setattr(app_module.os, "unlink", flaky_unlink)
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
 
     app_module.cleanup_old_public(days=app_module.RETENTION_DAYS)
 
