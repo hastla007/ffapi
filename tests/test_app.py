@@ -9,7 +9,7 @@ import time
 from itertools import count
 from pathlib import Path
 from typing import List, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
 from unittest.mock import Mock
 
 import pytest
@@ -313,6 +313,7 @@ def patched_app(app_module, monkeypatch, tmp_path):
     app_module.METRICS.reset()
     app_module.RATE_LIMITER.reset()
     app_module.UI_AUTH.reset()
+    app_module.API_KEYS.reset()
 
     return app_module
 
@@ -320,8 +321,10 @@ def patched_app(app_module, monkeypatch, tmp_path):
 @pytest.fixture(autouse=True)
 def reset_ui_auth_state(app_module):
     app_module.UI_AUTH.reset()
+    app_module.API_KEYS.reset()
     yield
     app_module.UI_AUTH.reset()
+    app_module.API_KEYS.reset()
 
 
 def test_root_redirects_to_downloads(patched_app):
@@ -717,6 +720,188 @@ def test_performance_settings_rejects_bad_values(patched_app):
     assert "Rate Limit Rpm must be between 1 and 100000" in html
     assert patched_app.RATE_LIMITER.current_limit() == original_rpm
     assert patched_app.settings.RATE_LIMIT_REQUESTS_PER_MINUTE == original_rpm
+
+
+def test_api_keys_page_shows_controls(patched_app):
+    status, _, body = call_app(patched_app.app, "GET", "/api-keys")
+    assert status == 200
+    html = body.decode()
+    assert "API Key Authentication" in html
+    assert "Require API key for requests" in html
+    assert "Generate new key" in html
+    assert "No API keys yet" in html
+
+
+def test_api_keys_toggle_requires_login_when_ui_auth_enabled(patched_app):
+    enable_body = urlencode({"require_login": "true"}).encode()
+    status, _, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/ui-auth",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=enable_body,
+    )
+    assert status == 303
+
+    status, headers, _ = call_app(patched_app.app, "GET", "/api-keys")
+    assert status == 303
+    assert headers["location"].startswith("/settings?next=%2Fapi-keys")
+
+    login_body = urlencode({"username": "admin", "password": "admin123"}).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/settings/login",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=login_body,
+    )
+    assert status == 303
+    session_cookie = headers["set-cookie"].split(";", 1)[0]
+
+    toggle_body = urlencode({"require_api_key": "true"}).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/api-keys/require",
+        headers=[
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Cookie", session_cookie),
+        ],
+        body=toggle_body,
+    )
+    assert status == 303
+    assert headers["location"].startswith("/api-keys")
+    assert patched_app.API_KEYS.is_required() is True
+
+
+def test_api_key_generation_and_listing(patched_app):
+    toggle_body = urlencode({"require_api_key": "true"}).encode()
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/api-keys/require",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=toggle_body,
+    )
+    assert status == 303
+    assert patched_app.API_KEYS.is_required() is True
+
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/api-keys/generate",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=b"",
+    )
+    assert status == 303
+    location = headers["location"]
+    parsed = urlparse(location)
+    params = parse_qs(parsed.query)
+    new_key_id = params["new_key_id"][0]
+
+    status, _, body = call_app(
+        patched_app.app,
+        "GET",
+        parsed.path,
+        query=parsed.query,
+    )
+    assert status == 200
+    html = body.decode()
+    assert "New API key generated" in html
+    snippet = html.split("New API key generated", 1)[1]
+    start = snippet.index("<code>") + len("<code>")
+    end = snippet.index("</code>", start)
+    key_value = snippet[start:end]
+    assert key_value
+    listing = patched_app.API_KEYS.list_keys()
+    assert len(listing) == 1
+    assert key_value.startswith(listing[0]["prefix"])
+    assert listing[0]["id"] == new_key_id
+    assert patched_app.API_KEYS.verify(key_value) is True
+    table_section = html.split("<tbody>", 1)[1]
+    assert key_value[:8] in table_section
+
+
+def test_api_requests_require_key_when_enabled(patched_app):
+    payload = {
+        "video_url": "https://example.com/video.mp4",
+        "duration_ms": 1000,
+        "width": 640,
+        "height": 360,
+        "fps": 24,
+    }
+
+    status, _, body = call_app(
+        patched_app.app,
+        "POST",
+        "/compose/from-urls",
+        headers=[("content-type", "application/json")],
+        body=json.dumps(payload).encode("utf-8"),
+        query="as_json=true",
+    )
+    assert status == 200
+    result = json.loads(body.decode())
+    assert result["ok"] is True
+
+    toggle_body = urlencode({"require_api_key": "true"}).encode()
+    status, _, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/api-keys/require",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=toggle_body,
+    )
+    assert status == 303
+
+    status, _, body = call_app(
+        patched_app.app,
+        "POST",
+        "/compose/from-urls",
+        headers=[("content-type", "application/json")],
+        body=json.dumps(payload).encode("utf-8"),
+        query="as_json=true",
+    )
+    assert status == 401
+    error_payload = json.loads(body.decode())
+    assert error_payload["error"] == "api_key_required"
+
+    status, headers, _ = call_app(
+        patched_app.app,
+        "POST",
+        "/api-keys/generate",
+        headers=[("Content-Type", "application/x-www-form-urlencoded")],
+        body=b"",
+    )
+    location = headers["location"]
+    parsed_location = urlparse(location)
+    status, _, body = call_app(
+        patched_app.app,
+        "GET",
+        parsed_location.path,
+        query=parsed_location.query,
+    )
+    html = body.decode()
+    snippet = html.split("New API key generated", 1)[1]
+    start = snippet.index("<code>") + len("<code>")
+    end = snippet.index("</code>", start)
+    key_value = snippet[start:end]
+
+    status, _, body = call_app(
+        patched_app.app,
+        "POST",
+        "/compose/from-urls",
+        headers=[
+            ("content-type", "application/json"),
+            ("X-API-Key", key_value),
+        ],
+        body=json.dumps(payload).encode("utf-8"),
+        query="as_json=true",
+    )
+    assert status == 200
+    data = json.loads(body.decode())
+    assert data["ok"] is True
+    listing = patched_app.API_KEYS.list_keys()
+    assert listing and listing[0]["last_used"] is not None
 
 
 def test_concurrent_requests_handle_independent_state(patched_app):

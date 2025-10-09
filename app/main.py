@@ -384,6 +384,109 @@ class UIAuthManager:
 UI_AUTH = UIAuthManager()
 
 
+class APIKeyManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.require_key = False
+        self._keys: Dict[str, Dict[str, Any]] = {}
+        self._plaintext: Dict[str, str] = {}
+
+    def reset(self) -> None:
+        with self._lock:
+            self.require_key = False
+            self._keys.clear()
+            self._plaintext.clear()
+
+    def is_required(self) -> bool:
+        with self._lock:
+            return self.require_key
+
+    def set_require_key(self, enabled: bool) -> None:
+        with self._lock:
+            self.require_key = enabled
+
+    def generate_key(self) -> tuple[str, str]:
+        token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        entry = {
+            "hash": digest,
+            "created": time.time(),
+            "prefix": token[:8],
+            "last_used": None,
+        }
+        key_id = uuid4().hex
+        with self._lock:
+            self._keys[key_id] = entry
+            self._plaintext[key_id] = token
+        return key_id, token
+
+    def consume_plaintext(self, key_id: str) -> Optional[str]:
+        with self._lock:
+            return self._plaintext.pop(key_id, None)
+
+    def list_keys(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = [
+                {
+                    "id": key_id,
+                    "prefix": data["prefix"],
+                    "created": data["created"],
+                    "last_used": data.get("last_used"),
+                }
+                for key_id, data in self._keys.items()
+            ]
+        items.sort(key=lambda item: item["created"], reverse=True)
+        return items
+
+    def remove_key(self, key_id: str) -> None:
+        with self._lock:
+            self._keys.pop(key_id, None)
+            self._plaintext.pop(key_id, None)
+
+    def verify(self, token: Optional[str]) -> bool:
+        if not token:
+            return False
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        now = time.time()
+        with self._lock:
+            for data in self._keys.values():
+                if secrets.compare_digest(data["hash"], digest):
+                    data["last_used"] = now
+                    return True
+        return False
+
+
+API_KEYS = APIKeyManager()
+
+
+_DASHBOARD_EXACT_PATHS = {"/", "/health"}
+_DASHBOARD_PREFIXES = (
+    "/downloads",
+    "/logs",
+    "/ffmpeg",
+    "/metrics",
+    "/documentation",
+    "/settings",
+    "/api-keys",
+    "/files",
+)
+
+
+def is_dashboard_path(path: str) -> bool:
+    if path in _DASHBOARD_EXACT_PATHS:
+        return True
+    return any(path.startswith(prefix) for prefix in _DASHBOARD_PREFIXES)
+
+
+def requires_api_key(request: Request) -> bool:
+    if not API_KEYS.is_required():
+        return False
+    path = request.url.path
+    if is_dashboard_path(path):
+        return False
+    return True
+
+
 def is_authenticated(request: Request) -> bool:
     token = request.cookies.get(SESSION_COOKIE_NAME)
     return UI_AUTH.authenticate_session(token)
@@ -607,7 +710,7 @@ def render_settings_page(
       <meta charset=\"utf-8\" />
       <title>Settings</title>
       <style>
-        body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 900px; margin: 0 auto; }}
+        body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
         .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
         .brand .ff {{ color: #28a745; }}
         .brand .api {{ color: #000; }}
@@ -658,6 +761,7 @@ def render_settings_page(
         .help-text {{ font-size: 13px; color: #526079; }}
         .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
         .field-card {{ background: #f9fbff; padding: 12px; border-radius: 8px; box-shadow: inset 0 0 0 1px #d6e2f1; display: grid; gap: 8px; }}
+        .retention-form button, .performance-form button {{ margin-top: 16px; }}
         .field-card label {{ margin-bottom: 0; }}
       </style>
     </head>
@@ -669,6 +773,7 @@ def render_settings_page(
         <a href=\"/ffmpeg\">FFmpeg Info</a>
         <a href=\"/metrics\">Metrics</a>
         <a href=\"/documentation\">API Docs</a>
+        <a href=\"/api-keys\">API Keys</a>
         <a href=\"/settings\">Settings</a>
       </nav>
       {alerts}
@@ -718,7 +823,7 @@ def render_settings_page(
       <div class="section-pair">
       <section>
         <h2>Retention Settings</h2>
-        <form method="post" action="/settings/retention">
+        <form method="post" action="/settings/retention" class="retention-form">
           <label for="retention_hours">Default retention (hours)</label>
           <input
               id="retention_hours"
@@ -764,7 +869,7 @@ def render_settings_page(
 
       <section>
         <h2>Performance Settings</h2>
-          <form method="post" action="/settings/performance">
+          <form method="post" action="/settings/performance" class="performance-form">
             <div class="form-grid">
               <div class="field-card">
                 <label for="rate_limit_rpm">Rate limit (requests/minute)</label>
@@ -830,6 +935,175 @@ def render_settings_page(
     </body>
     </html>
     """
+
+
+def render_api_keys_page(
+    *,
+    keys: List[Dict[str, Any]],
+    require_key: bool,
+    message: Optional[str] = None,
+    error: Optional[str] = None,
+    new_key: Optional[str] = None,
+) -> str:
+    alert_blocks: List[str] = []
+    if message:
+        alert_blocks.append(f"<div class=\"alert success\">{html.escape(message)}</div>")
+    if error:
+        alert_blocks.append(f"<div class=\"alert error\">{html.escape(error)}</div>")
+    if new_key:
+        alert_blocks.append(
+            """
+            <div class="alert success">
+              <strong>New API key generated</strong>
+              <p>Copy this value now — it will not be shown again.</p>
+              <code>{key}</code>
+            </div>
+            """.format(key=html.escape(new_key)),
+        )
+    alerts = "".join(alert_blocks)
+
+    checkbox_state = "checked" if require_key else ""
+    disabled_class = "" if require_key else " is-disabled"
+    disabled_attr = "" if require_key else " disabled"
+
+    def format_timestamp(epoch: Optional[float]) -> str:
+        if not epoch:
+            return "Never"
+        dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    rows = []
+    for item in keys:
+        prefix = html.escape(item["prefix"])
+        created = format_timestamp(item.get("created"))
+        last_used = format_timestamp(item.get("last_used"))
+        rows.append(
+            """
+            <tr>
+              <td>{display}&hellip;</td>
+              <td>{created}</td>
+              <td>{last_used}</td>
+              <td>
+                <form method="post" action="/api-keys/revoke">
+                  <input type="hidden" name="key_id" value="{key_id}" />
+                  <button type="submit" class="secondary"{disabled}>Revoke</button>
+                </form>
+              </td>
+            </tr>
+            """.format(
+                display=prefix,
+                created=html.escape(created),
+                last_used=html.escape(last_used),
+                key_id=html.escape(str(item["id"]), quote=True),
+                disabled=disabled_attr,
+            )
+        )
+
+    if not rows:
+        rows.append(
+            """
+            <tr>
+              <td colspan="4">No API keys yet</td>
+            </tr>
+            """
+        )
+
+    status_text = "Enabled" if require_key else "Disabled"
+    note_text = (
+        "API endpoints currently require a valid key in the X-API-Key header or api_key parameter."
+        if require_key
+        else "API endpoints are open; enable authentication to restrict access."
+    )
+
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset=\"utf-8\" />
+      <title>API Keys</title>
+      <style>
+        body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
+        .brand {{ font-size: 32px; font-weight: bold; margin-bottom: 20px; }}
+        .brand .ff {{ color: #28a745; }}
+        .brand .api {{ color: #000; }}
+        nav {{ margin-bottom: 20px; }}
+        nav a {{ margin-right: 15px; color: #0066cc; text-decoration: none; }}
+        h2 {{ margin-top: 32px; }}
+        section {{ background: #f7f9fc; padding: 20px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.08); margin-bottom: 24px; }}
+        form {{ margin-top: 12px; }}
+        label {{ display: block; font-weight: 600; margin-bottom: 6px; }}
+        input {{ padding: 10px; font-size: 14px; border: 1px solid #ccd5e0; border-radius: 4px; width: 100%; box-sizing: border-box; }}
+        button {{ padding: 10px 16px; background: #0066cc; color: #fff; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; }}
+        button:hover {{ background: #0053a3; }}
+        button.secondary {{ background: #9aa5b1; }}
+        button.secondary:hover {{ background: #7c8794; }}
+        .checkbox-row {{ display: flex; align-items: center; gap: 10px; font-weight: 600; }}
+        .checkbox-row input {{ width: auto; margin: 0; transform: scale(1.2); }}
+        .alert {{ padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }}
+        .alert.success {{ background: #e8f5e9; color: #256029; border: 1px solid #c8e6c9; }}
+        .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
+        .api-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 16px; }}
+        .api-card {{ background: #fff; padding: 16px; border-radius: 8px; box-shadow: inset 0 0 0 1px #e1e7ef; display: flex; flex-direction: column; gap: 12px; }}
+        .api-card h3 {{ margin: 0; font-size: 16px; color: #1f2937; }}
+        .api-card p {{ margin: 0; font-size: 14px; color: #334155; }}
+        .api-card form {{ margin-top: 0; display: flex; flex-direction: column; gap: 12px; }}
+        .api-card.is-disabled {{ opacity: 0.5; }}
+        .status-pill {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: #e8f5e9; color: #256029; border-radius: 999px; font-weight: 600; width: fit-content; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ padding: 10px 12px; border-bottom: 1px solid #e5edf6; font-size: 14px; text-align: left; }}
+        th {{ color: #1f2937; }}
+        code {{ background: #0f172a; color: #e2e8f0; padding: 6px 10px; border-radius: 4px; display: inline-block; font-size: 13px; }}
+      </style>
+    </head>
+    <body>
+      <div class=\"brand\"><span class=\"ff\">ff</span><span class=\"api\">api</span></div>
+      <nav>
+        <a href=\"/downloads\">Downloads</a>
+        <a href=\"/logs\">Logs</a>
+        <a href=\"/ffmpeg\">FFmpeg Info</a>
+        <a href=\"/metrics\">Metrics</a>
+        <a href=\"/documentation\">API Docs</a>
+        <a href=\"/api-keys\">API Keys</a>
+        <a href=\"/settings\">Settings</a>
+      </nav>
+      {alerts}
+
+      <section>
+        <h2>API Key Authentication</h2>
+        <div class="api-row">
+          <div class="api-card">
+            <h3>Status</h3>
+            <span class="status-pill">{status_text}</span>
+            <p>{note_text}</p>
+            <form method="post" action="/api-keys/require">
+              <label class="checkbox-row" for="require_api_key">
+                <input type="checkbox" id="require_api_key" name="require_api_key" value="true" {checkbox_state} />
+                <span>Require API key for requests</span>
+              </label>
+              <button type="submit">Save preference</button>
+            </form>
+          </div>
+          <div class="api-card keys-card{disabled_class}">
+            <h3>API Keys</h3>
+            <p>Generate keys and distribute them to clients. Include the key in the <code>X-API-Key</code> header or <code>api_key</code> query parameter.</p>
+            <form method="post" action="/api-keys/generate">
+              <button type="submit"{disabled_attr}>Generate new key</button>
+            </form>
+            <table>
+              <thead>
+                <tr><th>Key</th><th>Created</th><th>Last used</th><th></th></tr>
+              </thead>
+              <tbody>
+                {''.join(rows)}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </body>
+    </html>
+    """
+
 
 REQUEST_ID_CTX: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
 
@@ -981,6 +1255,25 @@ async def metrics_middleware(request, call_next):
     identifier = "unknown"
     if request.client:
         identifier = request.client.host or "unknown"
+
+    if requires_api_key(request):
+        provided_key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+        if not provided_key:
+            METRICS.request_finished(path, 401, 0.0, 0.0, "missing_api_key")
+            response = JSONResponse(
+                {"error": "api_key_required", "detail": "Valid API key is required"},
+                status_code=401,
+            )
+            response.headers["X-Request-ID"] = request_id
+            return response
+        if not API_KEYS.verify(provided_key):
+            METRICS.request_finished(path, 401, 0.0, 0.0, "invalid_api_key")
+            response = JSONResponse(
+                {"error": "api_key_invalid", "detail": "Supplied API key is not recognized"},
+                status_code=401,
+            )
+            response.headers["X-Request-ID"] = request_id
+            return response
 
     RATE_LIMITER.cleanup_old_identifiers()
     wait_time = 0.0
@@ -1534,6 +1827,7 @@ def downloads(request: Request):
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
+        <a href="/api-keys">API Keys</a>
         <a href="/settings">Settings</a>
       </nav>
       <h2>Generated Files</h2>
@@ -1599,6 +1893,7 @@ def logs(request: Request):
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
+        <a href="/api-keys">API Keys</a>
         <a href="/settings">Settings</a>
       </nav>
       <h2>FFmpeg Logs</h2>
@@ -1739,6 +2034,7 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
+        <a href="/api-keys">API Keys</a>
         <a href="/settings">Settings</a>
       </nav>
       <h2>FFmpeg & Container Information</h2>
@@ -1841,6 +2137,20 @@ def documentation(request: Request):
   <div class="path">/settings</div>
   <div class="desc">Configuration page for UI authentication and storage overview</div>
   <div class="example">Example:<br>curl http://localhost:3000/settings</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/api-keys</div>
+  <div class="desc">Manage API authentication, generate keys, and review usage history</div>
+  <div class="example">Example:<br>curl http://localhost:3000/api-keys</div>
+</div>
+
+<div class="endpoint">
+  <div class="method post">POST</div>
+  <div class="path">/api-keys/(require|generate|revoke)</div>
+  <div class="desc">Toggle API key enforcement, create new keys, or revoke existing ones</div>
+  <div class="params">Submit form-encoded fields such as <span class="param">require_api_key</span> or <span class="param">key_id</span>.</div>
 </div>
 
 <div class="endpoint">
@@ -2147,6 +2457,7 @@ def documentation(request: Request):
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
+        <a href="/api-keys">API Keys</a>
         <a href="/settings">Settings</a>
       </nav>
       <h2>FFAPI Ultimate - API Documentation</h2>
@@ -2478,6 +2789,78 @@ async def settings_update_performance(request: Request):
     return RedirectResponse(url=f"/settings?{query}", status_code=303)
 
 
+@app.get("/api-keys", response_class=HTMLResponse)
+def api_keys_page(
+    request: Request,
+    message: str = "",
+    error: str = "",
+    new_key_id: str = "",
+):
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
+
+    new_key_value = API_KEYS.consume_plaintext(new_key_id) if new_key_id else None
+    html_content = render_api_keys_page(
+        keys=API_KEYS.list_keys(),
+        require_key=API_KEYS.is_required(),
+        message=message or None,
+        error=error or None,
+        new_key=new_key_value,
+    )
+    return HTMLResponse(html_content)
+
+
+@app.post("/api-keys/require")
+async def api_keys_toggle(request: Request):
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
+
+    form = await request.form()
+    raw_value = form.get("require_api_key")
+    enable = False
+    if raw_value is not None:
+        enable = str(raw_value).lower() in {"true", "1", "on", "yes"}
+    API_KEYS.set_require_key(enable)
+    message = "API authentication enabled" if enable else "API authentication disabled"
+    query = urlencode({"message": message})
+    return RedirectResponse(url=f"/api-keys?{query}", status_code=303)
+
+
+@app.post("/api-keys/generate")
+async def api_keys_generate(request: Request):
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
+
+    if not API_KEYS.is_required():
+        query = urlencode({"error": "Enable API authentication before generating keys"})
+        return RedirectResponse(url=f"/api-keys?{query}", status_code=303)
+
+    key_id, _ = API_KEYS.generate_key()
+    query = urlencode({"message": "Generated new API key", "new_key_id": key_id})
+    response = RedirectResponse(url=f"/api-keys?{query}", status_code=303)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/api-keys/revoke")
+async def api_keys_revoke(request: Request):
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
+
+    form = await request.form()
+    key_id = str(form.get("key_id", "")).strip()
+    if key_id:
+        API_KEYS.remove_key(key_id)
+        query = urlencode({"message": "API key revoked"})
+    else:
+        query = urlencode({"error": "Key identifier is required"})
+    return RedirectResponse(url=f"/api-keys?{query}", status_code=303)
+
+
 @app.get("/health")
 def health():
     logger.info("Health check requested")
@@ -2590,6 +2973,7 @@ def metrics_dashboard(request: Request):
         <a href="/ffmpeg">FFmpeg Info</a>
         <a href="/metrics">Metrics</a>
         <a href="/documentation">API Docs</a>
+        <a href="/api-keys">API Keys</a>
         <a href="/settings">Settings</a>
       </nav>
 
