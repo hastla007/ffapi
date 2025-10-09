@@ -6,7 +6,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy both the app and fastapi_csrf_protect directories
 COPY app ./app
+COPY fastapi_csrf_protect ./fastapi_csrf_protect
 
 # volumes for outputs and work
 VOLUME ["/data/public", "/data/work", "/data/logs"]
