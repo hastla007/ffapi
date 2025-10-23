@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Literal, Tuple, Callable
-from urllib.parse import urlencode, quote, parse_qs
+from urllib.parse import urlencode, quote, parse_qs, urlparse
 from uuid import uuid4
 
 import re
@@ -4907,21 +4907,39 @@ def _make_async_client() -> httpx.AsyncClient:
 def _normalize_media_url(url: str) -> str:
     """Normalize media URLs to avoid malformed duplicates from the UI proxy."""
 
-    normalized = url
+    normalized = url.strip()
+    if not normalized:
+        return normalized
+
     proxy_base = "http://10.120.2.5:3000"
     localhost_base = "http://localhost:3000"
     double_prefix = f"{proxy_base}/{localhost_base}"
+    double_proxy = f"{proxy_base}/{proxy_base}"
+
+    while normalized.startswith(double_proxy):
+        normalized = proxy_base + normalized[len(double_proxy) :]
+
+    while normalized.startswith(double_prefix):
+        normalized = proxy_base + normalized[len(double_prefix) :]
 
     if normalized.startswith(double_prefix):
         normalized = proxy_base + normalized[len(double_prefix) :]
     elif normalized.startswith(localhost_base):
         normalized = proxy_base + normalized[len(localhost_base) :]
 
+    proxy_http_prefix = f"{proxy_base}/http://"
+    while normalized.startswith(proxy_http_prefix):
+        normalized = normalized[len(proxy_base) + 1 :]
+
     if normalized.startswith("http://"):
         rest = normalized[len("http://") :]
         while rest.startswith("http://"):
             rest = rest[len("http://") :]
         normalized = "http://" + rest
+
+    parsed = urlparse(normalized)
+    if not parsed.scheme:
+        normalized = f"{proxy_base}/{normalized.lstrip('/')}"
 
     return normalized
 
