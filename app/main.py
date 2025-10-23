@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional, Literal, Tuple, Callable
-from urllib.parse import urlencode, quote, parse_qs
+from urllib.parse import urlencode, quote, parse_qs, urlparse
 from uuid import uuid4
 
 import re
@@ -4899,6 +4899,51 @@ def _make_async_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(follow_redirects=True)
 
 
+# ---------------------------------------------------------------------------
+# Media URL helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_media_url(url: str) -> str:
+    """Normalize media URLs to avoid malformed duplicates from the UI proxy."""
+
+    normalized = url.strip()
+    if not normalized:
+        return normalized
+
+    proxy_base = "http://10.120.2.5:3000"
+    localhost_base = "http://localhost:3000"
+    double_prefix = f"{proxy_base}/{localhost_base}"
+    double_proxy = f"{proxy_base}/{proxy_base}"
+
+    while normalized.startswith(double_proxy):
+        normalized = proxy_base + normalized[len(double_proxy) :]
+
+    while normalized.startswith(double_prefix):
+        normalized = proxy_base + normalized[len(double_prefix) :]
+
+    if normalized.startswith(double_prefix):
+        normalized = proxy_base + normalized[len(double_prefix) :]
+    elif normalized.startswith(localhost_base):
+        normalized = proxy_base + normalized[len(localhost_base) :]
+
+    proxy_http_prefix = f"{proxy_base}/http://"
+    while normalized.startswith(proxy_http_prefix):
+        normalized = normalized[len(proxy_base) + 1 :]
+
+    if normalized.startswith("http://"):
+        rest = normalized[len("http://") :]
+        while rest.startswith("http://"):
+            rest = rest[len("http://") :]
+        normalized = "http://" + rest
+
+    parsed = urlparse(normalized)
+    if not parsed.scheme:
+        normalized = f"{proxy_base}/{normalized.lstrip('/')}"
+
+    return normalized
+
+
 async def _download_to(
     url: str,
     dest: Path,
@@ -4908,6 +4953,11 @@ async def _download_to(
     client: Optional[httpx.AsyncClient] = None,
 ) -> None:
     """Download file with retry, resume, and progress tracking."""
+
+    normalized_url = _normalize_media_url(url)
+    if normalized_url != url:
+        logger.debug("Normalized download URL from %s to %s", url, normalized_url)
+    url = normalized_url
 
     base_headers: Dict[str, str] = {}
     if headers:
@@ -5324,7 +5374,13 @@ async def _compose_from_urls_impl(
 
         if progress:
             progress.update(15, "Preparing workspace")
-        await _download_to(str(job.video_url), v_path, job.headers)
+
+        video_url = _normalize_media_url(str(job.video_url))
+        if video_url != str(job.video_url):
+            logger.debug(
+                "Normalized job video URL from %s to %s", job.video_url, video_url
+            )
+        await _download_to(video_url, v_path, job.headers)
         if progress:
             progress.update(35, "Downloaded primary video")
         has_audio = False
@@ -5332,7 +5388,12 @@ async def _compose_from_urls_impl(
         if job.audio_url:
             if progress:
                 progress.update(45, "Downloading audio track")
-            await _download_to(str(job.audio_url), a_path, job.headers)
+            audio_url = _normalize_media_url(str(job.audio_url))
+            if audio_url != str(job.audio_url):
+                logger.debug(
+                    "Normalized job audio URL from %s to %s", job.audio_url, audio_url
+                )
+            await _download_to(audio_url, a_path, job.headers)
             has_audio = True
         else:
             if progress:
@@ -5340,7 +5401,12 @@ async def _compose_from_urls_impl(
         if job.bgm_url:
             if progress:
                 progress.update(55, "Downloading background music")
-            await _download_to(str(job.bgm_url), b_path, job.headers)
+            bgm_url = _normalize_media_url(str(job.bgm_url))
+            if bgm_url != str(job.bgm_url):
+                logger.debug(
+                    "Normalized job bgm URL from %s to %s", job.bgm_url, bgm_url
+                )
+            await _download_to(bgm_url, b_path, job.headers)
             has_bgm = True
         else:
             if progress:
