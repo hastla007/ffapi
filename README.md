@@ -37,6 +37,7 @@
 - `/compose/from-tracks` - Compose from track definitions
 - `/video/concat-from-urls` - Concatenate videos
 - `/video/concat` - Concat alias (accepts `clips` or `urls`)
+- `/v1/audio/tempo` - Adjust audio playback speed and track jobs
 - `/v1/run-ffmpeg-command` - Run custom FFmpeg command
 - `/probe/from-urls` - FFprobe on URL
 - `/probe/from-binary` - FFprobe on uploaded file
@@ -79,6 +80,19 @@ For complete API documentation with all parameters and examples, visit `/documen
 **Video Concatenation:**
 - `/video/concat-from-urls` - Concatenate clips
 - `/video/concat` - Concat alias
+
+**Audio Processing:**
+- `POST /v1/audio/tempo` - Download an audio file, manipulate playback speed, and publish the result. Body:
+  ```json
+  {
+    "input_url": "http://10.120.2.5:4321/audio/speech/long/abcd1234/download",
+    "output_name": "slowed.mp3",
+    "tempo": 0.85
+  }
+  ```
+  Successful responses include the generated `job_id`, formatted `input_size`, `output_file` path, and a signed `download_url`.
+- `GET /v1/audio/tempo` - Return the in-memory history of recent tempo jobs, including status, timestamps, and file metadata.
+- `GET /v1/audio/tempo/{job_id}/status` - Inspect an individual tempo job for success, failure details, or in-progress updates.
 
 **Custom Commands:**
 - `/v1/run-ffmpeg-command` - Run custom FFmpeg command
