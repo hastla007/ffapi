@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, List, Optional, Literal, Tuple, Callable
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Deque
 from urllib.parse import urlencode, quote, parse_qs, urlparse
 from uuid import uuid4
 
@@ -114,7 +114,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.utils import get_openapi
-from pydantic import BaseModel, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from fastapi_csrf_protect import CsrfProtect, CsrfProtectException
 try:  # pragma: no cover - optional dependency for QR generation
@@ -258,6 +258,8 @@ _FFMPEG_VERSION_CACHE: Optional[Dict[str, Optional[str]]] = None
 JOBS: Dict[str, Dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
 SETTINGS_LOCK = threading.Lock()
+TEMPO_HISTORY: Deque[Dict[str, Any]] = deque(maxlen=200)
+TEMPO_HISTORY_LOCK = threading.Lock()
 
 
 SESSION_COOKIE_NAME = "ffapi_session"
@@ -2613,6 +2615,20 @@ def ensure_upload_type(upload: UploadFile, expected_prefix: str, field: str) -> 
         )
 
 
+def format_file_size(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
+def format_duration(seconds: float) -> str:
+    return f"{seconds:.2f}s"
+
+
 def run_ffmpeg_with_timeout(
     cmd: List[str],
     log_handle,
@@ -3513,6 +3529,13 @@ def documentation(request: Request):
   <div class="method get">GET</div>
   <div class="path">/</div>
   <div class="desc">Redirects to /downloads</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>302</code> Redirect to <code>/downloads</code></li>
+      <li><code>303</code> Redirect to <code>/settings</code> when UI login is required</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl http://localhost:3000/</div>
 </div>
 
@@ -3520,6 +3543,13 @@ def documentation(request: Request):
   <div class="method get">GET</div>
   <div class="path">/downloads</div>
   <div class="desc">Browse generated files (HTML page)</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> HTML page listing generated files</li>
+      <li><code>303</code> Redirect to <code>/settings</code> when UI login is required</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl http://localhost:3000/downloads</div>
 </div>
 
@@ -3527,6 +3557,13 @@ def documentation(request: Request):
   <div class="method get">GET</div>
   <div class="path">/logs</div>
   <div class="desc">Browse FFmpeg operation logs (HTML page)</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> HTML log browser</li>
+      <li><code>303</code> Redirect to <code>/settings</code> when UI login is required</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl http://localhost:3000/logs</div>
 </div>
 
@@ -3536,6 +3573,15 @@ def documentation(request: Request):
   <div class="desc">View individual log file content</div>
   <div class="params">
     <span class="param">path</span> - Relative path to log file (e.g., 20241008/20241008_143022_12345678_compose-urls.log)
+  </div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> Plain-text log contents</li>
+      <li><code>303</code> Redirect to <code>/settings</code> when UI login is required</li>
+      <li><code>404</code> JSON error when the specified log file is missing</li>
+      <li><code>413</code> JSON error when the requested log exceeds the size limit</li>
+    </ul>
   </div>
   <div class="example">Example:<br>curl http://localhost:3000/logs/view?path=20241008/20241008_143022_12345678_compose-urls.log</div>
 </div>
@@ -3547,6 +3593,13 @@ def documentation(request: Request):
   <div class="params">
     <span class="param">auto_refresh</span> - Auto-refresh interval in seconds (0-60, default: 0)
   </div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> HTML diagnostics dashboard</li>
+      <li><code>303</code> Redirect to <code>/settings</code> when UI login is required</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl http://localhost:3000/ffmpeg?auto_refresh=10</div>
 </div>
 
@@ -3554,6 +3607,13 @@ def documentation(request: Request):
   <div class="method get">GET</div>
   <div class="path">/documentation</div>
   <div class="desc">This page - Complete API documentation</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> HTML API reference</li>
+      <li><code>303</code> Redirect to <code>/settings</code> when UI login is required</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl http://localhost:3000/documentation</div>
 </div>
 
@@ -3561,6 +3621,13 @@ def documentation(request: Request):
   <div class="method get">GET</div>
   <div class="path">/settings</div>
   <div class="desc">Configuration page for UI authentication and storage overview</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> HTML settings dashboard</li>
+      <li><code>303</code> Redirect to login when UI authentication is enabled and unauthenticated</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl http://localhost:3000/settings</div>
 </div>
 
@@ -3568,6 +3635,13 @@ def documentation(request: Request):
   <div class="method get">GET</div>
   <div class="path">/api-keys</div>
   <div class="desc">Manage API authentication, generate keys, and review usage history</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> HTML page for key management</li>
+      <li><code>303</code> Redirect to login when UI authentication is enabled and unauthenticated</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl http://localhost:3000/api-keys</div>
 </div>
 
@@ -3576,13 +3650,28 @@ def documentation(request: Request):
   <div class="path">/api-keys/(require|generate|revoke)</div>
   <div class="desc">Toggle API key enforcement, create new keys, or revoke existing ones</div>
   <div class="params">Submit form-encoded fields such as <span class="param">require_api_key</span> or <span class="param">key_id</span>.</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>303</code> Redirect back to <code>/api-keys</code> with success or error feedback in the query string</li>
+      <li><code>303</code> Redirect to <code>/settings</code> when UI login is required</li>
+    </ul>
+  </div>
 </div>
 
 <div class="endpoint">
   <div class="method get">GET</div>
   <div class="path">/health</div>
   <div class="desc">Health check endpoint with disk, memory, FFmpeg, and operation metrics</div>
-  <div class="response">Returns: {"ok": true, "disk": {...}, "memory": {...}, "ffmpeg": {...}, "operations": {...}}</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> JSON body with <code>ok</code>, <code>disk</code>, <code>memory</code>, <code>ffmpeg</code>, and <code>operations</code> sections</li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when health information cannot be collected</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl http://localhost:3000/health</div>
 </div>
 
@@ -3590,6 +3679,13 @@ def documentation(request: Request):
   <div class="method get">GET</div>
   <div class="path">/metrics</div>
   <div class="desc">Operational metrics dashboard (HTML page)</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> HTML dashboard with aggregated metrics</li>
+      <li><code>303</code> Redirect to <code>/settings</code> when UI login is required</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl http://localhost:3000/metrics</div>
 </div>
 
@@ -3597,6 +3693,13 @@ def documentation(request: Request):
   <div class="method get">GET</div>
   <div class="path">/files/{date}/{filename}</div>
   <div class="desc">Static file serving - download generated files</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> Binary file download</li>
+      <li><code>404</code> Plain-text response when the requested file does not exist</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl -O http://localhost:3000/files/20241008/20241008_143022_12345678.mp4</div>
 </div>
 
@@ -3610,7 +3713,17 @@ def documentation(request: Request):
     <span class="param">duration</span> - Duration in seconds (1-3600, default: 30)<br>
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
-  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> MP4 file stream or JSON payload with <code>ok</code>, <code>file_url</code>, and <code>path</code></li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>413</code> JSON error when the uploaded file exceeds configured limits</li>
+      <li><code>422</code> JSON validation error for malformed parameters</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when FFmpeg processing fails</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl -X POST http://localhost:3000/image/to-mp4-loop \<br>  -F "file=@image.jpg" \<br>  -F "duration=10" \<br>  -F "as_json=true"</div>
 </div>
 
@@ -3630,7 +3743,17 @@ def documentation(request: Request):
     <span class="param">bgm_volume</span> - BGM volume multiplier (default: 0.3)<br>
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
-  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> MP4 file stream or JSON payload with <code>ok</code>, <code>file_url</code>, and <code>path</code></li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>413</code> JSON error when uploaded binaries exceed configured limits</li>
+      <li><code>422</code> JSON validation error for malformed parameters</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when FFmpeg composition fails</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-binaries \<br>  -F "video=@video.mp4" \<br>  -F "audio=@audio.mp3" \<br>  -F "bgm=@music.mp3" \<br>  -F "duration_ms=15000" \<br>  -F "width=1280" \<br>  -F "height=720" \<br>  -F "bgm_volume=0.2" \<br>  -F "as_json=true"</div>
 </div>
 
@@ -3651,7 +3774,17 @@ def documentation(request: Request):
     <span class="param">headers</span> - HTTP headers for authenticated requests (optional)<br>
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
-  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> MP4 file stream or JSON payload with <code>ok</code>, <code>file_url</code>, and <code>path</code></li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>404</code> JSON error when referenced media URLs cannot be retrieved</li>
+      <li><code>422</code> JSON validation error for malformed parameters</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when FFmpeg composition fails</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-urls \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "video_url": "https://example.com/video.mp4",<br>    "audio_url": "https://example.com/audio.mp3",<br>    "bgm_url": "https://example.com/music.mp3",<br>    "duration": 20.0,<br>    "width": 1280,<br>    "height": 720,<br>    "fps": 30,<br>    "bgm_volume": 0.3,<br>    "as_json": true<br>  }'</div>
 </div>
 
@@ -3662,7 +3795,16 @@ def documentation(request: Request):
   <div class="params">
     Same parameters as <code>/compose/from-urls</code>
   </div>
-  <div class="response">Returns: {"job_id": "...", "status_url": "/jobs/{job_id}"}</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> JSON payload with <code>job_id</code> and <code>status_url</code></li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>422</code> JSON validation error for malformed parameters</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when the job cannot be enqueued</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-urls/async \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "video_url": "https://example.com/video.mp4",<br>    "duration_ms": 10000<br>  }'</div>
 </div>
 
@@ -3673,7 +3815,15 @@ def documentation(request: Request):
   <div class="params">
     <span class="param">job_id</span> - Identifier returned from the async compose endpoint
   </div>
-  <div class="response">Returns: {"status": "queued|processing|finished|failed", ...}</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> JSON payload including <code>status</code>, progress metrics, and any result URLs</li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>404</code> JSON error when the job cannot be located</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl http://localhost:3000/jobs/123e4567-e89b-12d3-a456-426614174000</div>
 </div>
 
@@ -3688,7 +3838,16 @@ def documentation(request: Request):
     <span class="param">fps</span> - Output frames per second (default: 30)<br>
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
-  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> MP4 file stream or JSON payload with <code>ok</code>, <code>file_url</code>, and <code>path</code></li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>422</code> JSON validation error for malformed track definitions</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when FFmpeg composition fails</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl -X POST http://localhost:3000/compose/from-tracks \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "tracks": [<br>      {<br>        "id": "video1",<br>        "type": "video",<br>        "keyframes": [<br>          {<br>            "url": "https://example.com/clip.mp4",<br>            "timestamp": 0,<br>            "duration": 10000<br>          }<br>        ]<br>      },<br>      {<br>        "id": "audio1",<br>        "type": "audio",<br>        "keyframes": [<br>          {<br>            "url": "https://example.com/audio.mp3",<br>            "timestamp": 0,<br>            "duration": 10000<br>          }<br>        ]<br>      }<br>    ],<br>    "width": 1920,<br>    "height": 1080,<br>    "fps": 30,<br>    "as_json": true<br>  }'</div>
 </div>
 
@@ -3704,7 +3863,17 @@ def documentation(request: Request):
     <span class="param">fps</span> - Output frames per second (default: 30)<br>
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
-  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> MP4 file stream or JSON payload with <code>ok</code>, <code>file_url</code>, and <code>path</code></li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>404</code> JSON error when referenced clips cannot be retrieved</li>
+      <li><code>422</code> JSON validation error for malformed parameters</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when FFmpeg concatenation fails</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl -X POST http://localhost:3000/video/concat-from-urls \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "clips": [<br>      "https://example.com/clip1.mp4",<br>      "https://example.com/clip2.mp4",<br>      "https://example.com/clip3.mp4"<br>    ],<br>    "width": 1920,<br>    "height": 1080,<br>    "fps": 30,<br>    "as_json": true<br>  }'</div>
 </div>
 
@@ -3720,8 +3889,77 @@ def documentation(request: Request):
     <span class="param">fps</span> - Output frames per second (default: 30)<br>
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
-  <div class="response">Returns: MP4 file or {"ok": true, "file_url": "...", "path": "..."}</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> MP4 file stream or JSON payload with <code>ok</code>, <code>file_url</code>, and <code>path</code></li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>404</code> JSON error when referenced clips cannot be retrieved</li>
+      <li><code>422</code> JSON validation error for malformed parameters</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when FFmpeg concatenation fails</li>
+    </ul>
+  </div>
   <div class="example">Example (using 'clips'):<br>curl -X POST http://localhost:3000/video/concat \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "clips": [<br>      "https://example.com/video1.mp4",<br>      "https://example.com/video2.mp4"<br>    ],<br>    "width": 1280,<br>    "height": 720,<br>    "as_json": true<br>  }'</div>
+</div>
+
+<h4>Audio Processing</h4>
+<div class="endpoint">
+  <div class="method post">POST</div>
+  <div class="path">/v1/audio/tempo</div>
+  <div class="desc">Download an audio source, adjust playback speed with FFmpeg, and publish the converted file. Accepts <code>Content-Type: application/json</code>.</div>
+  <div class="params">
+    <span class="param">input_url</span> - HTTP(S) URL for the source audio<br>
+    <span class="param">output_name</span> - Desired filename for the processed output (default: output.mp3)<br>
+    <span class="param">tempo</span> - Playback rate multiplier (0.5 - 2.0, default: 1.0)
+  </div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> JSON payload with <code>status</code>, <code>job_id</code>, <code>tempo</code>, <code>input_size</code>, <code>output_file</code>, <code>download_url</code>, and <code>processing_time</code></li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>422</code> JSON validation error for malformed parameters</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when FFmpeg processing fails</li>
+      <li><code>504</code> JSON error when tempo conversion exceeds the processing timeout</li>
+    </ul>
+  </div>
+  <div class="example">JSON Example:<br>curl -X POST http://localhost:3000/v1/audio/tempo \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "input_url": "http://10.120.2.5:4321/audio/speech/long/abcd1234/download",<br>    "output_name": "slowed.mp3",<br>    "tempo": 0.85<br>  }'</div>
+  <div class="example">n8n curl Example (Execute Command node):<br>curl -X POST "$FFAPI_BASE_URL/v1/audio/tempo" \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "input_url": "&#123;&#123; $json[\"input_url\"] &#125;&#125;",<br>    "output_name": "&#123;&#123; $json[\"output_name\"] || \"tempo-output.mp3\" &#125;&#125;",<br>    "tempo": &#123;&#123; $json[\"tempo\"] || 0.85 &#125;&#125;<br>  }'</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/v1/audio/tempo</div>
+  <div class="desc">List the most recent tempo jobs recorded in memory</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> JSON array of job summaries with <code>id</code>, filenames, <code>tempo</code>, timestamps, and status</li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+    </ul>
+  </div>
+  <div class="example">Example:<br>curl http://localhost:3000/v1/audio/tempo</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/v1/audio/tempo/{job_id}/status</div>
+  <div class="desc">Fetch live status for a previously created tempo job</div>
+  <div class="params">
+    <span class="param">job_id</span> - Identifier returned from the POST /v1/audio/tempo response
+  </div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> JSON payload including <code>status</code>, <code>tempo</code>, <code>processing_time</code>, and download metadata</li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>404</code> JSON error when the job cannot be located</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+    </ul>
+  </div>
+  <div class="example">Example:<br>curl http://localhost:3000/v1/audio/tempo/b9f32f/status</div>
 </div>
 
 <h4>Custom FFmpeg Commands</h4>
@@ -3734,7 +3972,16 @@ def documentation(request: Request):
     <span class="param">output_files</span> - Object mapping variable names to filenames<br>
     <span class="param">ffmpeg_command</span> - FFmpeg command with {{variable}} placeholders
   </div>
-  <div class="response">Returns: {"ok": true, "outputs": {"key": "url", ...}}</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> JSON payload with <code>ok</code> and an <code>outputs</code> mapping of generated URLs</li>
+      <li><code>400</code> JSON error when the command is invalid or violates safety checks</li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when FFmpeg execution fails</li>
+    </ul>
+  </div>
   <div class="example">Example (scale video to 720p):<br>curl -X POST http://localhost:3000/v1/run-ffmpeg-command \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "input_files": {<br>      "video": "https://example.com/input.mp4"<br>    },<br>    "output_files": {<br>      "out": "result.mp4"<br>    },<br>    "ffmpeg_command": "-i {{video}} -vf scale=1280:720 -c:a copy {{out}}"<br>  }'</div>
 </div>
 
@@ -3757,7 +4004,18 @@ def documentation(request: Request):
     <span class="param">analyze_duration</span> - Analyze duration (optional)<br>
     <span class="param">select_streams</span> - Select specific streams (optional)
   </div>
-  <div class="response">Returns: JSON with media information</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> JSON payload mirroring the ffprobe output</li>
+      <li><code>400</code> JSON error when the supplied URL or options are invalid</li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>404</code> JSON error when the remote media cannot be downloaded</li>
+      <li><code>422</code> JSON validation error for malformed parameters</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when ffprobe execution fails</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl -X POST http://localhost:3000/probe/from-urls \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "url": "https://example.com/video.mp4",<br>    "show_format": true,<br>    "show_streams": true,<br>    "count_frames": true<br>  }'</div>
 </div>
 
@@ -3769,7 +4027,17 @@ def documentation(request: Request):
     <span class="param">file</span> - Media file [multipart/form-data]<br>
     <span class="param">(same options as /probe/from-urls)</span>
   </div>
-  <div class="response">Returns: JSON with media information</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> JSON payload mirroring the ffprobe output</li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement or IP allow-listing blocks the request</li>
+      <li><code>413</code> JSON error when the uploaded file exceeds configured limits</li>
+      <li><code>422</code> JSON validation error for malformed parameters</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when ffprobe execution fails</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl -X POST http://localhost:3000/probe/from-binary \<br>  -F "file=@video.mp4" \<br>  -F "show_format=true" \<br>  -F "show_streams=true" \<br>  -F "count_frames=true"</div>
 </div>
 
@@ -3781,7 +4049,17 @@ def documentation(request: Request):
     <span class="param">rel</span> - Relative path within PUBLIC_DIR<br>
     <span class="param">(same options as /probe/from-urls)</span>
   </div>
-  <div class="response">Returns: JSON with media information</div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> JSON payload mirroring the ffprobe output</li>
+      <li><code>400</code> JSON error when the relative path is invalid</li>
+      <li><code>401</code> / <code>403</code> JSON errors when API key enforcement, IP allow-listing, or directory safety checks block the request</li>
+      <li><code>404</code> JSON error when the referenced file does not exist</li>
+      <li><code>429</code> Plain-text error when the caller exceeds the global rate limit</li>
+      <li><code>500</code> JSON error when ffprobe execution fails</li>
+    </ul>
+  </div>
   <div class="example">Example:<br>curl "http://localhost:3000/probe/public?rel=20241008/20241008_143022_12345678.mp4&show_format=true&show_streams=true"</div>
 </div>
 """
@@ -3848,6 +4126,28 @@ def documentation(request: Request):
           margin-top: 8px;
           color: #555;
           font-size: 14px;
+        }}
+        .responses {{
+          margin-top: 10px;
+          font-size: 13px;
+          color: #374151;
+        }}
+        .response-title {{
+          font-weight: 600;
+          margin-bottom: 4px;
+        }}
+        .responses ul {{
+          margin: 4px 0 0 18px;
+          padding: 0;
+        }}
+        .responses li {{
+          margin: 2px 0;
+          list-style: disc;
+        }}
+        .responses code {{
+          background: #e2e8f0;
+          padding: 1px 4px;
+          border-radius: 4px;
         }}
         .params {{
           margin-top: 8px;
@@ -4687,6 +4987,26 @@ def metrics_prometheus() -> PlainTextResponse:
 
 
 # ---------- models ----------
+
+
+class TempoRequest(BaseModel):
+    input_url: HttpUrl
+    output_name: str = "output.mp3"
+    tempo: float = Field(1.0, ge=0.5, le=2.0)
+
+    @field_validator("output_name")
+    @classmethod
+    def validate_output_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("output_name cannot be empty")
+        if any(sep in cleaned for sep in ("/", "\\")):
+            raise ValueError("output_name must be a file name without directories")
+        if not re.search(r"\.[A-Za-z0-9]+$", cleaned):
+            raise ValueError("output_name must include a file extension")
+        return cleaned
+
+
 class RendiJob(BaseModel):
     input_files: Dict[str, HttpUrl]
     output_files: Dict[str, str]
@@ -6090,6 +6410,213 @@ async def run_rendi(job: RendiJob):
         if not published:
             return JSONResponse(status_code=500, content={"error": "no_outputs_found", "log": log.read_text()})
         return {"ok": True, "outputs": published}
+
+
+# ---------- audio endpoints ----------
+
+
+@app.post("/v1/audio/tempo")
+async def change_audio_tempo(request: TempoRequest):
+    job_id = uuid4().hex[:8]
+    start = time.perf_counter()
+    record: Dict[str, Any] = {
+        "id": job_id,
+        "input": None,
+        "output": request.output_name,
+        "tempo": request.tempo,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "processing",
+        "processing_time": None,
+        "input_url": str(request.input_url),
+    }
+    with TEMPO_HISTORY_LOCK:
+        TEMPO_HISTORY.appendleft(record)
+
+    struct_logger.info(
+        "audio_tempo_started",
+        job_id=job_id,
+        tempo=request.tempo,
+        input_url=str(request.input_url),
+        output_name=request.output_name,
+    )
+
+    try:
+        check_disk_space(WORK_DIR)
+        with TemporaryDirectory(prefix="tempo_", dir=str(WORK_DIR)) as workdir:
+            work = Path(workdir)
+            parsed = urlparse(str(request.input_url))
+            candidate_name = Path(parsed.path).name or "input.audio"
+            input_name = candidate_name or "input.audio"
+            if not Path(input_name).suffix:
+                input_name = f"{input_name}.bin"
+            input_path = work / input_name
+
+            await _download_to(str(request.input_url), input_path, None)
+            input_size_bytes = input_path.stat().st_size
+            record["input"] = input_name
+            record["input_size"] = format_file_size(input_size_bytes)
+
+            output_path = work / request.output_name
+            output_ext = output_path.suffix.lower().lstrip(".")
+            if output_ext == "wav":
+                codec = "pcm_s16le"
+                extra_args: List[str] = []
+            elif output_ext in {"ogg", "oga"}:
+                codec = "libvorbis"
+                extra_args = ["-b:a", "192k"]
+            elif output_ext == "flac":
+                codec = "flac"
+                extra_args = []
+            else:
+                codec = "libmp3lame"
+                extra_args = ["-b:a", "192k"]
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_path),
+                "-filter:a",
+                f"atempo={request.tempo}",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                "-c:a",
+                codec,
+                *extra_args,
+                str(output_path),
+            ]
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=FFMPEG_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                record["status"] = "failed"
+                record["error"] = "processing_timeout"
+                _flush_logs()
+                struct_logger.error(
+                    "audio_tempo_failed",
+                    job_id=job_id,
+                    tempo=request.tempo,
+                    error="processing_timeout",
+                )
+                raise HTTPException(
+                    status_code=504,
+                    detail={
+                        "error": "processing_timeout",
+                        "cmd": cmd,
+                        "stderr": (exc.stderr.decode("utf-8", "ignore") if isinstance(exc.stderr, bytes) else exc.stderr),
+                    },
+                ) from exc
+
+            log_path = work / "ffmpeg.log"
+            try:
+                log_path.write_text(result.stderr or "", encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
+            save_log(log_path, "audio-tempo")
+
+            if result.returncode != 0 or not output_path.exists():
+                record["status"] = "failed"
+                record["error"] = "ffmpeg_failed"
+                _flush_logs()
+                struct_logger.error(
+                    "audio_tempo_failed",
+                    job_id=job_id,
+                    tempo=request.tempo,
+                    error="ffmpeg_failed",
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "ffmpeg_failed",
+                        "stderr": result.stderr,
+                        "stdout": result.stdout,
+                        "cmd": cmd,
+                    },
+                )
+
+            published = publish_file(output_path, Path(output_path).suffix or ".bin")
+            elapsed = time.perf_counter() - start
+            duration_text = format_duration(elapsed)
+            record["status"] = "done"
+            record["processing_time"] = duration_text
+            record["download_url"] = published["url"]
+            record["output_file"] = published["rel"]
+
+            struct_logger.info(
+                "audio_tempo_completed",
+                job_id=job_id,
+                tempo=request.tempo,
+                input_size_bytes=input_size_bytes,
+                output_rel=published["rel"],
+                duration_seconds=round(elapsed, 4),
+            )
+
+            return {
+                "status": "success",
+                "job_id": job_id,
+                "tempo": request.tempo,
+                "input_size": format_file_size(input_size_bytes),
+                "output_file": published["rel"],
+                "download_url": published["url"],
+                "processing_time": duration_text,
+            }
+    except HTTPException as exc:
+        record["status"] = "failed"
+        if "processing_time" not in record or record["processing_time"] is None:
+            record["processing_time"] = format_duration(time.perf_counter() - start)
+        if "error" not in record:
+            detail = exc.detail
+            if isinstance(detail, str):
+                record["error"] = detail
+            else:
+                try:
+                    record["error"] = json.dumps(detail)
+                except Exception:
+                    record["error"] = "unknown_error"
+        error_key = record.get("error", "http_error")
+        if error_key not in {"processing_timeout", "ffmpeg_failed"}:
+            struct_logger.error(
+                "audio_tempo_failed",
+                job_id=job_id,
+                tempo=request.tempo,
+                error=error_key,
+            )
+        _flush_logs()
+        raise
+    except Exception as exc:
+        record["status"] = "failed"
+        record["error"] = str(exc)
+        record["processing_time"] = format_duration(time.perf_counter() - start)
+        struct_logger.error(
+            "audio_tempo_failed",
+            job_id=job_id,
+            tempo=request.tempo,
+            error=str(exc),
+        )
+        _flush_logs()
+        raise
+
+
+@app.get("/v1/audio/tempo")
+def list_tempo_jobs() -> List[Dict[str, Any]]:
+    with TEMPO_HISTORY_LOCK:
+        return [dict(item) for item in TEMPO_HISTORY]
+
+
+@app.get("/v1/audio/tempo/{job_id}/status")
+def get_tempo_job_status(job_id: str) -> Dict[str, Any]:
+    with TEMPO_HISTORY_LOCK:
+        for item in TEMPO_HISTORY:
+            if item.get("id") == job_id:
+                return dict(item)
+    raise HTTPException(status_code=404, detail="job_not_found")
 
 
 # ---------- ffprobe endpoints ----------
