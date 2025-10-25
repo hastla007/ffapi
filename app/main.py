@@ -3740,6 +3740,39 @@ def documentation(request: Request):
   <div class="example">Example (using 'clips'):<br>curl -X POST http://localhost:3000/video/concat \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "clips": [<br>      "https://example.com/video1.mp4",<br>      "https://example.com/video2.mp4"<br>    ],<br>    "width": 1280,<br>    "height": 720,<br>    "as_json": true<br>  }'</div>
 </div>
 
+<h4>Audio Processing</h4>
+<div class="endpoint">
+  <div class="method post">POST</div>
+  <div class="path">/v1/audio/tempo</div>
+  <div class="desc">Download an audio source, adjust playback speed with FFmpeg, and publish the converted file</div>
+  <div class="params">
+    <span class="param">input_url</span> - HTTP(S) URL for the source audio<br>
+    <span class="param">output_name</span> - Desired filename for the processed output (default: output.mp3)<br>
+    <span class="param">tempo</span> - Playback rate multiplier (0.5 - 2.0, default: 1.0)
+  </div>
+  <div class="response">Returns: {"status": "success", "job_id": "...", "tempo": 0.85, "input_size": "...", "output_file": "...", "download_url": "...", "processing_time": "..."}</div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/v1/audio/tempo \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "input_url": "http://10.120.2.5:4321/audio/speech/long/abcd1234/download",<br>    "output_name": "slowed.mp3",<br>    "tempo": 0.85<br>  }'</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/v1/audio/tempo</div>
+  <div class="desc">List the most recent tempo jobs recorded in memory</div>
+  <div class="response">Returns: [{"id": "...", "input": "...", "output": "...", "tempo": 0.85, "created_at": "...", "status": "done", "processing_time": "..."}, ...]</div>
+  <div class="example">Example:<br>curl http://localhost:3000/v1/audio/tempo</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/v1/audio/tempo/{job_id}/status</div>
+  <div class="desc">Fetch live status for a previously created tempo job</div>
+  <div class="params">
+    <span class="param">job_id</span> - Identifier returned from the POST /v1/audio/tempo response
+  </div>
+  <div class="response">Returns: {"id": "...", "status": "processing", "tempo": 0.85, "progress": "...", "processing_time": "..."}</div>
+  <div class="example">Example:<br>curl http://localhost:3000/v1/audio/tempo/b9f32f/status</div>
+</div>
+
 <h4>Custom FFmpeg Commands</h4>
 <div class="endpoint">
   <div class="method post">POST</div>
