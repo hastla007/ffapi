@@ -6173,6 +6173,20 @@ async def change_audio_tempo(request: TempoRequest):
             record["input_size"] = format_file_size(input_size_bytes)
 
             output_path = work / request.output_name
+            output_ext = output_path.suffix.lower().lstrip(".")
+            if output_ext == "wav":
+                codec = "pcm_s16le"
+                extra_args: List[str] = []
+            elif output_ext in {"ogg", "oga"}:
+                codec = "libvorbis"
+                extra_args = ["-b:a", "192k"]
+            elif output_ext == "flac":
+                codec = "flac"
+                extra_args = []
+            else:
+                codec = "libmp3lame"
+                extra_args = ["-b:a", "192k"]
+
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -6184,10 +6198,9 @@ async def change_audio_tempo(request: TempoRequest):
                 "44100",
                 "-ac",
                 "2",
-                "-b:a",
-                "192k",
                 "-c:a",
-                "libmp3lame",
+                codec,
+                *extra_args,
                 str(output_path),
             ]
 
