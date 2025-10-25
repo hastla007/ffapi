@@ -3744,14 +3744,15 @@ def documentation(request: Request):
 <div class="endpoint">
   <div class="method post">POST</div>
   <div class="path">/v1/audio/tempo</div>
-  <div class="desc">Download an audio source, adjust playback speed with FFmpeg, and publish the converted file</div>
+  <div class="desc">Download an audio source, adjust playback speed with FFmpeg, and publish the converted file. Accepts <code>Content-Type: application/json</code>.</div>
   <div class="params">
     <span class="param">input_url</span> - HTTP(S) URL for the source audio<br>
     <span class="param">output_name</span> - Desired filename for the processed output (default: output.mp3)<br>
     <span class="param">tempo</span> - Playback rate multiplier (0.5 - 2.0, default: 1.0)
   </div>
   <div class="response">Returns: {"status": "success", "job_id": "...", "tempo": 0.85, "input_size": "...", "output_file": "...", "download_url": "...", "processing_time": "..."}</div>
-  <div class="example">Example:<br>curl -X POST http://localhost:3000/v1/audio/tempo \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "input_url": "http://10.120.2.5:4321/audio/speech/long/abcd1234/download",<br>    "output_name": "slowed.mp3",<br>    "tempo": 0.85<br>  }'</div>
+  <div class="example">JSON Example:<br>curl -X POST http://localhost:3000/v1/audio/tempo \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "input_url": "http://10.120.2.5:4321/audio/speech/long/abcd1234/download",<br>    "output_name": "slowed.mp3",<br>    "tempo": 0.85<br>  }'</div>
+  <div class="example">n8n curl Example (Execute Command node):<br>curl -X POST "$FFAPI_BASE_URL/v1/audio/tempo" \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "input_url": "&#123;&#123; $json[\"input_url\"] &#125;&#125;",<br>    "output_name": "&#123;&#123; $json[\"output_name\"] || \"tempo-output.mp3\" &#125;&#125;",<br>    "tempo": &#123;&#123; $json[\"tempo\"] || 0.85 &#125;&#125;<br>  }'</div>
 </div>
 
 <div class="endpoint">

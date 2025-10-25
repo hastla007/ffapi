@@ -91,6 +91,16 @@ For complete API documentation with all parameters and examples, visit `/documen
   }
   ```
   Successful responses include the generated `job_id`, formatted `input_size`, `output_file` path, and a signed `download_url`.
+  n8n Execute Command example (assumes `FFAPI_BASE_URL` is an environment variable inside n8n):
+  ```bash
+  curl -X POST "$FFAPI_BASE_URL/v1/audio/tempo" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "input_url": "{{ $json["input_url"] }}",
+      "output_name": "{{ $json["output_name"] || "tempo-output.mp3" }}",
+      "tempo": {{ $json["tempo"] || 0.85 }}
+    }'
+  ```
 - `GET /v1/audio/tempo` - Return the in-memory history of recent tempo jobs, including status, timestamps, and file metadata.
 - `GET /v1/audio/tempo/{job_id}/status` - Inspect an individual tempo job for success, failure details, or in-progress updates.
 
