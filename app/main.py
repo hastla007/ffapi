@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, List, Optional, Literal, Tuple, Callable
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Deque
 from urllib.parse import urlencode, quote, parse_qs, urlparse
 from uuid import uuid4
 
@@ -114,7 +114,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.utils import get_openapi
-from pydantic import BaseModel, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 from fastapi_csrf_protect import CsrfProtect, CsrfProtectException
 try:  # pragma: no cover - optional dependency for QR generation
@@ -258,6 +258,8 @@ _FFMPEG_VERSION_CACHE: Optional[Dict[str, Optional[str]]] = None
 JOBS: Dict[str, Dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
 SETTINGS_LOCK = threading.Lock()
+TEMPO_HISTORY: Deque[Dict[str, Any]] = deque(maxlen=200)
+TEMPO_HISTORY_LOCK = threading.Lock()
 
 
 SESSION_COOKIE_NAME = "ffapi_session"
@@ -2613,6 +2615,20 @@ def ensure_upload_type(upload: UploadFile, expected_prefix: str, field: str) -> 
         )
 
 
+def format_file_size(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
+def format_duration(seconds: float) -> str:
+    return f"{seconds:.2f}s"
+
+
 def run_ffmpeg_with_timeout(
     cmd: List[str],
     log_handle,
@@ -3724,6 +3740,40 @@ def documentation(request: Request):
   <div class="example">Example (using 'clips'):<br>curl -X POST http://localhost:3000/video/concat \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "clips": [<br>      "https://example.com/video1.mp4",<br>      "https://example.com/video2.mp4"<br>    ],<br>    "width": 1280,<br>    "height": 720,<br>    "as_json": true<br>  }'</div>
 </div>
 
+<h4>Audio Processing</h4>
+<div class="endpoint">
+  <div class="method post">POST</div>
+  <div class="path">/v1/audio/tempo</div>
+  <div class="desc">Download an audio source, adjust playback speed with FFmpeg, and publish the converted file. Accepts <code>Content-Type: application/json</code>.</div>
+  <div class="params">
+    <span class="param">input_url</span> - HTTP(S) URL for the source audio<br>
+    <span class="param">output_name</span> - Desired filename for the processed output (default: output.mp3)<br>
+    <span class="param">tempo</span> - Playback rate multiplier (0.5 - 2.0, default: 1.0)
+  </div>
+  <div class="response">Returns: {"status": "success", "job_id": "...", "tempo": 0.85, "input_size": "...", "output_file": "...", "download_url": "...", "processing_time": "..."}</div>
+  <div class="example">JSON Example:<br>curl -X POST http://localhost:3000/v1/audio/tempo \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "input_url": "http://10.120.2.5:4321/audio/speech/long/abcd1234/download",<br>    "output_name": "slowed.mp3",<br>    "tempo": 0.85<br>  }'</div>
+  <div class="example">n8n curl Example (Execute Command node):<br>curl -X POST "$FFAPI_BASE_URL/v1/audio/tempo" \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "input_url": "&#123;&#123; $json[\"input_url\"] &#125;&#125;",<br>    "output_name": "&#123;&#123; $json[\"output_name\"] || \"tempo-output.mp3\" &#125;&#125;",<br>    "tempo": &#123;&#123; $json[\"tempo\"] || 0.85 &#125;&#125;<br>  }'</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/v1/audio/tempo</div>
+  <div class="desc">List the most recent tempo jobs recorded in memory</div>
+  <div class="response">Returns: [{"id": "...", "input": "...", "output": "...", "tempo": 0.85, "created_at": "...", "status": "done", "processing_time": "..."}, ...]</div>
+  <div class="example">Example:<br>curl http://localhost:3000/v1/audio/tempo</div>
+</div>
+
+<div class="endpoint">
+  <div class="method get">GET</div>
+  <div class="path">/v1/audio/tempo/{job_id}/status</div>
+  <div class="desc">Fetch live status for a previously created tempo job</div>
+  <div class="params">
+    <span class="param">job_id</span> - Identifier returned from the POST /v1/audio/tempo response
+  </div>
+  <div class="response">Returns: {"id": "...", "status": "processing", "tempo": 0.85, "progress": "...", "processing_time": "..."}</div>
+  <div class="example">Example:<br>curl http://localhost:3000/v1/audio/tempo/b9f32f/status</div>
+</div>
+
 <h4>Custom FFmpeg Commands</h4>
 <div class="endpoint">
   <div class="method post">POST</div>
@@ -4687,6 +4737,26 @@ def metrics_prometheus() -> PlainTextResponse:
 
 
 # ---------- models ----------
+
+
+class TempoRequest(BaseModel):
+    input_url: HttpUrl
+    output_name: str = "output.mp3"
+    tempo: float = Field(1.0, ge=0.5, le=2.0)
+
+    @field_validator("output_name")
+    @classmethod
+    def validate_output_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("output_name cannot be empty")
+        if any(sep in cleaned for sep in ("/", "\\")):
+            raise ValueError("output_name must be a file name without directories")
+        if not re.search(r"\.[A-Za-z0-9]+$", cleaned):
+            raise ValueError("output_name must include a file extension")
+        return cleaned
+
+
 class RendiJob(BaseModel):
     input_files: Dict[str, HttpUrl]
     output_files: Dict[str, str]
@@ -6090,6 +6160,213 @@ async def run_rendi(job: RendiJob):
         if not published:
             return JSONResponse(status_code=500, content={"error": "no_outputs_found", "log": log.read_text()})
         return {"ok": True, "outputs": published}
+
+
+# ---------- audio endpoints ----------
+
+
+@app.post("/v1/audio/tempo")
+async def change_audio_tempo(request: TempoRequest):
+    job_id = uuid4().hex[:8]
+    start = time.perf_counter()
+    record: Dict[str, Any] = {
+        "id": job_id,
+        "input": None,
+        "output": request.output_name,
+        "tempo": request.tempo,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "processing",
+        "processing_time": None,
+        "input_url": str(request.input_url),
+    }
+    with TEMPO_HISTORY_LOCK:
+        TEMPO_HISTORY.appendleft(record)
+
+    struct_logger.info(
+        "audio_tempo_started",
+        job_id=job_id,
+        tempo=request.tempo,
+        input_url=str(request.input_url),
+        output_name=request.output_name,
+    )
+
+    try:
+        check_disk_space(WORK_DIR)
+        with TemporaryDirectory(prefix="tempo_", dir=str(WORK_DIR)) as workdir:
+            work = Path(workdir)
+            parsed = urlparse(str(request.input_url))
+            candidate_name = Path(parsed.path).name or "input.audio"
+            input_name = candidate_name or "input.audio"
+            if not Path(input_name).suffix:
+                input_name = f"{input_name}.bin"
+            input_path = work / input_name
+
+            await _download_to(str(request.input_url), input_path, None)
+            input_size_bytes = input_path.stat().st_size
+            record["input"] = input_name
+            record["input_size"] = format_file_size(input_size_bytes)
+
+            output_path = work / request.output_name
+            output_ext = output_path.suffix.lower().lstrip(".")
+            if output_ext == "wav":
+                codec = "pcm_s16le"
+                extra_args: List[str] = []
+            elif output_ext in {"ogg", "oga"}:
+                codec = "libvorbis"
+                extra_args = ["-b:a", "192k"]
+            elif output_ext == "flac":
+                codec = "flac"
+                extra_args = []
+            else:
+                codec = "libmp3lame"
+                extra_args = ["-b:a", "192k"]
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_path),
+                "-filter:a",
+                f"atempo={request.tempo}",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                "-c:a",
+                codec,
+                *extra_args,
+                str(output_path),
+            ]
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=FFMPEG_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                record["status"] = "failed"
+                record["error"] = "processing_timeout"
+                _flush_logs()
+                struct_logger.error(
+                    "audio_tempo_failed",
+                    job_id=job_id,
+                    tempo=request.tempo,
+                    error="processing_timeout",
+                )
+                raise HTTPException(
+                    status_code=504,
+                    detail={
+                        "error": "processing_timeout",
+                        "cmd": cmd,
+                        "stderr": (exc.stderr.decode("utf-8", "ignore") if isinstance(exc.stderr, bytes) else exc.stderr),
+                    },
+                ) from exc
+
+            log_path = work / "ffmpeg.log"
+            try:
+                log_path.write_text(result.stderr or "", encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
+            save_log(log_path, "audio-tempo")
+
+            if result.returncode != 0 or not output_path.exists():
+                record["status"] = "failed"
+                record["error"] = "ffmpeg_failed"
+                _flush_logs()
+                struct_logger.error(
+                    "audio_tempo_failed",
+                    job_id=job_id,
+                    tempo=request.tempo,
+                    error="ffmpeg_failed",
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "ffmpeg_failed",
+                        "stderr": result.stderr,
+                        "stdout": result.stdout,
+                        "cmd": cmd,
+                    },
+                )
+
+            published = publish_file(output_path, Path(output_path).suffix or ".bin")
+            elapsed = time.perf_counter() - start
+            duration_text = format_duration(elapsed)
+            record["status"] = "done"
+            record["processing_time"] = duration_text
+            record["download_url"] = published["url"]
+            record["output_file"] = published["rel"]
+
+            struct_logger.info(
+                "audio_tempo_completed",
+                job_id=job_id,
+                tempo=request.tempo,
+                input_size_bytes=input_size_bytes,
+                output_rel=published["rel"],
+                duration_seconds=round(elapsed, 4),
+            )
+
+            return {
+                "status": "success",
+                "job_id": job_id,
+                "tempo": request.tempo,
+                "input_size": format_file_size(input_size_bytes),
+                "output_file": published["rel"],
+                "download_url": published["url"],
+                "processing_time": duration_text,
+            }
+    except HTTPException as exc:
+        record["status"] = "failed"
+        if "processing_time" not in record or record["processing_time"] is None:
+            record["processing_time"] = format_duration(time.perf_counter() - start)
+        if "error" not in record:
+            detail = exc.detail
+            if isinstance(detail, str):
+                record["error"] = detail
+            else:
+                try:
+                    record["error"] = json.dumps(detail)
+                except Exception:
+                    record["error"] = "unknown_error"
+        error_key = record.get("error", "http_error")
+        if error_key not in {"processing_timeout", "ffmpeg_failed"}:
+            struct_logger.error(
+                "audio_tempo_failed",
+                job_id=job_id,
+                tempo=request.tempo,
+                error=error_key,
+            )
+        _flush_logs()
+        raise
+    except Exception as exc:
+        record["status"] = "failed"
+        record["error"] = str(exc)
+        record["processing_time"] = format_duration(time.perf_counter() - start)
+        struct_logger.error(
+            "audio_tempo_failed",
+            job_id=job_id,
+            tempo=request.tempo,
+            error=str(exc),
+        )
+        _flush_logs()
+        raise
+
+
+@app.get("/v1/audio/tempo")
+def list_tempo_jobs() -> List[Dict[str, Any]]:
+    with TEMPO_HISTORY_LOCK:
+        return [dict(item) for item in TEMPO_HISTORY]
+
+
+@app.get("/v1/audio/tempo/{job_id}/status")
+def get_tempo_job_status(job_id: str) -> Dict[str, Any]:
+    with TEMPO_HISTORY_LOCK:
+        for item in TEMPO_HISTORY:
+            if item.get("id") == job_id:
+                return dict(item)
+    raise HTTPException(status_code=404, detail="job_not_found")
 
 
 # ---------- ffprobe endpoints ----------
