@@ -5506,7 +5506,7 @@ async def compose_from_binaries(
     video: UploadFile = File(...),
     audio: Optional[UploadFile] = File(None),
     bgm: Optional[UploadFile] = File(None),
-    duration_ms: int = Query(30000, ge=1, le=3600000),
+    duration_ms: Optional[int] = Query(None, ge=1, le=3600000),
     width: int = Query(1920, ge=1, le=7680),
     height: int = Query(1080, ge=1, le=7680),
     fps: int = Query(30, ge=1, le=240),
@@ -5538,14 +5538,20 @@ async def compose_from_binaries(
             await stream_upload_to_path(bgm, b_path)
             has_bgm = True
 
-        dur_s = f"{duration_ms/1000:.3f}"
         inputs = ["-i", str(v_path)]
-        if has_audio: inputs += ["-i", str(a_path)]
-        if has_bgm:   inputs += ["-i", str(b_path)]
+        if has_audio:
+            inputs += ["-i", str(a_path)]
+        if has_bgm:
+            inputs += ["-i", str(b_path)]
 
         maps = ["-map", "0:v:0"]
-        cmd = ["ffmpeg", "-y"] + inputs + [
-            "-t", dur_s,
+        cmd = ["ffmpeg", "-y"] + inputs
+
+        if duration_ms is not None:
+            dur_s = f"{duration_ms/1000:.3f}"
+            cmd += ["-t", dur_s]
+
+        cmd += [
             "-vf", f"scale={width}:{height},fps={fps}",
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
