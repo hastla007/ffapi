@@ -3766,11 +3766,12 @@ def documentation(request: Request):
     <span class="param">audio_url</span> - Audio URL (optional)<br>
     <span class="param">bgm_url</span> - Background music URL (optional)<br>
     <span class="param">duration</span> - Duration in seconds (0.001-3600, optional)<br>
-    <span class="param">duration_ms</span> - Duration in milliseconds (1-3600000, default: 30000)<br>
+    <span class="param">duration_ms</span> - Duration in milliseconds (1-3600000, optional)<br>
     <span class="param">width</span> - Output width in pixels (default: 1920)<br>
     <span class="param">height</span> - Output height in pixels (default: 1080)<br>
     <span class="param">fps</span> - Output frames per second (default: 30)<br>
     <span class="param">bgm_volume</span> - BGM volume multiplier (default: 0.3)<br>
+    <span class="param">loop_bgm</span> - Loop background music to fill duration (default: false)<br>
     <span class="param">headers</span> - HTTP headers for authenticated requests (optional)<br>
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
   </div>
@@ -5070,6 +5071,7 @@ class ComposeFromUrlsJob(BaseModel):
     height: int = 1080
     fps: int = 30
     bgm_volume: float = 0.3
+    loop_bgm: bool = False
     headers: Optional[Dict[str, str]] = None  # forwarded header subset
     webhook_url: Optional[HttpUrl] = None
     webhook_headers: Optional[Dict[str, str]] = None
@@ -5757,10 +5759,20 @@ async def _compose_from_urls_impl(
             "-movflags", "+faststart",
         ]
         if has_audio and has_bgm:
-            af = (
-                f"[1:a]anull[a1];[2:a]volume={job.bgm_volume}[a2];"
-                "[a1][a2]amix=inputs=2:normalize=0:duration=shortest[aout]"
-            )
+            # Mix voice audio with background music
+            if job.loop_bgm:
+                # Loop the BGM indefinitely, then mix
+                af = (
+                    f"[1:a]anull[a1];"
+                    f"[2:a]aloop=loop=-1:size=2e+09,volume={job.bgm_volume}[a2];"
+                    "[a1][a2]amix=inputs=2:normalize=0:duration=first[aout]"
+                )
+            else:
+                # Standard mix - BGM stops when it ends
+                af = (
+                    f"[1:a]anull[a1];[2:a]volume={job.bgm_volume}[a2];"
+                    "[a1][a2]amix=inputs=2:normalize=0:duration=shortest[aout]"
+                )
             cmd += [
                 "-filter_complex",
                 af,
@@ -5776,8 +5788,16 @@ async def _compose_from_urls_impl(
             maps += ["-map", "1:a:0"]
             cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
         elif has_bgm:
-            cmd += ["-filter_complex", f"[1:a]volume={job.bgm_volume}[aout]"]
-            maps += ["-map", "[aout]"]
+            # Only BGM, with optional looping
+            if job.loop_bgm:
+                cmd += [
+                    "-filter_complex",
+                    f"[1:a]aloop=loop=-1:size=2e+09,volume={job.bgm_volume}[aout]",
+                ]
+                maps += ["-map", "[aout]"]
+            else:
+                cmd += ["-filter_complex", f"[1:a]volume={job.bgm_volume}[aout]"]
+                maps += ["-map", "[aout]"]
             cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
 
         cmd += maps + [str(out_path)]
