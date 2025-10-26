@@ -5149,9 +5149,8 @@ class ComposeFromUrlsJob(BaseModel):
         raise ValueError("webhook_headers must be a mapping of header names to values")
 
     def model_post_init(self, __context: Any) -> None:
-        if self.duration is None and self.duration_ms is None:
-            self.duration_ms = 30000
-        elif self.duration is not None and self.duration_ms is not None:
+        # Don't set a default - let the video play its full length
+        if self.duration is not None and self.duration_ms is not None:
             raise ValueError("Provide either 'duration' or 'duration_ms', not both")
         elif self.duration is not None:
             self.duration_ms = int(self.duration * 1000)
@@ -5507,7 +5506,7 @@ async def compose_from_binaries(
     video: UploadFile = File(...),
     audio: Optional[UploadFile] = File(None),
     bgm: Optional[UploadFile] = File(None),
-    duration_ms: int = Query(30000, ge=1, le=3600000),
+    duration_ms: Optional[int] = Query(None, ge=1, le=3600000),
     width: int = Query(1920, ge=1, le=7680),
     height: int = Query(1080, ge=1, le=7680),
     fps: int = Query(30, ge=1, le=240),
@@ -5539,14 +5538,20 @@ async def compose_from_binaries(
             await stream_upload_to_path(bgm, b_path)
             has_bgm = True
 
-        dur_s = f"{duration_ms/1000:.3f}"
         inputs = ["-i", str(v_path)]
-        if has_audio: inputs += ["-i", str(a_path)]
-        if has_bgm:   inputs += ["-i", str(b_path)]
+        if has_audio:
+            inputs += ["-i", str(a_path)]
+        if has_bgm:
+            inputs += ["-i", str(b_path)]
 
         maps = ["-map", "0:v:0"]
-        cmd = ["ffmpeg", "-y"] + inputs + [
-            "-t", dur_s,
+        cmd = ["ffmpeg", "-y"] + inputs
+
+        if duration_ms is not None:
+            dur_s = f"{duration_ms/1000:.3f}"
+            cmd += ["-t", dur_s]
+
+        cmd += [
             "-vf", f"scale={width}:{height},fps={fps}",
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
@@ -5732,7 +5737,6 @@ async def _compose_from_urls_impl(
             if progress:
                 progress.update(55, "Background music skipped")
 
-        dur_s = f"{job.duration_ms/1000:.3f}"
         inputs = ["-i", str(v_path)]
         if has_audio:
             inputs += ["-i", str(a_path)]
@@ -5740,8 +5744,14 @@ async def _compose_from_urls_impl(
             inputs += ["-i", str(b_path)]
 
         maps = ["-map", "0:v:0"]
-        cmd = ["ffmpeg", "-y"] + inputs + [
-            "-t", dur_s,
+        cmd = ["ffmpeg", "-y"] + inputs
+
+        # Only add duration limit if user explicitly provided it
+        if job.duration_ms is not None:
+            dur_s = f"{job.duration_ms/1000:.3f}"
+            cmd += ["-t", dur_s]
+
+        cmd += [
             "-vf", f"scale={job.width}:{job.height},fps={job.fps}",
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
@@ -5772,9 +5782,13 @@ async def _compose_from_urls_impl(
 
         cmd += maps + [str(out_path)]
         parser: Optional[FFmpegProgressParser] = None
-        if progress:
+        if progress and job.duration_ms is not None:
             progress.update(70, "Rendering composition")
-            parser = FFmpegProgressParser(job.duration_ms / 1000.0, progress, "Rendering composition")
+            parser = FFmpegProgressParser(
+                job.duration_ms / 1000.0, progress, "Rendering composition"
+            )
+        elif progress:
+            progress.update(70, "Rendering composition (unknown duration)")
         with log_path.open("w", encoding="utf-8", errors="ignore") as logf:
             code = run_ffmpeg_with_timeout(cmd, logf, progress_parser=parser)
         save_log(log_path, "compose-urls")
