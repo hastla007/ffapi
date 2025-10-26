@@ -5149,9 +5149,8 @@ class ComposeFromUrlsJob(BaseModel):
         raise ValueError("webhook_headers must be a mapping of header names to values")
 
     def model_post_init(self, __context: Any) -> None:
-        if self.duration is None and self.duration_ms is None:
-            self.duration_ms = 30000
-        elif self.duration is not None and self.duration_ms is not None:
+        # Don't set a default - let the video play its full length
+        if self.duration is not None and self.duration_ms is not None:
             raise ValueError("Provide either 'duration' or 'duration_ms', not both")
         elif self.duration is not None:
             self.duration_ms = int(self.duration * 1000)
@@ -5732,7 +5731,6 @@ async def _compose_from_urls_impl(
             if progress:
                 progress.update(55, "Background music skipped")
 
-        dur_s = f"{job.duration_ms/1000:.3f}"
         inputs = ["-i", str(v_path)]
         if has_audio:
             inputs += ["-i", str(a_path)]
@@ -5740,8 +5738,14 @@ async def _compose_from_urls_impl(
             inputs += ["-i", str(b_path)]
 
         maps = ["-map", "0:v:0"]
-        cmd = ["ffmpeg", "-y"] + inputs + [
-            "-t", dur_s,
+        cmd = ["ffmpeg", "-y"] + inputs
+
+        # Only add duration limit if user explicitly provided it
+        if job.duration_ms is not None:
+            dur_s = f"{job.duration_ms/1000:.3f}"
+            cmd += ["-t", dur_s]
+
+        cmd += [
             "-vf", f"scale={job.width}:{job.height},fps={job.fps}",
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
