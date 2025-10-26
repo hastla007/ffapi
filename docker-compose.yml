@@ -14,6 +14,8 @@ services:
       - ./public:/data/public
       - ./work:/data/work
       - ./logs:/data/logs
+      - /c/Windows/Fonts:/fonts:ro  # <-- THIS LINE is for Win fonts uncomment when use Linux docker host
+    # - /usr/share/fonts:/fonts:ro  # <-- THIS LINE is for Linux fonts uncomment when use Win docker host
     restart: unless-stopped
     deploy:
       resources:
