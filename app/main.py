@@ -5782,9 +5782,13 @@ async def _compose_from_urls_impl(
 
         cmd += maps + [str(out_path)]
         parser: Optional[FFmpegProgressParser] = None
-        if progress:
+        if progress and job.duration_ms is not None:
             progress.update(70, "Rendering composition")
-            parser = FFmpegProgressParser(job.duration_ms / 1000.0, progress, "Rendering composition")
+            parser = FFmpegProgressParser(
+                job.duration_ms / 1000.0, progress, "Rendering composition"
+            )
+        elif progress:
+            progress.update(70, "Rendering composition (unknown duration)")
         with log_path.open("w", encoding="utf-8", errors="ignore") as logf:
             code = run_ffmpeg_with_timeout(cmd, logf, progress_parser=parser)
         save_log(log_path, "compose-urls")
