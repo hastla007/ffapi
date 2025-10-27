@@ -14,63 +14,28 @@ services:
       REQUIRE_DURATION_LIMIT: "false"
       # GPU Configuration
       ENABLE_GPU: "true"
-      GPU_ENCODER: "h264_nvenc"  # Options: h264_nvenc, hevc_nvenc, h264_amf, h264_qsv
-      GPU_DECODER: "h264_cuvid"  # Options: h264_cuvid, hevc_cuvid, mjpeg_cuvid
-      GPU_DEVICE: "0"            # GPU device index (for multi-GPU systems)
+      GPU_ENCODER: "h264_nvenc"  # or hevc_nvenc for H.265
+      GPU_DECODER: "h264_cuvid"
+      GPU_DEVICE: "0"
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"
     volumes:
       - ./public:/data/public
       - ./work:/data/work
       - ./logs:/data/logs
-      # - /usr/share/fonts:/fonts:ro  # Uncomment for Linux fonts
-      # - /c/Windows/Fonts:/fonts:ro  # Uncomment for Windows fonts
     restart: unless-stopped
-    
-    # NVIDIA GPU Configuration
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1  # Use all available GPUs, or specify a number
-              capabilities: [gpu, video]
-        limits:
-          cpus: '8'
-          memory: 8G
-        reservations:
-          cpus: '2'
-          memory: 512M
-    
-    # Alternative: Use runtime (older Docker versions)
-    # runtime: nvidia
-    
-    # Health check
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/health').read()"]
-      interval: 30s
-      timeout: 3s
-      start_period: 5s
-      retries: 3
-
-# For AMD GPUs, use this configuration instead:
-#   ffapi-amd:
-#     build:
-#       context: .
-#       dockerfile: Dockerfile.gpu
-#     devices:
-#       - /dev/dri:/dev/dri  # AMD GPU device
-#     environment:
-#       GPU_ENCODER: "h264_amf"
-#       GPU_DECODER: "h264"
-#     # ... rest of configuration
-
-# For Intel QuickSync, use:
-#   ffapi-intel:
-#     build:
-#       context: .
-#       dockerfile: Dockerfile.gpu
-#     devices:
-#       - /dev/dri/renderD128:/dev/dri/renderD128
-#     environment:
-#       GPU_ENCODER: "h264_qsv"
-#       GPU_DECODER: "h264_qsv"
-#     # ... rest of configuration
+              count: 1
+              capabilities: [gpu, video, compute, utility]
