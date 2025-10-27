@@ -343,17 +343,11 @@ def get_video_decoder(input_path: Optional[Path] = None) -> List[str]:
 
     decoder = gpu_config["decoder"]
 
+    # input_path is accepted for future format-specific handling
+    _ = input_path
+
     if "cuvid" in decoder:
-        if input_path is None:
-            return ["-hwaccel", "cuda", "-hwaccel_device", gpu_config["device"]]
-        return [
-            "-hwaccel",
-            "cuda",
-            "-hwaccel_device",
-            gpu_config["device"],
-            "-c:v",
-            decoder,
-        ]
+        return ["-hwaccel", "cuda", "-hwaccel_device", gpu_config["device"]]
     elif "amf" in decoder or decoder == "h264":
         return ["-hwaccel", "auto"]
     elif "qsv" in decoder:
@@ -5638,9 +5632,12 @@ async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as
             str(in_path),
             "-c:v",
             codec,
-        ] + codec_args + [
-            "-tune",
-            "stillimage",
+        ] + codec_args
+
+        if codec == "libx264":
+            cmd += ["-tune", "stillimage"]
+
+        cmd += [
             "-pix_fmt",
             "yuv420p",
             "-movflags",
