@@ -1,6 +1,12 @@
 # Use NVIDIA CUDA base image for GPU acceleration
 FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
+# Requirements:
+# - NVIDIA GPU with compute capability 5.0+ (Maxwell generation or newer)
+# - NVIDIA Driver 525.60.13+ (for CUDA 12.2 runtime)
+# - Docker configured with the NVIDIA Container Toolkit
+# - FFmpeg compiled with --enable-nvenc support
+
 # Prevent interactive prompts during installation
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -11,17 +17,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg-dev \
     zlib1g-dev \
     libpng-dev \
-    wget \
-    xz-utils \
+    curl \
+    software-properties-common \
     && rm -rf /var/lib/apt/lists/*
 
-# Install FFmpeg with NVIDIA GPU support (static build with NVENC)
-RUN wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
-    && tar xvf ffmpeg-release-amd64-static.tar.xz \
-    && mv ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ \
-    && mv ffmpeg-*-amd64-static/ffprobe /usr/local/bin/ \
-    && rm -rf ffmpeg-*-amd64-static* \
-    && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+# Install FFmpeg with NVIDIA GPU support from Ubuntu PPA providing NVENC-enabled builds
+RUN apt-get update \
+    && add-apt-repository ppa:ubuntuhandbook1/ffmpeg7 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 # Verify FFmpeg supports hardware acceleration
 RUN ffmpeg -hwaccels
