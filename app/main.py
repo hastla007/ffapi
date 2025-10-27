@@ -280,6 +280,200 @@ PROBE_CACHE: Dict[str, Tuple[dict, float]] = {}
 PROBE_CACHE_LOCK = threading.Lock()
 
 
+# ========== GPU Acceleration Helpers ==========
+
+
+GPU_RUNTIME_DISABLED = False
+GPU_FILTER_FALLBACK_WARNED = False
+
+
+def get_gpu_config() -> Dict[str, Any]:
+    """Get GPU configuration from environment variables."""
+    enabled = os.getenv("ENABLE_GPU", "false").lower() == "true"
+    if GPU_RUNTIME_DISABLED:
+        enabled = False
+    return {
+        "enabled": enabled,
+        "encoder": os.getenv("GPU_ENCODER", "h264_nvenc"),
+        "decoder": os.getenv("GPU_DECODER", "h264_cuvid"),
+        "device": os.getenv("GPU_DEVICE", "0"),
+    }
+
+
+def get_video_encoder() -> Tuple[str, List[str]]:
+    """
+    Get appropriate video encoder and preset args based on GPU availability.
+
+    Returns:
+        Tuple of (codec_name, extra_args)
+    """
+
+    gpu_config = get_gpu_config()
+
+    if not gpu_config["enabled"]:
+        return ("libx264", ["-preset", "medium"])
+
+    encoder = gpu_config["encoder"]
+
+    if "nvenc" in encoder:
+        return (
+            encoder,
+            ["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "5M", "-maxrate", "10M", "-bufsize", "10M"],
+        )
+    elif "amf" in encoder:
+        return (
+            encoder,
+            ["-quality", "balanced", "-rc", "vbr_latency", "-qp_i", "23", "-qp_p", "23"],
+        )
+    elif "qsv" in encoder:
+        return (encoder, ["-preset", "medium", "-global_quality", "23"])
+
+    logger.warning(f"Unknown GPU encoder {encoder}, falling back to CPU")
+    return ("libx264", ["-preset", "medium"])
+
+
+def get_video_decoder(input_path: Optional[Path] = None) -> List[str]:
+    """
+    Get appropriate video decoder args based on GPU availability.
+
+    Args:
+        input_path: Optional path to input file for format detection
+
+    Returns:
+        List of FFmpeg args for hardware decoding
+    """
+
+    gpu_config = get_gpu_config()
+
+    if not gpu_config["enabled"]:
+        return []
+
+    decoder = gpu_config["decoder"]
+
+    # input_path is accepted for future format-specific handling
+    _ = input_path
+
+    if "cuvid" in decoder:
+        return [
+            "-hwaccel",
+            "cuda",
+            "-hwaccel_output_format",
+            "cuda",
+            "-hwaccel_device",
+            gpu_config["device"],
+        ]
+    elif "amf" in decoder or decoder == "h264":
+        return ["-hwaccel", "auto"]
+    elif "qsv" in decoder:
+        return ["-hwaccel", "qsv", "-hwaccel_device", f"/dev/dri/renderD{128 + int(gpu_config['device'])}"]
+
+    return []
+
+
+def _decoder_args_use_hw_frames(decoder_args: List[str]) -> bool:
+    """Return True if the decoder args enable hardware frames transfer."""
+
+    try:
+        idx = decoder_args.index("-hwaccel")
+    except ValueError:
+        return False
+
+    if idx + 1 >= len(decoder_args):
+        return False
+
+    accel = decoder_args[idx + 1]
+    return accel in {"cuda", "qsv"}
+
+
+def get_scaling_filter(width: int, height: int, codec: str, use_gpu_filters: bool) -> str:
+    """Get appropriate scaling filter based on GPU availability."""
+
+    if not use_gpu_filters:
+        return f"scale={width}:{height}"
+
+    if "nvenc" in codec:
+        return f"scale_cuda={width}:{height}"
+    if "amf" in codec:
+        return f"scale={width}:{height},format=nv12"
+    if "qsv" in codec:
+        return f"scale_qsv={width}:{height}"
+
+    return f"scale={width}:{height}"
+
+
+def build_encode_args(
+    width: int,
+    height: int,
+    fps: int,
+    *,
+    decoder_args: Optional[List[str]] = None,
+    prefer_gpu_filters: bool = True,
+) -> List[str]:
+    """Build complete encoding arguments including filters and codec settings."""
+
+    codec, codec_args = get_video_encoder()
+    gpu_config = get_gpu_config()
+    decoder_args = decoder_args or []
+    use_hw_frames = _decoder_args_use_hw_frames(decoder_args)
+    use_gpu_filters = prefer_gpu_filters and gpu_config["enabled"] and use_hw_frames
+
+    scale_filter = get_scaling_filter(width, height, codec, use_gpu_filters)
+
+    args = [
+        "-vf",
+        f"{scale_filter},fps={fps}",
+        "-c:v",
+        codec,
+    ] + codec_args + [
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+    ]
+
+    if prefer_gpu_filters and gpu_config["enabled"] and not use_hw_frames:
+        global GPU_FILTER_FALLBACK_WARNED
+        if not GPU_FILTER_FALLBACK_WARNED:
+            logger.warning(
+                "GPU encoder %s requested but hardware frames are unavailable; "
+                "using CPU-based scaling filters instead. Configure GPU_DECODER for hardware decoding to avoid transfers.",
+                codec,
+            )
+            GPU_FILTER_FALLBACK_WARNED = True
+
+    return args
+
+
+def log_gpu_status() -> None:
+    """Log current GPU configuration at startup."""
+
+    gpu_config = get_gpu_config()
+    global GPU_RUNTIME_DISABLED
+
+    if gpu_config["enabled"]:
+        logger.info("=" * 60)
+        logger.info("GPU Acceleration ENABLED")
+        logger.info(f"  Encoder: {gpu_config['encoder']}")
+        logger.info(f"  Decoder: {gpu_config['decoder']}")
+        logger.info(f"  Device: {gpu_config['device']}")
+        logger.info("=" * 60)
+
+        try:
+            test_cmd = ["ffmpeg", "-hide_banner", "-encoders"]
+            result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=5)
+            if gpu_config["encoder"] in result.stdout:
+                logger.info(f"✓ GPU encoder '{gpu_config['encoder']}' is available")
+            else:
+                logger.warning(f"⚠ GPU encoder '{gpu_config['encoder']}' not found in FFmpeg; disabling GPU acceleration")
+                GPU_RUNTIME_DISABLED = True
+                os.environ["ENABLE_GPU"] = "false"
+                logger.info("GPU acceleration disabled for this process due to missing encoder")
+        except Exception as e:
+            logger.warning(f"Could not verify GPU encoder: {e}")
+    else:
+        logger.info("GPU Acceleration DISABLED - using CPU encoding")
+
+
 def _generate_totp_secret(length: int = 20) -> str:
     raw = secrets.token_bytes(length)
     secret = base64.b32encode(raw).decode("utf-8").rstrip("=")
@@ -2370,6 +2564,7 @@ logger.info("="*60)
 @app.on_event("startup")
 async def startup_event():
     logger.info("FastAPI server is ready to accept requests")
+    log_gpu_status()
     try:
         cleanup_old_public()
     except Exception as exc:
@@ -5475,15 +5670,29 @@ async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as
 
         await stream_upload_to_path(file, in_path)
 
+        codec, codec_args = get_video_encoder()
+
         cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1",
-            "-t", str(duration),
-            "-i", str(in_path),
-            "-c:v", "libx264", "-preset", "medium",
-            "-tune", "stillimage",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
+            "ffmpeg",
+            "-y",
+            "-loop",
+            "1",
+            "-t",
+            str(duration),
+            "-i",
+            str(in_path),
+            "-c:v",
+            codec,
+        ] + codec_args
+
+        if codec == "libx264":
+            cmd += ["-tune", "stillimage"]
+
+        cmd += [
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
             str(out_path),
         ]
         log = work / "ffmpeg.log"
@@ -5547,17 +5756,15 @@ async def compose_from_binaries(
             inputs += ["-i", str(b_path)]
 
         maps = ["-map", "0:v:0"]
-        cmd = ["ffmpeg", "-y"] + inputs
+        decoder_args = get_video_decoder(v_path)
+        cmd = ["ffmpeg", "-y"] + decoder_args + inputs
 
         if duration_ms is not None:
             dur_s = f"{duration_ms/1000:.3f}"
             cmd += ["-t", dur_s]
 
-        cmd += [
-            "-vf", f"scale={width}:{height},fps={fps}",
-            "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-        ]
+        encode_args = build_encode_args(width, height, fps, decoder_args=decoder_args)
+        cmd += encode_args
         if has_audio and has_bgm:
             af = f"[1:a]anull[a1];[2:a]volume={bgm_volume}[a2];[a1][a2]amix=inputs=2:normalize=0:duration=shortest[aout]"
             cmd += ["-filter_complex", af, "-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
@@ -5600,13 +5807,26 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             raw = work / f"in_{i:03d}.bin"
             await _download_to(str(url), raw, None)
             out = work / f"norm_{i:03d}.mp4"
+            decoder_args = get_video_decoder(raw)
+            encode_args = build_encode_args(
+                job.width, job.height, job.fps, decoder_args=decoder_args
+            )
+
             cmd = [
-                "ffmpeg", "-y",
-                "-i", str(raw),
-                "-vf", f"scale={job.width}:{job.height},fps={job.fps}",
-                "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
-                "-movflags", "+faststart",
+                "ffmpeg",
+                "-y",
+            ] + decoder_args + [
+                "-i",
+                str(raw),
+            ] + encode_args + [
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-ar",
+                "48000",
+                "-movflags",
+                "+faststart",
                 str(out),
             ]
             log = work / f"norm_{i:03d}.log"
@@ -5746,18 +5966,18 @@ async def _compose_from_urls_impl(
             inputs += ["-i", str(b_path)]
 
         maps = ["-map", "0:v:0"]
-        cmd = ["ffmpeg", "-y"] + inputs
+        decoder_args = get_video_decoder(v_path)
+        cmd = ["ffmpeg", "-y"] + decoder_args + inputs
 
         # Only add duration limit if user explicitly provided it
         if job.duration_ms is not None:
             dur_s = f"{job.duration_ms/1000:.3f}"
             cmd += ["-t", dur_s]
 
-        cmd += [
-            "-vf", f"scale={job.width}:{job.height},fps={job.fps}",
-            "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-        ]
+        encode_args = build_encode_args(
+            job.width, job.height, job.fps, decoder_args=decoder_args
+        )
+        cmd += encode_args
         if has_audio and has_bgm:
             # Mix voice audio with background music
             if job.loop_bgm:
