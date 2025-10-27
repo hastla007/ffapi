@@ -283,14 +283,37 @@ PROBE_CACHE_LOCK = threading.Lock()
 # ========== GPU Acceleration Helpers ==========
 
 
-GPU_RUNTIME_DISABLED = False
-GPU_FILTER_FALLBACK_WARNED = False
+class GPUState:
+    """Thread-safe GPU runtime state tracking."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._runtime_disabled = False
+        self._filter_fallback_warned = False
+
+    def disable_runtime(self) -> None:
+        with self._lock:
+            self._runtime_disabled = True
+
+    def is_runtime_disabled(self) -> bool:
+        with self._lock:
+            return self._runtime_disabled
+
+    def should_warn_filter_fallback(self) -> bool:
+        with self._lock:
+            if self._filter_fallback_warned:
+                return False
+            self._filter_fallback_warned = True
+            return True
+
+
+GPU_STATE = GPUState()
 
 
 def get_gpu_config() -> Dict[str, Any]:
     """Get GPU configuration from environment variables."""
     enabled = os.getenv("ENABLE_GPU", "false").lower() == "true"
-    if GPU_RUNTIME_DISABLED:
+    if GPU_STATE.is_runtime_disabled():
         enabled = False
     return {
         "enabled": enabled,
@@ -298,6 +321,22 @@ def get_gpu_config() -> Dict[str, Any]:
         "decoder": os.getenv("GPU_DECODER", "h264_cuvid"),
         "device": os.getenv("GPU_DEVICE", "0"),
     }
+
+
+def _nvenc_supports_modern_presets() -> bool:
+    """Return True if the installed FFmpeg uses the modern NVENC preset names."""
+
+    version_line = ffmpeg_snapshot().get("version") or ""
+    match = re.search(r"ffmpeg version\s+(?:n)?(\d+)(?:\.(\d+))?", version_line)
+    if not match:
+        return False
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    if major > 5:
+        return True
+    if major == 5 and minor >= 1:
+        return True
+    return False
 
 
 def get_video_encoder() -> Tuple[str, List[str]]:
@@ -316,9 +355,11 @@ def get_video_encoder() -> Tuple[str, List[str]]:
     encoder = gpu_config["encoder"]
 
     if "nvenc" in encoder:
+        preset_args = ["-preset", "p4"] if _nvenc_supports_modern_presets() else ["-preset", "medium"]
         return (
             encoder,
-            ["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "5M", "-maxrate", "10M", "-bufsize", "10M"],
+            preset_args
+            + ["-rc", "vbr", "-cq", "23", "-b:v", "5M", "-maxrate", "10M", "-bufsize", "10M"],
         )
     elif "amf" in encoder:
         return (
@@ -432,14 +473,12 @@ def build_encode_args(
     ]
 
     if prefer_gpu_filters and gpu_config["enabled"] and not use_hw_frames:
-        global GPU_FILTER_FALLBACK_WARNED
-        if not GPU_FILTER_FALLBACK_WARNED:
+        if GPU_STATE.should_warn_filter_fallback():
             logger.warning(
                 "GPU encoder %s requested but hardware frames are unavailable; "
                 "using CPU-based scaling filters instead. Configure GPU_DECODER for hardware decoding to avoid transfers.",
                 codec,
             )
-            GPU_FILTER_FALLBACK_WARNED = True
 
     return args
 
@@ -448,15 +487,26 @@ def log_gpu_status() -> None:
     """Log current GPU configuration at startup."""
 
     gpu_config = get_gpu_config()
-    global GPU_RUNTIME_DISABLED
+    requested_enabled = os.getenv("ENABLE_GPU", "false").lower() == "true"
 
+    logger.info("=" * 60)
     if gpu_config["enabled"]:
-        logger.info("=" * 60)
         logger.info("GPU Acceleration ENABLED")
         logger.info(f"  Encoder: {gpu_config['encoder']}")
         logger.info(f"  Decoder: {gpu_config['decoder']}")
         logger.info(f"  Device: {gpu_config['device']}")
-        logger.info("=" * 60)
+
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=driver_version,name", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                logger.info(f"  GPU Info: {result.stdout.strip()}")
+        except Exception:
+            logger.warning("  Could not query GPU information (nvidia-smi not available)")
 
         try:
             test_cmd = ["ffmpeg", "-hide_banner", "-encoders"]
@@ -464,14 +514,24 @@ def log_gpu_status() -> None:
             if gpu_config["encoder"] in result.stdout:
                 logger.info(f"✓ GPU encoder '{gpu_config['encoder']}' is available")
             else:
-                logger.warning(f"⚠ GPU encoder '{gpu_config['encoder']}' not found in FFmpeg; disabling GPU acceleration")
-                GPU_RUNTIME_DISABLED = True
+                logger.warning(
+                    f"⚠ GPU encoder '{gpu_config['encoder']}' not found in FFmpeg; disabling GPU acceleration"
+                )
+                GPU_STATE.disable_runtime()
                 os.environ["ENABLE_GPU"] = "false"
                 logger.info("GPU acceleration disabled for this process due to missing encoder")
-        except Exception as e:
-            logger.warning(f"Could not verify GPU encoder: {e}")
+        except Exception as exc:
+            logger.warning(f"Could not verify GPU encoder: {exc}")
+
+        if GPU_STATE.is_runtime_disabled():
+            logger.info("GPU Acceleration DISABLED - using CPU encoding")
     else:
-        logger.info("GPU Acceleration DISABLED - using CPU encoding")
+        if requested_enabled and GPU_STATE.is_runtime_disabled():
+            logger.info("GPU Acceleration DISABLED - runtime fallback to CPU encoding")
+        else:
+            logger.info("GPU Acceleration DISABLED - using CPU encoding")
+
+    logger.info("=" * 60)
 
 
 def _generate_totp_secret(length: int = 20) -> str:
@@ -4944,19 +5004,109 @@ def health():
             disk_ok = False
             break
 
-    overall_ok = ffmpeg_info.get("available", False) and disk_ok
+    requested_gpu = os.getenv("ENABLE_GPU", "false").lower() == "true"
+    runtime_disabled = GPU_STATE.is_runtime_disabled()
+    gpu_config = get_gpu_config()
+    gpu_status: Dict[str, Any] = {
+        "requested": requested_gpu,
+        "enabled": gpu_config["enabled"],
+        "runtime_disabled": runtime_disabled,
+        "encoder": os.getenv("GPU_ENCODER", "h264_nvenc"),
+        "decoder": os.getenv("GPU_DECODER", "h264_cuvid"),
+        "device": os.getenv("GPU_DEVICE", "0"),
+    }
+
+    gpu_ok = True
+    if requested_gpu:
+        if not gpu_config["enabled"] or runtime_disabled:
+            gpu_status["available"] = False
+            gpu_status["issue"] = "runtime_disabled"
+            gpu_ok = False
+        else:
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=2
+                )
+                available = result.returncode == 0
+                gpu_status["available"] = available
+                if not available:
+                    stderr = (result.stderr or "").strip()
+                    if stderr:
+                        gpu_status["nvidia_smi_error"] = stderr
+                    gpu_ok = False
+            except Exception as exc:
+                gpu_status["available"] = False
+                gpu_status["nvidia_smi_error"] = str(exc)
+                gpu_ok = False
+    else:
+        gpu_status["available"] = None
+
+    overall_ok = ffmpeg_info.get("available", False) and disk_ok and gpu_ok
 
     return {
         "ok": overall_ok,
         "disk": disk,
         "memory": memory,
         "ffmpeg": ffmpeg_info,
+        "gpu": gpu_status,
         "operations": {
             "recent_success_rate": metrics_data["recent"],
             "queue": metrics_data["queue"],
             "error_counts": metrics_data["errors"],
         },
     }
+
+
+@app.get("/gpu/test")
+async def test_gpu_encoding(request: Request):
+    """Run a lightweight GPU encoding smoke test."""
+
+    redirect = ensure_dashboard_access(request)
+    if redirect:
+        return redirect
+
+    gpu_config = get_gpu_config()
+    runtime_disabled = GPU_STATE.is_runtime_disabled()
+
+    if not gpu_config["enabled"] or runtime_disabled:
+        status = "runtime_disabled" if runtime_disabled else "disabled"
+        return {
+            "status": status,
+            "message": "GPU acceleration is not enabled",
+            "encoder": os.getenv("GPU_ENCODER", "h264_nvenc"),
+        }
+
+    try:
+        with TemporaryDirectory(prefix="gpu_test_", dir=str(WORK_DIR)) as workdir:
+            work = Path(workdir)
+            test_video = work / "test.mp4"
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x240:d=1",
+                "-c:v",
+                gpu_config["encoder"],
+                "-t",
+                "1",
+                str(test_video),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and test_video.exists():
+                return {
+                    "status": "success",
+                    "encoder": gpu_config["encoder"],
+                    "message": "GPU encoding test passed",
+                }
+            return {
+                "status": "failed",
+                "encoder": gpu_config["encoder"],
+                "stderr": (result.stderr or "").strip(),
+            }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
 
 
 @app.get("/metrics", response_class=HTMLResponse)

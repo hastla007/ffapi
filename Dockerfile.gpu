@@ -1,6 +1,12 @@
 # Use NVIDIA CUDA base image for GPU acceleration
 FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
+# Requirements:
+# - NVIDIA GPU with compute capability 5.0+ (Maxwell generation or newer)
+# - NVIDIA Driver 525.60.13+ (for CUDA 12.2 runtime)
+# - Docker configured with the NVIDIA Container Toolkit
+# - FFmpeg compiled with --enable-nvenc support
+
 # Prevent interactive prompts during installation
 ENV DEBIAN_FRONTEND=noninteractive
 
