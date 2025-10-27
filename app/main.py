@@ -283,10 +283,17 @@ PROBE_CACHE_LOCK = threading.Lock()
 # ========== GPU Acceleration Helpers ==========
 
 
+GPU_RUNTIME_DISABLED = False
+GPU_FILTER_FALLBACK_WARNED = False
+
+
 def get_gpu_config() -> Dict[str, Any]:
     """Get GPU configuration from environment variables."""
+    enabled = os.getenv("ENABLE_GPU", "false").lower() == "true"
+    if GPU_RUNTIME_DISABLED:
+        enabled = False
     return {
-        "enabled": os.getenv("ENABLE_GPU", "false").lower() == "true",
+        "enabled": enabled,
         "encoder": os.getenv("GPU_ENCODER", "h264_nvenc"),
         "decoder": os.getenv("GPU_DECODER", "h264_cuvid"),
         "device": os.getenv("GPU_DEVICE", "0"),
@@ -347,7 +354,14 @@ def get_video_decoder(input_path: Optional[Path] = None) -> List[str]:
     _ = input_path
 
     if "cuvid" in decoder:
-        return ["-hwaccel", "cuda", "-hwaccel_device", gpu_config["device"]]
+        return [
+            "-hwaccel",
+            "cuda",
+            "-hwaccel_output_format",
+            "cuda",
+            "-hwaccel_device",
+            gpu_config["device"],
+        ]
     elif "amf" in decoder or decoder == "h264":
         return ["-hwaccel", "auto"]
     elif "qsv" in decoder:
@@ -356,31 +370,54 @@ def get_video_decoder(input_path: Optional[Path] = None) -> List[str]:
     return []
 
 
-def get_scaling_filter(width: int, height: int) -> str:
+def _decoder_args_use_hw_frames(decoder_args: List[str]) -> bool:
+    """Return True if the decoder args enable hardware frames transfer."""
+
+    try:
+        idx = decoder_args.index("-hwaccel")
+    except ValueError:
+        return False
+
+    if idx + 1 >= len(decoder_args):
+        return False
+
+    accel = decoder_args[idx + 1]
+    return accel in {"cuda", "qsv"}
+
+
+def get_scaling_filter(width: int, height: int, codec: str, use_gpu_filters: bool) -> str:
     """Get appropriate scaling filter based on GPU availability."""
 
-    gpu_config = get_gpu_config()
-
-    if not gpu_config["enabled"]:
+    if not use_gpu_filters:
         return f"scale={width}:{height}"
 
-    encoder = gpu_config["encoder"]
-
-    if "nvenc" in encoder:
+    if "nvenc" in codec:
         return f"scale_cuda={width}:{height}"
-    elif "amf" in encoder:
+    if "amf" in codec:
         return f"scale={width}:{height},format=nv12"
-    elif "qsv" in encoder:
+    if "qsv" in codec:
         return f"scale_qsv={width}:{height}"
 
     return f"scale={width}:{height}"
 
 
-def build_encode_args(width: int, height: int, fps: int) -> List[str]:
+def build_encode_args(
+    width: int,
+    height: int,
+    fps: int,
+    *,
+    decoder_args: Optional[List[str]] = None,
+    prefer_gpu_filters: bool = True,
+) -> List[str]:
     """Build complete encoding arguments including filters and codec settings."""
 
     codec, codec_args = get_video_encoder()
-    scale_filter = get_scaling_filter(width, height)
+    gpu_config = get_gpu_config()
+    decoder_args = decoder_args or []
+    use_hw_frames = _decoder_args_use_hw_frames(decoder_args)
+    use_gpu_filters = prefer_gpu_filters and gpu_config["enabled"] and use_hw_frames
+
+    scale_filter = get_scaling_filter(width, height, codec, use_gpu_filters)
 
     args = [
         "-vf",
@@ -394,6 +431,16 @@ def build_encode_args(width: int, height: int, fps: int) -> List[str]:
         "+faststart",
     ]
 
+    if prefer_gpu_filters and gpu_config["enabled"] and not use_hw_frames:
+        global GPU_FILTER_FALLBACK_WARNED
+        if not GPU_FILTER_FALLBACK_WARNED:
+            logger.warning(
+                "GPU encoder %s requested but hardware frames are unavailable; "
+                "using CPU-based scaling filters instead. Configure GPU_DECODER for hardware decoding to avoid transfers.",
+                codec,
+            )
+            GPU_FILTER_FALLBACK_WARNED = True
+
     return args
 
 
@@ -401,6 +448,7 @@ def log_gpu_status() -> None:
     """Log current GPU configuration at startup."""
 
     gpu_config = get_gpu_config()
+    global GPU_RUNTIME_DISABLED
 
     if gpu_config["enabled"]:
         logger.info("=" * 60)
@@ -416,7 +464,10 @@ def log_gpu_status() -> None:
             if gpu_config["encoder"] in result.stdout:
                 logger.info(f"✓ GPU encoder '{gpu_config['encoder']}' is available")
             else:
-                logger.warning(f"⚠ GPU encoder '{gpu_config['encoder']}' not found in FFmpeg")
+                logger.warning(f"⚠ GPU encoder '{gpu_config['encoder']}' not found in FFmpeg; disabling GPU acceleration")
+                GPU_RUNTIME_DISABLED = True
+                os.environ["ENABLE_GPU"] = "false"
+                logger.info("GPU acceleration disabled for this process due to missing encoder")
         except Exception as e:
             logger.warning(f"Could not verify GPU encoder: {e}")
     else:
@@ -5712,7 +5763,7 @@ async def compose_from_binaries(
             dur_s = f"{duration_ms/1000:.3f}"
             cmd += ["-t", dur_s]
 
-        encode_args = build_encode_args(width, height, fps)
+        encode_args = build_encode_args(width, height, fps, decoder_args=decoder_args)
         cmd += encode_args
         if has_audio and has_bgm:
             af = f"[1:a]anull[a1];[2:a]volume={bgm_volume}[a2];[a1][a2]amix=inputs=2:normalize=0:duration=shortest[aout]"
@@ -5757,7 +5808,9 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             await _download_to(str(url), raw, None)
             out = work / f"norm_{i:03d}.mp4"
             decoder_args = get_video_decoder(raw)
-            encode_args = build_encode_args(job.width, job.height, job.fps)
+            encode_args = build_encode_args(
+                job.width, job.height, job.fps, decoder_args=decoder_args
+            )
 
             cmd = [
                 "ffmpeg",
@@ -5921,7 +5974,9 @@ async def _compose_from_urls_impl(
             dur_s = f"{job.duration_ms/1000:.3f}"
             cmd += ["-t", dur_s]
 
-        encode_args = build_encode_args(job.width, job.height, job.fps)
+        encode_args = build_encode_args(
+            job.width, job.height, job.fps, decoder_args=decoder_args
+        )
         cmd += encode_args
         if has_audio and has_bgm:
             # Mix voice audio with background music
