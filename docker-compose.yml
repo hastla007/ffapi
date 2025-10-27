@@ -20,10 +20,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '4'      # Max 4 CPU cores
-          memory: 4G     # Max 4GB RAM
+          cpus: '8'      # Max 4 CPU cores
+          memory: 8G     # Max 4GB RAM
         reservations:
-          cpus: '0.5'    # Reserve at least 0.5 cores
+          cpus: '2'    # Reserve at least 0.5 cores
           memory: 512M   # Reserve at least 512MB
     # Health check configuration
     healthcheck:
