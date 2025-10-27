@@ -1,0 +1,123 @@
+# Use NVIDIA CUDA base image for GPU acceleration
+FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
+
+# Requirements:
+# - NVIDIA GPU with compute capability 5.0+ (Maxwell generation or newer)
+# - NVIDIA Driver 525.60.13+ (for CUDA 12.2 runtime)
+# - Docker configured with the NVIDIA Container Toolkit
+
+# Prevent interactive prompts during installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies and runtime requirements
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Python runtime
+    python3.11 \
+    python3-pip \
+    # Build essentials
+    build-essential \
+    cmake \
+    pkg-config \
+    yasm \
+    nasm \
+    git \
+    curl \
+    ca-certificates \
+    # Library dependencies for FFmpeg
+    libnuma-dev \
+    libx264-dev \
+    libx265-dev \
+    libvpx-dev \
+    libfdk-aac-dev \
+    libmp3lame-dev \
+    libopus-dev \
+    libvorbis-dev \
+    libass-dev \
+    libfreetype6-dev \
+    libsdl2-dev \
+    libva-dev \
+    libvdpau-dev \
+    libxcb1-dev \
+    libxcb-shm0-dev \
+    libxcb-xfixes0-dev \
+    # Image processing libraries
+    libjpeg-dev \
+    zlib1g-dev \
+    libpng-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install NVIDIA codec headers (required for NVENC/NVDEC)
+WORKDIR /tmp
+RUN git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
+    cd nv-codec-headers && \
+    git checkout n12.1.14.0 && \
+    make install && \
+    cd .. && \
+    rm -rf nv-codec-headers
+
+# Download and compile FFmpeg with NVENC support
+ENV FFMPEG_VERSION=6.1.1
+RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz -o ffmpeg.tar.xz && \
+    tar xf ffmpeg.tar.xz && \
+    cd ffmpeg-${FFMPEG_VERSION} && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-gpl \
+        --enable-nonfree \
+        --enable-libx264 \
+        --enable-libx265 \
+        --enable-libvpx \
+        --enable-libfdk-aac \
+        --enable-libmp3lame \
+        --enable-libopus \
+        --enable-libvorbis \
+        --enable-libass \
+        --enable-libfreetype \
+        --enable-cuda-nvcc \
+        --enable-cuvid \
+        --enable-nvdec \
+        --enable-nvenc \
+        --enable-libnpp \
+        --extra-cflags="-I/usr/local/cuda/include" \
+        --extra-ldflags="-L/usr/local/cuda/lib64" \
+        --nvccflags="-gencode arch=compute_52,code=sm_52 -O2" \
+        --disable-debug \
+        --disable-doc && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd .. && \
+    rm -rf ffmpeg-${FFMPEG_VERSION} ffmpeg.tar.xz
+
+# Verify FFmpeg supports hardware acceleration
+RUN ffmpeg -hwaccels && ffmpeg -encoders | grep nvenc
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY app ./app
+COPY fastapi_csrf_protect ./fastapi_csrf_protect
+
+# Configure volumes and environment
+VOLUME ["/data/public", "/data/work", "/data/logs"]
+ENV PUBLIC_DIR=/data/public
+ENV WORK_DIR=/data/work
+ENV LOGS_DIR=/data/logs
+ENV RETENTION_DAYS=7
+ENV PUBLIC_BASE_URL=
+ENV ENABLE_GPU=true
+ENV GPU_ENCODER=h264_nvenc
+ENV GPU_DECODER=h264_cuvid
+ENV GPU_DEVICE=0
+
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:3000/health').read()" || exit 1
+
+CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3000"]
