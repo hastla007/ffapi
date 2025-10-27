@@ -247,7 +247,7 @@ MAX_FILE_SIZE_MB = settings.MAX_FILE_SIZE_MB
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 FFMPEG_TIMEOUT_SECONDS = settings.FFMPEG_TIMEOUT_SECONDS
 MIN_FREE_SPACE_MB = settings.MIN_FREE_SPACE_MB
-UPLOAD_CHUNK_SIZE = settings.UPLOAD_CHUNK_SIZE
+UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks
 PUBLIC_CLEANUP_INTERVAL_SECONDS = settings.PUBLIC_CLEANUP_INTERVAL_SECONDS
 REQUIRE_DURATION_LIMIT = settings.REQUIRE_DURATION_LIMIT
 RATE_LIMITER = RateLimiter(settings.RATE_LIMIT_REQUESTS_PER_MINUTE)
@@ -355,11 +355,15 @@ def get_video_encoder() -> Tuple[str, List[str]]:
     encoder = gpu_config["encoder"]
 
     if "nvenc" in encoder:
-        preset_args = ["-preset", "p4"] if _nvenc_supports_modern_presets() else ["-preset", "medium"]
+        preset_args = (
+            ["-preset", "p1", "-tune", "hq"]
+            if _nvenc_supports_modern_presets()
+            else ["-preset", "medium"]
+        )
         return (
             encoder,
             preset_args
-            + ["-rc", "vbr", "-cq", "23", "-b:v", "5M", "-maxrate", "10M", "-bufsize", "10M"],
+            + ["-rc", "vbr", "-cq", "28", "-b:v", "5M", "-maxrate", "10M", "-bufsize", "10M"],
         )
     elif "amf" in encoder:
         return (
@@ -470,6 +474,8 @@ def build_encode_args(
         "yuv420p",
         "-movflags",
         "+faststart",
+        "-threads",
+        "0",  # auto-detect cores
     ]
 
     if prefer_gpu_filters and gpu_config["enabled"] and not use_hw_frames:
