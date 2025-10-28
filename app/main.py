@@ -462,9 +462,14 @@ def build_encode_args(
 
     scale_filter = get_scaling_filter(width, height, codec, use_gpu_filters)
 
+    if use_gpu_filters and "scale_cuda" in scale_filter:
+        filter_chain = f"{scale_filter},hwdownload,format=nv12,fps={fps}"
+    else:
+        filter_chain = f"{scale_filter},fps={fps}"
+
     args = [
         "-vf",
-        f"{scale_filter},fps={fps}",
+        filter_chain,
         "-c:v",
         codec,
     ] + codec_args + [
