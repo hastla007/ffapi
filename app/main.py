@@ -5949,61 +5949,200 @@ async def compose_from_binaries(
 async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
     logger.info(f"Starting concat: {len(job.clips)} clips, {job.width}x{job.height}@{job.fps}fps")
     check_disk_space(WORK_DIR)
+    
     with TemporaryDirectory(prefix="concat_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
-        norm = []
+        
+        # Step 1: Download all clips
+        logger.info("Downloading %d clips...", len(job.clips))
+        downloaded = []
         for i, url in enumerate(job.clips):
-            raw = work / f"in_{i:03d}.bin"
+            raw = work / f"in_{i:03d}.mp4"
             await _download_to(str(url), raw, None)
-            out = work / f"norm_{i:03d}.mp4"
-            decoder_args = get_video_decoder(raw)
-            encode_args = build_encode_args(
-                job.width, job.height, job.fps, decoder_args=decoder_args
-            )
-
+            downloaded.append(raw)
+            logger.info("Downloaded clip %d/%d", i + 1, len(job.clips))
+        
+        # Step 2: Probe clips to check compatibility
+        logger.info("Probing clips for compatibility...")
+        
+        def probe_clip(clip_path: Path) -> Optional[Dict[str, Any]]:
+            """Probe a video clip and return its stream info."""
+            try:
+                probe_cmd = [
+                    "ffprobe", "-v", "error", 
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name,width,height,avg_frame_rate,pix_fmt",
+                    "-of", "json", 
+                    str(clip_path)
+                ]
+                result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    data = json.loads(result.stdout)
+                    return data.get("streams", [{}])[0] if data.get("streams") else None
+            except Exception as exc:
+                logger.warning("Failed to probe %s: %s", clip_path, exc)
+            return None
+        
+        # Probe all clips
+        clip_info = [probe_clip(p) for p in downloaded]
+        
+        # Check if all clips are compatible for stream copy
+        all_compatible = True
+        baseline = clip_info[0]
+        
+        if not baseline:
+            logger.warning("Could not probe first clip, will re-encode all")
+            all_compatible = False
+        else:
+            baseline_codec = baseline.get("codec_name")
+            baseline_width = baseline.get("width")
+            baseline_height = baseline.get("height")
+            baseline_pix_fmt = baseline.get("pix_fmt")
+            
+            # Check if requested output matches baseline
+            if (baseline_width != job.width or 
+                baseline_height != job.height):
+                logger.info("Output size differs from source, will re-encode")
+                all_compatible = False
+            else:
+                # Check all clips against baseline
+                for i, info in enumerate(clip_info[1:], 1):
+                    if not info:
+                        logger.warning("Could not probe clip %d, will re-encode all", i)
+                        all_compatible = False
+                        break
+                    
+                    if (info.get("codec_name") != baseline_codec or
+                        info.get("width") != baseline_width or
+                        info.get("height") != baseline_height or
+                        info.get("pix_fmt") != baseline_pix_fmt):
+                        logger.info("Clip %d incompatible (codec=%s vs %s, size=%dx%d vs %dx%d), will re-encode all",
+                                  i, info.get("codec_name"), baseline_codec,
+                                  info.get("width"), info.get("height"),
+                                  baseline_width, baseline_height)
+                        all_compatible = False
+                        break
+        
+        out_path = work / "output.mp4"
+        
+        # Step 3: Choose processing path
+        if all_compatible:
+            # ⚡ FAST PATH: Stream copy (no re-encoding!)
+            logger.info("✓ All clips compatible - using FAST stream copy mode")
+            
+            listfile = work / "list.txt"
+            with listfile.open("w", encoding="utf-8") as f:
+                for p in downloaded:
+                    f.write(f"file '{_escape_ffmpeg_concat_path(p)}'\n")
+            
             cmd = [
-                "ffmpeg",
-                "-y",
-            ] + decoder_args + [
-                "-i",
-                str(raw),
-            ] + encode_args + [
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-ar",
-                "48000",
-                "-movflags",
-                "+faststart",
-                str(out),
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(listfile),
+                "-c", "copy",  # ← Stream copy - instant!
+                "-movflags", "+faststart",
+                str(out_path)
             ]
-            log = work / f"norm_{i:03d}.log"
+            
+            log = work / "concat_fast.log"
             with log.open("w", encoding="utf-8", errors="ignore") as lf:
                 code = run_ffmpeg_with_timeout(cmd, lf)
-            save_log(log, f"concat-norm-{i}")
-            if code != 0 or not out.exists():
-                return JSONResponse(status_code=500, content={"error": "ffmpeg_failed_on_clip", "clip": str(url), "log": log.read_text()})
-            norm.append(out)
-        listfile = work / "list.txt"
-        with listfile.open("w", encoding="utf-8") as f:
-            for p in norm:
-                f.write(f"file '{_escape_ffmpeg_concat_path(p)}'\n")
-        out_path = work / "output.mp4"
-        cmd2 = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile), "-c", "copy", "-movflags", "+faststart", str(out_path)]
-        log2 = work / "concat.log"
-        with log2.open("w", encoding="utf-8", errors="ignore") as lf:
-            code2 = run_ffmpeg_with_timeout(cmd2, lf)
-        save_log(log2, "concat-final")
-        if code2 != 0 or not out_path.exists():
-            logger.error("concat failed at final stage")
-            _flush_logs()
-            return JSONResponse(status_code=500, content={"error": "ffmpeg_failed_concat", "log": log2.read_text()})
+            save_log(log, "concat-fast")
+            
+            if code != 0 or not out_path.exists():
+                logger.error("Fast concat failed, falling back to re-encode")
+                all_compatible = False  # Fall through to slow path
+        
+        if not all_compatible:
+            # 🐌 SLOW PATH: Normalize and re-encode incompatible clips
+            logger.info("⚠ Clips incompatible or fast path failed - using SLOW re-encode mode")
+            
+            norm = []
+            for i, clip_path in enumerate(downloaded):
+                logger.info("Normalizing clip %d/%d...", i + 1, len(downloaded))
+                out = work / f"norm_{i:03d}.mp4"
+                
+                decoder_args = get_video_decoder(clip_path)
+                encode_args = build_encode_args(
+                    job.width, job.height, job.fps, decoder_args=decoder_args
+                )
+                
+                cmd = [
+                    "ffmpeg", "-y",
+                ] + decoder_args + [
+                    "-i", str(clip_path),
+                ] + encode_args + [
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    "-ar", "48000",
+                    "-movflags", "+faststart",
+                    str(out),
+                ]
+                
+                log = work / f"norm_{i:03d}.log"
+                with log.open("w", encoding="utf-8", errors="ignore") as lf:
+                    code = run_ffmpeg_with_timeout(cmd, lf)
+                save_log(log, f"concat-norm-{i}")
+                
+                if code != 0 or not out.exists():
+                    logger.error("Failed to normalize clip %d", i)
+                    _flush_logs()
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "error": "ffmpeg_failed_on_clip",
+                            "clip": str(job.clips[i]),
+                            "log": log.read_text()
+                        }
+                    )
+                norm.append(out)
+            
+            # Concatenate normalized clips
+            logger.info("Concatenating %d normalized clips...", len(norm))
+            listfile = work / "list.txt"
+            with listfile.open("w", encoding="utf-8") as f:
+                for p in norm:
+                    f.write(f"file '{_escape_ffmpeg_concat_path(p)}'\n")
+            
+            cmd2 = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(listfile),
+                "-c", "copy",
+                "-movflags", "+faststart",
+                str(out_path)
+            ]
+            
+            log2 = work / "concat.log"
+            with log2.open("w", encoding="utf-8", errors="ignore") as lf:
+                code2 = run_ffmpeg_with_timeout(cmd2, lf)
+            save_log(log2, "concat-final")
+            
+            if code2 != 0 or not out_path.exists():
+                logger.error("concat failed at final stage")
+                _flush_logs()
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": "ffmpeg_failed_concat",
+                        "log": log2.read_text()
+                    }
+                )
+        
+        # Step 4: Publish result
         pub = publish_file(out_path, ".mp4")
         logger.info(f"concat completed: {len(job.clips)} clips -> {pub['rel']}")
+        
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
-        resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
+        
+        resp = FileResponse(
+            pub["dst"],
+            media_type="video/mp4",
+            filename=os.path.basename(pub["dst"])
+        )
         resp.headers["X-File-URL"] = pub["url"]
         return resp
 
