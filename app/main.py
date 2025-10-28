@@ -455,17 +455,15 @@ def build_encode_args(
     """Build complete encoding arguments including filters and codec settings."""
 
     codec, codec_args = get_video_encoder()
-    gpu_config = get_gpu_config()
-    decoder_args = decoder_args or []
-    use_hw_frames = _decoder_args_use_hw_frames(decoder_args)
-    use_gpu_filters = prefer_gpu_filters and gpu_config["enabled"] and use_hw_frames
+    decoder_args = decoder_args or []  # noqa: F841 - kept for backward compatibility
+
+    # CPU filters + GPU encoding provides the best compatibility while still
+    # benefiting from the hardware encoder.
+    use_gpu_filters = False
 
     scale_filter = get_scaling_filter(width, height, codec, use_gpu_filters)
 
-    if use_gpu_filters and "scale_cuda" in scale_filter:
-        filter_chain = f"{scale_filter},hwdownload,format=nv12,fps={fps}"
-    else:
-        filter_chain = f"{scale_filter},fps={fps}"
+    filter_chain = f"{scale_filter},fps={fps}"
 
     args = [
         "-vf",
@@ -480,14 +478,6 @@ def build_encode_args(
         "-threads",
         "0",  # auto-detect cores
     ]
-
-    if prefer_gpu_filters and gpu_config["enabled"] and not use_hw_frames:
-        if GPU_STATE.should_warn_filter_fallback():
-            logger.warning(
-                "GPU encoder %s requested but hardware frames are unavailable; "
-                "using CPU-based scaling filters instead. Configure GPU_DECODER for hardware decoding to avoid transfers.",
-                codec,
-            )
 
     return args
 
