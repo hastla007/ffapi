@@ -457,9 +457,19 @@ def build_encode_args(
     codec, codec_args = get_video_encoder()
     decoder_args = decoder_args or []  # noqa: F841 - kept for backward compatibility
 
-    # CPU filters + GPU encoding provides the best compatibility while still
-    # benefiting from the hardware encoder.
-    use_gpu_filters = False
+    # Check environment variable for GPU filters
+    gpu_filters_env = os.getenv("ENABLE_GPU_FILTERS", "false").lower() == "true"
+
+    # Enable GPU filters if:
+    # 1. Environment variable is true
+    # 2. Caller prefers GPU filters
+    # 3. Hardware decoding is active (decoder_args present)
+    use_gpu_filters = (
+        gpu_filters_env
+        and prefer_gpu_filters
+        and bool(decoder_args)
+        and _decoder_args_use_hw_frames(decoder_args)
+    )
 
     scale_filter = get_scaling_filter(width, height, codec, use_gpu_filters)
 
