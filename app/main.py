@@ -402,8 +402,6 @@ def get_video_decoder(input_path: Optional[Path] = None) -> List[str]:
         return [
             "-hwaccel",
             "cuda",
-            "-hwaccel_output_format",
-            "cuda",
             "-hwaccel_device",
             gpu_config["device"],
         ]
