@@ -5979,19 +5979,31 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             """Probe a video clip and return its stream info."""
             try:
                 probe_cmd = [
-                    "ffprobe", "-v", "error", 
-                    "-select_streams", "v:0",
-                    "-show_entries", "stream=codec_name,width,height,avg_frame_rate,pix_fmt",
-                    "-of", "json", 
+                    "ffprobe", "-v", "error",
+                    "-select_streams", "v:0,a:0",
+                    "-show_entries", "stream=codec_name,width,height,avg_frame_rate,pix_fmt,codec_type",
+                    "-of", "json",
                     str(clip_path)
                 ]
                 result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
                 if result.returncode == 0:
                     data = json.loads(result.stdout)
-                    return data.get("streams", [{}])[0] if data.get("streams") else None
+                    streams = data.get("streams", [])
+                    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+                    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+                    return {"video": video, "audio": audio}
             except Exception as exc:
                 logger.warning("Failed to probe %s: %s", clip_path, exc)
             return None
+
+        def parse_fps(fps_str: Optional[str]) -> Optional[float]:
+            if not fps_str or fps_str == "0/0":
+                return None
+            try:
+                num, den = fps_str.split("/")
+                return float(num) / float(den)
+            except Exception:
+                return None
         
         # Probe all clips
         clip_info = [probe_clip(p) for p in downloaded]
@@ -5999,39 +6011,85 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
         # Check if all clips are compatible for stream copy
         all_compatible = True
         baseline = clip_info[0]
-        
+
         if not baseline:
             logger.warning("Could not probe first clip, will re-encode all")
             all_compatible = False
         else:
-            baseline_codec = baseline.get("codec_name")
-            baseline_width = baseline.get("width")
-            baseline_height = baseline.get("height")
-            baseline_pix_fmt = baseline.get("pix_fmt")
-            
-            # Check if requested output matches baseline
-            if (baseline_width != job.width or 
-                baseline_height != job.height):
-                logger.info("Output size differs from source, will re-encode")
+            baseline_video = baseline.get("video")
+            baseline_audio = baseline.get("audio")
+
+            if not baseline_video:
+                logger.warning("No video stream info in first clip, will re-encode all")
                 all_compatible = False
             else:
-                # Check all clips against baseline
-                for i, info in enumerate(clip_info[1:], 1):
-                    if not info:
-                        logger.warning("Could not probe clip %d, will re-encode all", i)
-                        all_compatible = False
-                        break
-                    
-                    if (info.get("codec_name") != baseline_codec or
-                        info.get("width") != baseline_width or
-                        info.get("height") != baseline_height or
-                        info.get("pix_fmt") != baseline_pix_fmt):
-                        logger.info("Clip %d incompatible (codec=%s vs %s, size=%dx%d vs %dx%d), will re-encode all",
-                                  i, info.get("codec_name"), baseline_codec,
-                                  info.get("width"), info.get("height"),
-                                  baseline_width, baseline_height)
-                        all_compatible = False
-                        break
+                baseline_codec = baseline_video.get("codec_name")
+                baseline_width = baseline_video.get("width")
+                baseline_height = baseline_video.get("height")
+                baseline_pix_fmt = baseline_video.get("pix_fmt")
+                baseline_fps = parse_fps(baseline_video.get("avg_frame_rate"))
+                baseline_audio_codec = baseline_audio.get("codec_name") if baseline_audio else None
+
+                # Check if requested output matches baseline
+                if (
+                    baseline_width != job.width
+                    or baseline_height != job.height
+                    or (baseline_fps is not None and abs(baseline_fps - job.fps) > 0.1)
+                ):
+                    logger.info("Output parameters differ from source, will re-encode")
+                    all_compatible = False
+                else:
+                    # Check all clips against baseline
+                    for i, info in enumerate(clip_info[1:], 1):
+                        if not info:
+                            logger.warning("Could not probe clip %d, will re-encode all", i)
+                            all_compatible = False
+                            break
+
+                        video = info.get("video") if info else None
+                        audio = info.get("audio") if info else None
+
+                        if not video:
+                            logger.info("Clip %d missing video stream info, will re-encode all", i)
+                            all_compatible = False
+                            break
+
+                        clip_fps = parse_fps(video.get("avg_frame_rate"))
+
+                        if (
+                            video.get("codec_name") != baseline_codec
+                            or video.get("width") != baseline_width
+                            or video.get("height") != baseline_height
+                            or video.get("pix_fmt") != baseline_pix_fmt
+                            or abs((clip_fps or 0) - (baseline_fps or 0)) > 0.1
+                        ):
+                            logger.info(
+                                "Clip %d video incompatible, will re-encode all (codec=%s vs %s, size=%dx%d vs %dx%d)",
+                                i,
+                                video.get("codec_name"),
+                                baseline_codec,
+                                video.get("width"),
+                                video.get("height"),
+                                baseline_width,
+                                baseline_height,
+                            )
+                            all_compatible = False
+                            break
+
+                        if baseline_audio_codec and audio:
+                            if audio.get("codec_name") != baseline_audio_codec:
+                                logger.info(
+                                    "Clip %d audio codec differs (%s vs %s), will re-encode all",
+                                    i,
+                                    audio.get("codec_name"),
+                                    baseline_audio_codec,
+                                )
+                                all_compatible = False
+                                break
+                        elif bool(baseline_audio) != bool(audio):
+                            logger.info("Clip %d audio stream mismatch, will re-encode all", i)
+                            all_compatible = False
+                            break
         
         out_path = work / "output.mp4"
         
@@ -6063,6 +6121,11 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             if code != 0 or not out_path.exists():
                 logger.error("Fast concat failed, falling back to re-encode")
                 all_compatible = False  # Fall through to slow path
+                if out_path.exists():
+                    try:
+                        out_path.unlink()
+                    except Exception as exc:
+                        logger.warning("Failed to remove incomplete fast path output: %s", exc)
         
         if not all_compatible:
             # 🐌 SLOW PATH: Normalize and re-encode incompatible clips
@@ -6097,13 +6160,24 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
                 
                 if code != 0 or not out.exists():
                     logger.error("Failed to normalize clip %d", i)
+                    for partial in norm:
+                        try:
+                            partial.unlink()
+                        except Exception:
+                            pass
+                    if out.exists():
+                        try:
+                            out.unlink()
+                        except Exception:
+                            pass
                     _flush_logs()
                     return JSONResponse(
                         status_code=500,
                         content={
                             "error": "ffmpeg_failed_on_clip",
                             "clip": str(job.clips[i]),
-                            "log": log.read_text()
+                            "clip_index": i,
+                            "log": log.read_text() if log.exists() else "Log unavailable"
                         }
                     )
                 norm.append(out)
