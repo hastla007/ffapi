@@ -21,6 +21,49 @@
             // Update message
             document.getElementById('status-message').textContent = data.message || '';
             
+            // Update detail if available
+            if (data.detail) {
+              const detailEl = document.getElementById('status-detail');
+              if (detailEl) {
+                detailEl.textContent = data.detail;
+                detailEl.style.display = 'block';
+              }
+            }
+            
+            // Update FFmpeg stats
+            if (data.ffmpeg_stats) {
+              const statsContainer = document.getElementById('ffmpeg-stats-container');
+              if (statsContainer) {
+                statsContainer.style.display = 'block';
+                
+                const stats = data.ffmpeg_stats;
+                if (stats.fps) {
+                  document.getElementById('stat-fps').textContent = stats.fps;
+                  document.getElementById('stat-fps-box').style.display = 'block';
+                }
+                if (stats.speed) {
+                  document.getElementById('stat-speed').textContent = stats.speed + 'x';
+                  document.getElementById('stat-speed-box').style.display = 'block';
+                }
+                if (stats.frame) {
+                  document.getElementById('stat-frame').textContent = stats.frame;
+                  document.getElementById('stat-frame-box').style.display = 'block';
+                }
+                if (stats.bitrate) {
+                  document.getElementById('stat-bitrate').textContent = stats.bitrate;
+                  document.getElementById('stat-bitrate-box').style.display = 'block';
+                }
+                if (stats.size) {
+                  document.getElementById('stat-size').textContent = stats.size;
+                  document.getElementById('stat-size-box').style.display = 'block';
+                }
+                if (stats.time) {
+                  document.getElementById('stat-time').textContent = stats.time + 's';
+                  document.getElementById('stat-time-box').style.display = 'block';
+                }
+              }
+            }
+            
             // Update ETA
             if (data.eta_seconds !== undefined && data.eta_seconds > 0) {
               const minutes = Math.floor(data.eta_seconds / 60);
@@ -119,6 +162,58 @@
       color: white;
       font-weight: 600;
       min-width: 32px;
+    }
+    .status-detail {
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+      color: #6b7280;
+      background: #f9fafb;
+      padding: 8px 12px;
+      border-radius: 4px;
+      margin-top: 8px;
+      display: {{ 'block' if detail else 'none' }};
+    }
+    .ffmpeg-stats {
+      background: #fff;
+      padding: 16px;
+      border-radius: 8px;
+      margin-bottom: 24px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+      display: {{ 'block' if ffmpeg_stats else 'none' }};
+    }
+    .ffmpeg-stats h3 {
+      margin: 0 0 12px 0;
+      font-size: 16px;
+      color: #1f2937;
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+      gap: 12px;
+    }
+    .stat-box {
+      background: #f8fafc;
+      padding: 12px;
+      border-radius: 6px;
+      text-align: center;
+      border: 1px solid #e5e7eb;
+      display: none;
+    }
+    .stat-label {
+      display: block;
+      font-size: 11px;
+      color: #6b7280;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+    .stat-value {
+      display: block;
+      font-size: 20px;
+      font-weight: 700;
+      color: #1f2937;
+      font-family: 'Courier New', monospace;
     }
     .info-grid {
       display: grid;
@@ -220,6 +315,7 @@
       </div>
     </div>
     <p><strong>Current status:</strong> <span id="status-message">{{ message }}</span></p>
+    <div class="status-detail" id="status-detail">{{ detail or '' }}</div>
     {% if eta_seconds is not none and status == 'processing' %}
       <p id="eta-row"><strong>Estimated time remaining:</strong> <span id="eta-display">{{ (eta_seconds // 60)|int }}m {{ (eta_seconds % 60)|int }}s</span></p>
     {% else %}
@@ -230,6 +326,36 @@
     {% elif duration_ms is not none %}
       <p><strong>Duration:</strong> {{ (duration_ms / 1000 // 60)|int }}m {{ (duration_ms / 1000 % 60)|int }}s</p>
     {% endif %}
+  </div>
+
+  <div class="ffmpeg-stats" id="ffmpeg-stats-container">
+    <h3>FFmpeg Live Statistics</h3>
+    <div class="stats-grid">
+      <div class="stat-box" id="stat-fps-box" style="display: {{ 'block' if ffmpeg_stats and ffmpeg_stats.get('fps') else 'none' }}">
+        <span class="stat-label">FPS</span>
+        <span class="stat-value" id="stat-fps">{{ ffmpeg_stats.get('fps') if ffmpeg_stats and ffmpeg_stats.get('fps') else '—' }}</span>
+      </div>
+      <div class="stat-box" id="stat-speed-box" style="display: {{ 'block' if ffmpeg_stats and ffmpeg_stats.get('speed') else 'none' }}">
+        <span class="stat-label">Speed</span>
+        <span class="stat-value" id="stat-speed">{{ (ffmpeg_stats.get('speed') ~ 'x') if ffmpeg_stats and ffmpeg_stats.get('speed') else '—' }}</span>
+      </div>
+      <div class="stat-box" id="stat-frame-box" style="display: {{ 'block' if ffmpeg_stats and ffmpeg_stats.get('frame') else 'none' }}">
+        <span class="stat-label">Frame</span>
+        <span class="stat-value" id="stat-frame">{{ ffmpeg_stats.get('frame') if ffmpeg_stats and ffmpeg_stats.get('frame') else '—' }}</span>
+      </div>
+      <div class="stat-box" id="stat-time-box" style="display: {{ 'block' if ffmpeg_stats and ffmpeg_stats.get('time') else 'none' }}">
+        <span class="stat-label">Time</span>
+        <span class="stat-value" id="stat-time">{{ (ffmpeg_stats.get('time') ~ 's') if ffmpeg_stats and ffmpeg_stats.get('time') else '—' }}</span>
+      </div>
+      <div class="stat-box" id="stat-bitrate-box" style="display: {{ 'block' if ffmpeg_stats and ffmpeg_stats.get('bitrate') else 'none' }}">
+        <span class="stat-label">Bitrate</span>
+        <span class="stat-value" id="stat-bitrate">{{ ffmpeg_stats.get('bitrate') if ffmpeg_stats and ffmpeg_stats.get('bitrate') else '—' }}</span>
+      </div>
+      <div class="stat-box" id="stat-size-box" style="display: {{ 'block' if ffmpeg_stats and ffmpeg_stats.get('size') else 'none' }}">
+        <span class="stat-label">Size</span>
+        <span class="stat-value" id="stat-size">{{ ffmpeg_stats.get('size') if ffmpeg_stats and ffmpeg_stats.get('size') else '—' }}</span>
+      </div>
+    </div>
   </div>
 
   <div class="info-grid">

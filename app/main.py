@@ -2246,7 +2246,13 @@ class JobProgressReporter:
     def __init__(self, job_id: str) -> None:
         self.job_id = job_id
 
-    def update(self, percent: float, message: str, detail: Optional[str] = None) -> None:
+    def update(
+        self,
+        percent: float,
+        message: str,
+        detail: Optional[str] = None,
+        ffmpeg_stats: Optional[dict] = None,
+    ) -> None:
         clamped = max(0, min(100, int(percent)))
         now = time.time()
         with JOBS_LOCK:
@@ -2258,8 +2264,19 @@ class JobProgressReporter:
             updated["message"] = message
             if detail is not None:
                 updated["detail"] = detail
+            if ffmpeg_stats:
+                updated["ffmpeg_stats"] = ffmpeg_stats
+
             history = list(updated.get("history", []))
-            history.append({"timestamp": now, "progress": clamped, "message": message})
+            history_entry = {
+                "timestamp": now,
+                "progress": clamped,
+                "message": message,
+            }
+            if ffmpeg_stats:
+                history_entry["ffmpeg"] = ffmpeg_stats
+
+            history.append(history_entry)
             if len(history) > JOB_HISTORY_LIMIT:
                 history = history[-JOB_HISTORY_LIMIT:]
             updated["history"] = history
@@ -2269,6 +2286,11 @@ class JobProgressReporter:
 
 class FFmpegProgressParser:
     _TIME_PATTERN = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+    _FPS_PATTERN = re.compile(r"fps=\s*(\d+\.?\d*)")
+    _SPEED_PATTERN = re.compile(r"speed=\s*(\d+\.?\d*)x")
+    _BITRATE_PATTERN = re.compile(r"bitrate=\s*(\d+\.?\d*)\s*(\w+)")
+    _FRAME_PATTERN = re.compile(r"frame=\s*(\d+)")
+    _SIZE_PATTERN = re.compile(r"size=\s*(\d+\w+)")
 
     def __init__(
         self,
@@ -2294,11 +2316,57 @@ class FFmpegProgressParser:
             )
         except ValueError:
             return
+
         percent = min(99.0, (elapsed / self._total) * 100.0)
         if percent <= self._last_percent + 0.5:
             return
+
         self._last_percent = percent
-        self._reporter.update(percent, self._stage_message, detail=line.strip())
+
+        metrics = self._parse_metrics(line, elapsed)
+
+        detail_parts = [f"time={elapsed:.1f}s"]
+        if metrics.get("fps"):
+            detail_parts.append(f"fps={metrics['fps']}")
+        if metrics.get("speed"):
+            detail_parts.append(f"speed={metrics['speed']}x")
+        if metrics.get("frame"):
+            detail_parts.append(f"frame={metrics['frame']}")
+
+        detail = " | ".join(detail_parts)
+
+        self._reporter.update(
+            percent,
+            self._stage_message,
+            detail=detail,
+            ffmpeg_stats=metrics,
+        )
+
+    def _parse_metrics(self, line: str, elapsed: float) -> dict:
+        """Extract all available FFmpeg metrics from output line"""
+        metrics = {"time": f"{elapsed:.1f}"}
+
+        fps_match = self._FPS_PATTERN.search(line)
+        if fps_match:
+            metrics["fps"] = fps_match.group(1)
+
+        speed_match = self._SPEED_PATTERN.search(line)
+        if speed_match:
+            metrics["speed"] = speed_match.group(1)
+
+        bitrate_match = self._BITRATE_PATTERN.search(line)
+        if bitrate_match:
+            metrics["bitrate"] = f"{bitrate_match.group(1)}{bitrate_match.group(2)}"
+
+        frame_match = self._FRAME_PATTERN.search(line)
+        if frame_match:
+            metrics["frame"] = frame_match.group(1)
+
+        size_match = self._SIZE_PATTERN.search(line)
+        if size_match:
+            metrics["size"] = size_match.group(1)
+
+        return metrics
 
 
 class MetricsTracker:
@@ -7148,6 +7216,7 @@ async def job_status(request: Request, job_id: str, format: str = "json"):
             "status": data.get("status", "unknown"),
             "progress": data.get("progress", 0),
             "message": data.get("message", ""),
+            "detail": data.get("detail"),
             "created": created_str,
             "started": started_str,
             "elapsed_seconds": elapsed_seconds,
@@ -7156,6 +7225,7 @@ async def job_status(request: Request, job_id: str, format: str = "json"):
             "result": data.get("result"),
             "error": data.get("error"),
             "history": history_items,
+            "ffmpeg_stats": data.get("ffmpeg_stats"),
             "csrf_token": csrf_token,
         }
 
@@ -7179,6 +7249,7 @@ def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
     status = context["status"]
     progress = context["progress"]
     message = context.get("message", "")
+    detail = context.get("detail")
     created = context["created"]
     started = context.get("started", "Not started") or "Not started"
     elapsed = context.get("elapsed_seconds")
@@ -7187,6 +7258,7 @@ def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
     result = context.get("result")
     error = context.get("error")
     history = context.get("history", [])
+    ffmpeg_stats = context.get("ffmpeg_stats") or {}
 
     status_class = {
         "finished": "success",
@@ -7263,6 +7335,19 @@ def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
     if not history_rows:
         history_rows = "<tr><td colspan=\"3\">No history yet</td></tr>"
 
+    stats_html = ""
+    if ffmpeg_stats:
+        stats_items = "".join(
+            f"<li><strong>{html.escape(key.capitalize())}:</strong> {html.escape(str(value))}</li>"
+            for key, value in ffmpeg_stats.items()
+        )
+        stats_html = f"""
+        <div class=\"ffmpeg-stats\">
+            <h3>FFmpeg Live Statistics</h3>
+            <ul>{stats_items}</ul>
+        </div>
+        """
+
     auto_refresh = ""
     if status in {"queued", "processing"}:
         auto_refresh = '<meta http-equiv="refresh" content="2">'
@@ -7298,6 +7383,10 @@ def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
             .progress-section {{ background: #fff; padding: 20px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
             .progress-bar-container {{ background: #e2e8f0; border-radius: 8px; height: 32px; overflow: hidden; margin: 16px 0; }}
             .progress-bar {{ background: linear-gradient(90deg, #28a745, #20c997); height: 100%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; color: white; font-weight: 600; }}
+            .status-detail {{ font-family: "Courier New", monospace; font-size: 12px; color: #6b7280; background: #f9fafb; padding: 8px 12px; border-radius: 4px; margin-top: 8px; }}
+            .ffmpeg-stats {{ background: #fff; padding: 16px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+            .ffmpeg-stats ul {{ list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }}
+            .ffmpeg-stats li {{ background: #f8fafc; padding: 12px; border-radius: 6px; border: 1px solid #e5e7eb; font-size: 13px; }}
 
             .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
             .info-box {{ background: #f8fafc; padding: 12px; border-radius: 6px; }}
@@ -7336,9 +7425,11 @@ def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
                 </div>
             </div>
             <p><strong>Current status:</strong> {html.escape(message)}</p>
+            {f'<pre class="status-detail">{html.escape(detail or "")}</pre>' if detail else ''}
             {eta_display}
             {elapsed_display}
         </div>
+        {stats_html}
 
         <div class="info-grid">
             <div class="info-box">
