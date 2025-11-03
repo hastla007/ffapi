@@ -2893,12 +2893,13 @@ def format_duration(seconds: float) -> str:
     return f"{seconds:.2f}s"
 
 
-def run_ffmpeg_with_timeout(
+async def run_ffmpeg_with_timeout(
     cmd: List[str],
     log_handle,
     *,
     progress_parser: Optional[Callable[[str], None]] = None,
 ) -> int:
+    """Run FFmpeg asynchronously without blocking the event loop."""
     reader_thread: Optional[threading.Thread] = None
     reader_error: Optional[BaseException] = None
 
@@ -2918,6 +2919,7 @@ def run_ffmpeg_with_timeout(
         raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from exc
 
     if proc.stderr is not None:
+
         def _reader() -> None:
             nonlocal reader_error
             try:
@@ -2942,17 +2944,29 @@ def run_ffmpeg_with_timeout(
         reader_thread = threading.Thread(target=_reader, daemon=True)
         reader_thread.start()
 
+    loop = asyncio.get_event_loop()
+
     try:
-        return proc.wait(timeout=FFMPEG_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
+        return_code = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: proc.wait(timeout=FFMPEG_TIMEOUT_SECONDS)),
+            timeout=FFMPEG_TIMEOUT_SECONDS,
+        )
+        return return_code
+    except (asyncio.TimeoutError, subprocess.TimeoutExpired):
         proc.terminate()
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: proc.wait(timeout=5)),
+                timeout=5,
+            )
+        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
             proc.kill()
             try:
-                proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: proc.wait(timeout=1)),
+                    timeout=1,
+                )
+            except (asyncio.TimeoutError, subprocess.TimeoutExpired):
                 pass
         logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
         _flush_logs()
@@ -2964,7 +2978,7 @@ def run_ffmpeg_with_timeout(
             logger.debug("FFmpeg log writer encountered error: %s", reader_error)
 
 
-def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
+async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
     suffix = video_path.suffix.lower()
     if suffix not in VIDEO_THUMBNAIL_EXTENSIONS:
         return None
@@ -2991,7 +3005,7 @@ def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
     ]
     try:
         with temp_log.open("w", encoding="utf-8", errors="ignore") as log_handle:
-            code = run_ffmpeg_with_timeout(cmd, log_handle)
+            code = await run_ffmpeg_with_timeout(cmd, log_handle)
     except HTTPException:
         if thumb_path.exists():
             try:
@@ -3176,7 +3190,7 @@ async def _periodic_rate_limiter_cleanup():
             raise
 
 
-def publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None) -> Dict[str, str]:
+async def publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None) -> Dict[str, str]:
     """Move a finished file into PUBLIC_DIR/YYYYMMDD/ and return URLs/paths.
        Uses shutil.move to be cross-device safe (works across Docker volumes/Windows)."""
     if not ext or not re.fullmatch(r"\.[A-Za-z0-9]+", ext):
@@ -3204,7 +3218,7 @@ def publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None) -> D
 
     thumbnail_rel: Optional[str] = None
     try:
-        thumb_path = generate_video_thumbnail(dst)
+        thumb_path = await generate_video_thumbnail(dst)
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.debug("Thumbnail generation failed for %s: %s", dst, exc)
     else:
@@ -5960,13 +5974,13 @@ async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as
         ]
         log = work / "ffmpeg.log"
         with log.open("w", encoding="utf-8", errors="ignore") as lf:
-            code = run_ffmpeg_with_timeout(cmd, lf)
+            code = await run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "image-to-mp4")
         if code != 0 or not out_path.exists():
             logger.error(f"image-to-mp4-loop failed for {file.filename}")
             _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
-        pub = publish_file(out_path, ".mp4", duration_ms=duration * 1000)
+        pub = await publish_file(out_path, ".mp4", duration_ms=duration * 1000)
         logger.info(f"image-to-mp4-loop completed: {pub['rel']}")
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
@@ -6043,14 +6057,14 @@ async def compose_from_binaries(
 
         log = work / "ffmpeg.log"
         with log.open("w", encoding="utf-8", errors="ignore") as lf:
-            code = run_ffmpeg_with_timeout(cmd, lf)
+            code = await run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "compose-binaries")
         if code != 0 or not out_path.exists():
             logger.error("compose-from-binaries failed")
             _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": cmd, "log": log.read_text()})
 
-        pub = publish_file(out_path, ".mp4", duration_ms=duration_ms)
+        pub = await publish_file(out_path, ".mp4", duration_ms=duration_ms)
         logger.info(f"compose-from-binaries completed: {pub['rel']}")
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
@@ -6219,7 +6233,7 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             
             log = work / "concat_fast.log"
             with log.open("w", encoding="utf-8", errors="ignore") as lf:
-                code = run_ffmpeg_with_timeout(cmd, lf)
+                code = await run_ffmpeg_with_timeout(cmd, lf)
             save_log(log, "concat-fast")
             
             if code != 0 or not out_path.exists():
@@ -6259,7 +6273,7 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
                 
                 log = work / f"norm_{i:03d}.log"
                 with log.open("w", encoding="utf-8", errors="ignore") as lf:
-                    code = run_ffmpeg_with_timeout(cmd, lf)
+                    code = await run_ffmpeg_with_timeout(cmd, lf)
                 save_log(log, f"concat-norm-{i}")
                 
                 if code != 0 or not out.exists():
@@ -6305,7 +6319,7 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             
             log2 = work / "concat.log"
             with log2.open("w", encoding="utf-8", errors="ignore") as lf:
-                code2 = run_ffmpeg_with_timeout(cmd2, lf)
+                code2 = await run_ffmpeg_with_timeout(cmd2, lf)
             save_log(log2, "concat-final")
             
             if code2 != 0 or not out_path.exists():
@@ -6320,7 +6334,7 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
                 )
         
         # Step 4: Publish result
-        pub = publish_file(out_path, ".mp4")
+        pub = await publish_file(out_path, ".mp4")
         logger.info(f"concat completed: {len(job.clips)} clips -> {pub['rel']}")
         
         if as_json:
@@ -6506,7 +6520,7 @@ async def _compose_from_urls_impl(
         elif progress:
             progress.update(70, "Rendering composition (unknown duration)")
         with log_path.open("w", encoding="utf-8", errors="ignore") as logf:
-            code = run_ffmpeg_with_timeout(cmd, logf, progress_parser=parser)
+            code = await run_ffmpeg_with_timeout(cmd, logf, progress_parser=parser)
         save_log(log_path, "compose-urls")
         if code != 0 or not out_path.exists():
             logger.error("compose-from-urls failed")
@@ -6522,7 +6536,7 @@ async def _compose_from_urls_impl(
 
         if progress:
             progress.update(85, "Saving rendered output")
-        pub = publish_file(out_path, ".mp4", duration_ms=job.duration_ms)
+        pub = await publish_file(out_path, ".mp4", duration_ms=job.duration_ms)
         if progress:
             progress.update(95, "Publishing file")
         logger.info("compose-from-urls completed: %s", pub["rel"])
@@ -7037,7 +7051,7 @@ async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
                 str(v_in),
             ]
             with concat_log.open("w", encoding="utf-8", errors="ignore") as lf:
-                concat_code = run_ffmpeg_with_timeout(concat_cmd, lf)
+                concat_code = await run_ffmpeg_with_timeout(concat_cmd, lf)
             save_log(concat_log, "compose-tracks-concat")
             if concat_code != 0 or not v_in.exists():
                 logger.error("compose-from-tracks concat failed")
@@ -7069,7 +7083,7 @@ async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
 
         log = work / "ffmpeg.log"
         with log.open("w", encoding="utf-8", errors="ignore") as lf:
-            code = run_ffmpeg_with_timeout(cmd, lf)
+            code = await run_ffmpeg_with_timeout(cmd, lf)
         save_log(log, "compose-tracks")
         out_path = work / "output.mp4"
         if code != 0 or not out_path.exists():
@@ -7077,7 +7091,7 @@ async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
             _flush_logs()
             return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
 
-        pub = publish_file(out_path, ".mp4")
+        pub = await publish_file(out_path, ".mp4")
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
         resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -7125,7 +7139,7 @@ async def run_rendi(job: RendiJob):
         log = work / "ffmpeg.log"
         run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args
         with log.open("w", encoding="utf-8", errors="ignore") as lf:
-            code = run_ffmpeg_with_timeout(run_args, lf)
+            code = await run_ffmpeg_with_timeout(run_args, lf)
         save_log(log, "rendi-command")
         if code != 0:
             logger.error("run-ffmpeg-command failed")
@@ -7135,7 +7149,7 @@ async def run_rendi(job: RendiJob):
         published = {}
         for key, p in out_paths.items():
             if p.exists():
-                pub = publish_file(p, Path(p).suffix or ".bin")
+                pub = await publish_file(p, Path(p).suffix or ".bin")
                 published[key] = pub["url"]
         if not published:
             return JSONResponse(status_code=500, content={"error": "no_outputs_found", "log": log.read_text()})
@@ -7220,7 +7234,7 @@ async def run_ffmpeg_job(job: FFmpegJobRequest, as_json: bool = False):
         logger.info("Executing FFmpeg command: %s", " ".join(cmd))
 
         with log_path.open("w", encoding="utf-8", errors="ignore") as lf:
-            code = run_ffmpeg_with_timeout(cmd, lf)
+            code = await run_ffmpeg_with_timeout(cmd, lf)
 
         save_log(log_path, "ffmpeg-job")
 
@@ -7255,7 +7269,7 @@ async def run_ffmpeg_job(job: FFmpegJobRequest, as_json: bool = False):
         published_urls: Dict[str, str] = {}
         published_details: Dict[str, Dict[str, str]] = {}
         for output_path in output_paths:
-            pub = publish_file(output_path, output_path.suffix or ".bin")
+            pub = await publish_file(output_path, output_path.suffix or ".bin")
             published_urls[output_path.name] = pub["url"]
             published_details[output_path.name] = pub
             logger.info("Published output: %s -> %s", output_path.name, pub["rel"])
@@ -7412,7 +7426,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 message="Processing with FFmpeg",
             )
             with log_path.open("w", encoding="utf-8", errors="ignore") as lf:
-                code = run_ffmpeg_with_timeout(cmd, lf)
+                code = await run_ffmpeg_with_timeout(cmd, lf)
 
             save_log(log_path, "ffmpeg-job-async")
 
@@ -7459,7 +7473,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
             published_outputs: Dict[str, str] = {}
             for output_path in output_paths:
-                pub = publish_file(output_path, output_path.suffix or ".bin")
+                pub = await publish_file(output_path, output_path.suffix or ".bin")
                 published_outputs[output_path.name] = pub["url"]
                 logger.info("Published output: %s -> %s", output_path.name, pub["rel"])
 
@@ -7624,7 +7638,7 @@ async def change_audio_tempo(request: TempoRequest):
                     },
                 )
 
-            published = publish_file(output_path, Path(output_path).suffix or ".bin")
+            published = await publish_file(output_path, Path(output_path).suffix or ".bin")
             elapsed = time.perf_counter() - start
             duration_text = format_duration(elapsed)
             record["status"] = "done"
