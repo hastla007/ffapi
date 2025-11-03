@@ -2900,82 +2900,176 @@ async def run_ffmpeg_with_timeout(
     progress_parser: Optional[Callable[[str], None]] = None,
 ) -> int:
     """Run FFmpeg asynchronously without blocking the event loop."""
-    reader_thread: Optional[threading.Thread] = None
-    reader_error: Optional[BaseException] = None
+
+    async def _pump_stream(stream: Optional[asyncio.StreamReader], *, parse_progress: bool) -> None:
+        if stream is None:
+            return
+        try:
+            async for raw_line in stream:
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8", errors="ignore")
+                try:
+                    if hasattr(log_handle, "write"):
+                        log_handle.write(line)
+                        if hasattr(log_handle, "flush"):
+                            log_handle.flush()
+                except Exception:
+                    pass
+                if parse_progress and progress_parser is not None:
+                    try:
+                        progress_parser(line)
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    async def _run_with_asyncio_process() -> int:
+        stdout_task = asyncio.create_task(_pump_stream(proc.stdout, parse_progress=False))
+        stderr_task = asyncio.create_task(_pump_stream(proc.stderr, parse_progress=True))
+        pump_tasks = [t for t in (stdout_task, stderr_task) if t is not None]
+
+        try:
+            return_code = await asyncio.wait_for(proc.wait(), timeout=FFMPEG_TIMEOUT_SECONDS)
+            if pump_tasks:
+                try:
+                    await asyncio.wait_for(asyncio.gather(*pump_tasks), timeout=5)
+                except asyncio.TimeoutError:
+                    for task in pump_tasks:
+                        task.cancel()
+                    for task in pump_tasks:
+                        try:
+                            await task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+            return return_code
+        except asyncio.TimeoutError:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=1)
+                except asyncio.TimeoutError:
+                    pass
+            for task in pump_tasks:
+                task.cancel()
+            for task in pump_tasks:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
+            _flush_logs()
+            raise HTTPException(status_code=504, detail="Processing timeout")
+        except Exception:
+            for task in pump_tasks:
+                task.cancel()
+            for task in pump_tasks:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            raise
+
+    async def _run_with_subprocess_fallback(launch_error: Optional[Exception] = None) -> int:
+        try:
+            proc_sync = await asyncio.to_thread(
+                subprocess.Popen,
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle if hasattr(log_handle, "write") else subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                bufsize=1,
+            )
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.error("Failed to launch ffmpeg command %s: %s", cmd, exc)
+            _flush_logs()
+            if launch_error is not None:
+                raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from launch_error
+            raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from exc
+
+        reader_thread: Optional[threading.Thread] = None
+        if proc_sync.stderr is not None:
+
+            def _reader() -> None:
+                try:
+                    for line in proc_sync.stderr:
+                        try:
+                            if hasattr(log_handle, "write"):
+                                log_handle.write(line)
+                                if hasattr(log_handle, "flush"):
+                                    log_handle.flush()
+                        except Exception:
+                            pass
+                        if progress_parser is not None:
+                            try:
+                                progress_parser(line)
+                            except Exception:
+                                pass
+                finally:
+                    try:
+                        proc_sync.stderr.close()
+                    except Exception:
+                        pass
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
+        loop = asyncio.get_running_loop()
+
+        try:
+            return_code = await loop.run_in_executor(
+                None,
+                lambda: proc_sync.wait(timeout=FFMPEG_TIMEOUT_SECONDS),
+            )
+            return return_code
+        except subprocess.TimeoutExpired:
+            proc_sync.terminate()
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: proc_sync.wait(timeout=5)),
+                    timeout=5,
+                )
+            except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+                proc_sync.kill()
+                try:
+                    await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda: proc_sync.wait(timeout=1)),
+                        timeout=1,
+                    )
+                except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+                    pass
+            logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
+            _flush_logs()
+            raise HTTPException(status_code=504, detail="Processing timeout")
+        finally:
+            if reader_thread is not None:
+                reader_thread.join(timeout=1)
+
+        return 0
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_handle,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            bufsize=1,
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+    except AttributeError as attr_error:
+        return await _run_with_subprocess_fallback(attr_error)
     except Exception as exc:
         logger.error("Failed to launch ffmpeg command %s: %s", cmd, exc)
         _flush_logs()
         raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from exc
 
-    if proc.stderr is not None:
-
-        def _reader() -> None:
-            nonlocal reader_error
-            try:
-                for line in proc.stderr:  # pragma: no branch - sequential iteration
-                    try:
-                        log_handle.write(line)
-                        if hasattr(log_handle, "flush"):
-                            log_handle.flush()
-                    except Exception as log_exc:  # pragma: no cover - defensive logging
-                        reader_error = log_exc
-                    if progress_parser is not None:
-                        try:
-                            progress_parser(line)
-                        except Exception:
-                            logger.debug("Progress parser failed for line: %s", line.strip())
-            finally:
-                try:
-                    proc.stderr.close()
-                except Exception:
-                    pass
-
-        reader_thread = threading.Thread(target=_reader, daemon=True)
-        reader_thread.start()
-
-    loop = asyncio.get_event_loop()
-
-    try:
-        return_code = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: proc.wait(timeout=FFMPEG_TIMEOUT_SECONDS)),
-            timeout=FFMPEG_TIMEOUT_SECONDS,
-        )
-        return return_code
-    except (asyncio.TimeoutError, subprocess.TimeoutExpired):
-        proc.terminate()
-        try:
-            await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: proc.wait(timeout=5)),
-                timeout=5,
-            )
-        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
-            proc.kill()
-            try:
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: proc.wait(timeout=1)),
-                    timeout=1,
-                )
-            except (asyncio.TimeoutError, subprocess.TimeoutExpired):
-                pass
-        logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
-        _flush_logs()
-        raise HTTPException(status_code=504, detail="Processing timeout")
-    finally:
-        if reader_thread is not None:
-            reader_thread.join(timeout=1)
-        if reader_error is not None:
-            logger.debug("FFmpeg log writer encountered error: %s", reader_error)
+    return await _run_with_asyncio_process()
 
 
 async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
