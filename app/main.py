@@ -4250,6 +4250,28 @@ def documentation(request: Request):
   <div class="example">Example (scale video to 720p):<br>curl -X POST http://localhost:3000/v1/run-ffmpeg-command \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "input_files": {<br>      "video": "https://example.com/input.mp4"<br>    },<br>    "output_files": {<br>      "out": "result.mp4"<br>    },<br>    "ffmpeg_command": "-i {{video}} -vf scale=1280:720 -c:a copy {{out}}"<br>  }'</div>
 </div>
 
+<h4>Advanced FFmpeg Jobs</h4>
+<div class="endpoint">
+  <div class="method post">POST</div>
+  <div class="path">/v2/run-ffmpeg-job</div>
+  <div class="desc">Execute FFmpeg with structured inputs and filter_complex</div>
+  <div class="params">
+    <span class="param">task.inputs</span> - Array of input file URLs<br>
+    <span class="param">task.filter_complex</span> - FFmpeg filter_complex string<br>
+    <span class="param">task.outputs</span> - Array of output specifications with options<br>
+    <span class="param">as_json</span> - Return JSON instead of file (default: false)
+  </div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> File response or JSON with output URLs</li>
+      <li><code>422</code> Validation error for malformed parameters</li>
+      <li><code>500</code> FFmpeg execution failed</li>
+    </ul>
+  </div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/v2/run-ffmpeg-job \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "task": {<br>      "inputs": [<br>        {"file_path": "https://example.com/image.jpg"},<br>        {"file_path": "https://example.com/song1.mp3"}<br>      ],<br>      "filter_complex": "[1:a]anull[aout];[0:v]loop=999:size=1:start=0,scale=1280:720[vout]",<br>      "outputs": [<br>        {<br>          "file": "output.mp4",<br>          "options": ["-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-c:a", "aac"]<br>        }<br>      ]<br>    },<br>    "as_json": true<br>  }'</div>
+</div>
+
 <h4>FFprobe (Media Inspection)</h4>
 <div class="endpoint">
   <div class="method post">POST</div>
@@ -5413,6 +5435,67 @@ class ConcatJob(BaseModel):
         if not (1 <= value <= 240):
             raise ValueError(f"FPS must be 1-240, got {value}")
         return value
+
+
+class FFmpegInput(BaseModel):
+    file_path: HttpUrl
+
+    @field_validator("file_path", mode="before")
+    @classmethod
+    def validate_file_path(cls, value):
+        if value is None:
+            raise ValueError("file_path is required")
+        value_str = str(value)
+        if not value_str.startswith(("http://", "https://")):
+            raise ValueError("Only http:// and https:// URLs are supported")
+        return value
+
+
+class FFmpegOutput(BaseModel):
+    file: str
+    options: List[str] = []
+    maps: List[str] = []
+
+    @field_validator("file")
+    @classmethod
+    def validate_file_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("output file name cannot be empty")
+        if any(sep in cleaned for sep in ("/", "\\")):
+            raise ValueError("file name must not include directories")
+        if not re.search(r"\.[A-Za-z0-9]+$", cleaned):
+            raise ValueError("file name must include a file extension")
+        return cleaned
+
+
+class FFmpegTask(BaseModel):
+    inputs: List[FFmpegInput]
+    filter_complex: str
+    outputs: List[FFmpegOutput]
+
+    @field_validator("inputs")
+    @classmethod
+    def validate_inputs(cls, value):
+        if not value or len(value) == 0:
+            raise ValueError("At least one input is required")
+        if len(value) > 50:
+            raise ValueError("Too many inputs (max 50)")
+        return value
+
+    @field_validator("outputs")
+    @classmethod
+    def validate_outputs(cls, value):
+        if not value or len(value) == 0:
+            raise ValueError("At least one output is required")
+        if len(value) > 10:
+            raise ValueError("Too many outputs (max 10)")
+        return value
+
+
+class FFmpegJobRequest(BaseModel):
+    task: FFmpegTask
+    headers: Optional[Dict[str, str]] = None
 
 
 class ComposeFromUrlsJob(BaseModel):
@@ -7036,6 +7119,151 @@ async def run_rendi(job: RendiJob):
         if not published:
             return JSONResponse(status_code=500, content={"error": "no_outputs_found", "log": log.read_text()})
         return {"ok": True, "outputs": published}
+
+
+@app.post("/v2/run-ffmpeg-job")
+async def run_ffmpeg_job(job: FFmpegJobRequest, as_json: bool = False):
+    """
+    Execute FFmpeg with structured inputs, filter_complex, and outputs.
+
+    Example:
+    {
+      "task": {
+        "inputs": [
+          {"file_path": "https://example.com/image.jpg"},
+          {"file_path": "https://example.com/song1.mp3"},
+          {"file_path": "https://example.com/song2.mp3"}
+        ],
+        "filter_complex": "[1:a][2:a]concat=n=2:v=0:a=1[aout];[0:v]loop=999:size=1:start=0,scale=1280:720[vout]",
+        "outputs": [
+          {
+            "file": "final-video.mp4",
+            "options": ["-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-crf", "23", "-c:a", "aac"]
+          }
+        ]
+      }
+    }
+    """
+    logger.info(
+        "Starting ffmpeg job with %d inputs and %d outputs",
+        len(job.task.inputs),
+        len(job.task.outputs),
+    )
+    check_disk_space(WORK_DIR)
+
+    with TemporaryDirectory(prefix="ffmpeg_job_", dir=str(WORK_DIR)) as workdir:
+        work = Path(workdir)
+
+        # Download all input files
+        input_paths: List[Path] = []
+        for i, input_spec in enumerate(job.task.inputs):
+            input_url = _normalize_media_url(str(input_spec.file_path))
+            ext = Path(urlparse(input_url).path).suffix or ".bin"
+            input_path = work / f"input_{i:03d}{ext}"
+
+            logger.info(
+                "Downloading input %d/%d: %s",
+                i + 1,
+                len(job.task.inputs),
+                input_url,
+            )
+            await _download_to(input_url, input_path, job.headers)
+            input_paths.append(input_path)
+
+        # Build FFmpeg command
+        cmd = ["ffmpeg", "-y"]
+
+        # Add all inputs
+        for input_path in input_paths:
+            cmd += ["-i", str(input_path)]
+
+        # Add filter_complex
+        cmd += ["-filter_complex", job.task.filter_complex]
+
+        # Process outputs
+        output_paths: List[Path] = []
+        for output_spec in job.task.outputs:
+            output_path = work / output_spec.file
+            output_paths.append(output_path)
+
+            # Add output options (which should include -map directives)
+            for map_arg in output_spec.maps:
+                cmd += ["-map", map_arg]
+            cmd += output_spec.options
+
+            # Add output file path
+            cmd += [str(output_path)]
+
+        # Execute FFmpeg
+        log_path = work / "ffmpeg.log"
+        logger.info("Executing FFmpeg command: %s", " ".join(cmd))
+
+        with log_path.open("w", encoding="utf-8", errors="ignore") as lf:
+            code = run_ffmpeg_with_timeout(cmd, lf)
+
+        save_log(log_path, "ffmpeg-job")
+
+        if code != 0:
+            logger.error("FFmpeg job failed with exit code %d", code)
+            _flush_logs()
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "ffmpeg_failed",
+                    "exit_code": code,
+                    "cmd": cmd,
+                    "log": log_path.read_text(encoding="utf-8", errors="ignore"),
+                },
+            )
+
+        # Check that all outputs were created
+        missing_outputs = [p for p in output_paths if not p.exists()]
+        if missing_outputs:
+            logger.error("FFmpeg succeeded but outputs are missing: %s", missing_outputs)
+            _flush_logs()
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "missing_outputs",
+                    "missing": [str(p.name) for p in missing_outputs],
+                    "log": log_path.read_text(encoding="utf-8", errors="ignore"),
+                },
+            )
+
+        # Publish all outputs
+        published_urls: Dict[str, str] = {}
+        published_details: Dict[str, Dict[str, str]] = {}
+        for output_path in output_paths:
+            pub = publish_file(output_path, output_path.suffix or ".bin")
+            published_urls[output_path.name] = pub["url"]
+            published_details[output_path.name] = pub
+            logger.info("Published output: %s -> %s", output_path.name, pub["rel"])
+
+        if as_json:
+            return {
+                "ok": True,
+                "outputs": published_urls,
+            }
+
+        # Return the first output as a file response
+        first_output_name = output_paths[0].name
+        first_pub = published_details[first_output_name]
+        first_path = Path(first_pub["dst"])
+
+        resp = FileResponse(
+            first_pub["dst"],
+            media_type="video/mp4" if first_path.suffix == ".mp4" else "application/octet-stream",
+            filename=first_output_name,
+        )
+        resp.headers["X-File-URL"] = first_pub["url"]
+
+        # Include other outputs in headers
+        if len(published_urls) > 1:
+            resp.headers["X-Additional-Outputs"] = json.dumps(
+                {k: v for k, v in published_urls.items() if k != first_output_name}
+            )
+
+        return resp
 
 
 # ---------- audio endpoints ----------
