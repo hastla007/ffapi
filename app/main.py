@@ -5474,6 +5474,7 @@ class ConcatJob(BaseModel):
 
 class FFmpegInput(BaseModel):
     file_path: HttpUrl
+    options: List[str] = []
 
     @field_validator("file_path", mode="before")
     @classmethod
@@ -7208,8 +7209,11 @@ async def run_ffmpeg_job(job: FFmpegJobRequest, as_json: bool = False):
         # Build FFmpeg command
         cmd = ["ffmpeg", "-y"]
 
-        # Add all inputs
-        for input_path in input_paths:
+        # Add all inputs with per-input options
+        for index, input_spec in enumerate(job.task.inputs):
+            input_path = input_paths[index]
+            if input_spec.options:
+                cmd += input_spec.options
             cmd += ["-i", str(input_path)]
 
         # Add filter_complex
@@ -7406,7 +7410,10 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
             )
 
             cmd = ["ffmpeg", "-y"]
-            for input_path in input_paths:
+            for index, input_spec in enumerate(job.task.inputs):
+                input_path = input_paths[index]
+                if input_spec.options:
+                    cmd += input_spec.options
                 cmd += ["-i", str(input_path)]
             cmd += ["-filter_complex", job.task.filter_complex]
 
