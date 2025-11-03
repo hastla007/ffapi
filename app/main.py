@@ -4272,6 +4272,27 @@ def documentation(request: Request):
   <div class="example">Example:<br>curl -X POST http://localhost:3000/v2/run-ffmpeg-job \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "task": {<br>      "inputs": [<br>        {"file_path": "https://example.com/image.jpg"},<br>        {"file_path": "https://example.com/song1.mp3"}<br>      ],<br>      "filter_complex": "[1:a]anull[aout];[0:v]loop=999:size=1:start=0,scale=1280:720[vout]",<br>      "outputs": [<br>        {<br>          "file": "output.mp4",<br>          "options": ["-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-c:a", "aac"]<br>        }<br>      ]<br>    },<br>    "as_json": true<br>  }'</div>
 </div>
 
+<div class="endpoint">
+  <div class="method post">POST</div>
+  <div class="path">/v2/run-ffmpeg-job/async</div>
+  <div class="desc">Queue an FFmpeg job and poll /jobs/{job_id} for status</div>
+  <div class="params">
+    <span class="param">task.inputs</span> - Array of input file URLs<br>
+    <span class="param">task.filter_complex</span> - FFmpeg filter_complex string<br>
+    <span class="param">task.outputs</span> - Array of output specifications with options<br>
+    <span class="param">headers</span> - Optional headers forwarded to source downloads
+  </div>
+  <div class="responses">
+    <div class="response-title">Possible Responses</div>
+    <ul>
+      <li><code>200</code> JSON payload with <code>job_id</code> and <code>status_url</code></li>
+      <li><code>422</code> Validation error for malformed parameters</li>
+      <li><code>500</code> Job queueing failed</li>
+    </ul>
+  </div>
+  <div class="example">Example:<br>curl -X POST http://localhost:3000/v2/run-ffmpeg-job/async \<br>  -H "Content-Type: application/json" \<br>  -d '{<br>    "task": {<br>      "inputs": [<br>        {"file_path": "https://example.com/image.jpg"},<br>        {"file_path": "https://example.com/song1.mp3"}<br>      ],<br>      "filter_complex": "[1:a]anull[aout];[0:v]loop=999:size=1:start=0,scale=1280:720[vout]",<br>      "outputs": [<br>        {<br>          "file": "output.mp4",<br>          "options": ["-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-c:a", "aac"]<br>        }<br>      ]<br>    }<br>  }'</div>
+</div>
+
 <h4>FFprobe (Media Inspection)</h4>
 <div class="endpoint">
   <div class="method post">POST</div>
@@ -7265,6 +7286,214 @@ async def run_ffmpeg_job(job: FFmpegJobRequest, as_json: bool = False):
 
         return resp
 
+
+def _update_ffmpeg_async_job(
+    job_id: str,
+    *,
+    progress: Optional[int] = None,
+    message: Optional[str] = None,
+    status: Optional[str] = None,
+    **extra: Any,
+) -> None:
+    with JOBS_LOCK:
+        existing = JOBS.get(job_id, {})
+        created = existing.get("created", time.time())
+        history = list(existing.get("history", []))
+        if progress is not None or message is not None:
+            history.append(
+                {
+                    "timestamp": time.time(),
+                    "progress": progress if progress is not None else existing.get("progress", 0),
+                    "message": message if message is not None else existing.get("message", ""),
+                }
+            )
+            if len(history) > JOB_HISTORY_LIMIT:
+                history = history[-JOB_HISTORY_LIMIT:]
+
+        updated: Dict[str, Any] = {
+            **existing,
+            "created": created,
+            "updated": time.time(),
+            "history": history,
+        }
+        if progress is not None:
+            updated["progress"] = progress
+        if message is not None:
+            updated["message"] = message
+        if status is not None:
+            updated["status"] = status
+        updated.update(extra)
+        JOBS[job_id] = updated
+
+
+@app.post("/v2/run-ffmpeg-job/async")
+async def run_ffmpeg_job_async(job: FFmpegJobRequest):
+    """Queue FFmpeg job for background processing."""
+    cleanup_old_jobs()
+    job_id = str(uuid4())
+
+    with JOBS_LOCK:
+        now = time.time()
+        JOBS[job_id] = {
+            "status": "queued",
+            "progress": 0,
+            "message": "Queued",
+            "history": [{"timestamp": now, "progress": 0, "message": "Queued"}],
+            "created": now,
+            "updated": now,
+        }
+
+    job_copy = job.model_copy(deep=True)
+    asyncio.create_task(_process_ffmpeg_job_async(job_id, job_copy))
+
+    return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}
+
+
+async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
+    """Background worker for async FFmpeg jobs."""
+    now = time.time()
+    _update_ffmpeg_async_job(
+        job_id,
+        progress=10,
+        message="Job started",
+        status="processing",
+        started=now,
+    )
+
+    start = time.perf_counter()
+    struct_logger.info("job_started", job_id=job_id, job_type="ffmpeg_job")
+
+    try:
+        check_disk_space(WORK_DIR)
+
+        with TemporaryDirectory(prefix="ffmpeg_job_", dir=str(WORK_DIR)) as workdir:
+            work = Path(workdir)
+
+            input_paths: List[Path] = []
+            total_inputs = max(len(job.task.inputs), 1)
+            for index, input_spec in enumerate(job.task.inputs):
+                progress = 10 + int((index / total_inputs) * 40)
+                _update_ffmpeg_async_job(
+                    job_id,
+                    progress=progress,
+                    message=f"Downloading input {index + 1}/{len(job.task.inputs)}",
+                )
+
+                input_url = _normalize_media_url(str(input_spec.file_path))
+                ext = Path(urlparse(input_url).path).suffix or ".bin"
+                input_path = work / f"input_{index:03d}{ext}"
+                await _download_to(input_url, input_path, job.headers)
+                input_paths.append(input_path)
+
+            _update_ffmpeg_async_job(
+                job_id,
+                progress=55,
+                message="Inputs downloaded",
+            )
+
+            cmd = ["ffmpeg", "-y"]
+            for input_path in input_paths:
+                cmd += ["-i", str(input_path)]
+            cmd += ["-filter_complex", job.task.filter_complex]
+
+            output_paths: List[Path] = []
+            for output_spec in job.task.outputs:
+                output_path = work / output_spec.file
+                output_paths.append(output_path)
+                for map_arg in output_spec.maps:
+                    cmd += ["-map", map_arg]
+                cmd += output_spec.options
+                cmd += [str(output_path)]
+
+            log_path = work / "ffmpeg.log"
+            _update_ffmpeg_async_job(
+                job_id,
+                progress=60,
+                message="Processing with FFmpeg",
+            )
+            with log_path.open("w", encoding="utf-8", errors="ignore") as lf:
+                code = run_ffmpeg_with_timeout(cmd, lf)
+
+            save_log(log_path, "ffmpeg-job-async")
+
+            if code != 0:
+                error_text = log_path.read_text(encoding="utf-8", errors="ignore")
+                _update_ffmpeg_async_job(
+                    job_id,
+                    progress=100,
+                    message="FFmpeg failed",
+                    status="failed",
+                    error=error_text,
+                )
+                struct_logger.error(
+                    "job_failed",
+                    job_id=job_id,
+                    job_type="ffmpeg_job",
+                    exit_code=code,
+                )
+                return
+
+            missing_outputs = [p for p in output_paths if not p.exists()]
+            if missing_outputs:
+                _update_ffmpeg_async_job(
+                    job_id,
+                    progress=100,
+                    message="Missing outputs",
+                    status="failed",
+                    error={"missing": [p.name for p in missing_outputs]},
+                )
+                struct_logger.error(
+                    "job_failed",
+                    job_id=job_id,
+                    job_type="ffmpeg_job",
+                    error="missing_outputs",
+                    missing=[p.name for p in missing_outputs],
+                )
+                return
+
+            _update_ffmpeg_async_job(
+                job_id,
+                progress=90,
+                message="Publishing outputs",
+            )
+
+            published_outputs: Dict[str, str] = {}
+            for output_path in output_paths:
+                pub = publish_file(output_path, output_path.suffix or ".bin")
+                published_outputs[output_path.name] = pub["url"]
+                logger.info("Published output: %s -> %s", output_path.name, pub["rel"])
+
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            _update_ffmpeg_async_job(
+                job_id,
+                progress=100,
+                message="Completed",
+                status="finished",
+                result={"outputs": published_outputs},
+                duration_ms=duration_ms,
+            )
+            struct_logger.info(
+                "job_completed",
+                job_id=job_id,
+                job_type="ffmpeg_job",
+                duration_ms=duration_ms,
+            )
+
+    except Exception as exc:
+        logger.exception("Async FFmpeg job %s failed", job_id)
+        _update_ffmpeg_async_job(
+            job_id,
+            progress=100,
+            message="Failed",
+            status="failed",
+            error=str(exc),
+        )
+        struct_logger.error(
+            "job_failed",
+            job_id=job_id,
+            job_type="ffmpeg_job",
+            error=str(exc),
+        )
 
 # ---------- audio endpoints ----------
 
