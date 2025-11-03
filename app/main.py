@@ -3071,6 +3071,7 @@ async def run_ffmpeg_with_timeout(
 
     return await _run_with_asyncio_process()
 
+    return await _run_with_asyncio_process()
 
 async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
     suffix = video_path.suffix.lower()
