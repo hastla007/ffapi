@@ -3068,8 +3068,8 @@ async def run_ffmpeg_with_timeout(
         logger.error("Failed to launch ffmpeg command %s: %s", cmd, exc)
         _flush_logs()
         raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from exc
-
-    return await _run_with_asyncio_process()
+    else:
+        return await _run_with_asyncio_process()
 
     return await _run_with_asyncio_process()
 
