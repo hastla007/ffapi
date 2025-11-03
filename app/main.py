@@ -471,6 +471,12 @@ def build_encode_args(
         and _decoder_args_use_hw_frames(decoder_args)
     )
 
+    if gpu_filters_env and not use_gpu_filters:
+        if not decoder_args:
+            logger.debug("GPU filters disabled: no hardware decoder active")
+        elif not _decoder_args_use_hw_frames(decoder_args):
+            logger.debug("GPU filters disabled: decoder doesn't use hardware frames")
+
     scale_filter = get_scaling_filter(width, height, codec, use_gpu_filters)
 
     filter_chain = f"{scale_filter},fps={fps}"
@@ -2919,8 +2925,12 @@ async def run_ffmpeg_with_timeout(
                 if parse_progress and progress_parser is not None:
                     try:
                         progress_parser(line)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug(
+                            "Progress parser failed on line: %s - %s",
+                            line[:100],
+                            exc,
+                        )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -3011,8 +3021,12 @@ async def run_ffmpeg_with_timeout(
                         if progress_parser is not None:
                             try:
                                 progress_parser(line)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                logger.debug(
+                                    "Progress parser failed on line: %s - %s",
+                                    line[:100],
+                                    exc,
+                                )
                 finally:
                     try:
                         proc_sync.stderr.close()
@@ -6311,7 +6325,8 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
         if all_compatible:
             # ⚡ FAST PATH: Stream copy (no re-encoding!)
             logger.info("✓ All clips compatible - using FAST stream copy mode")
-            
+            logger.info("GPU acceleration not needed (no encoding performed)")
+
             listfile = work / "list.txt"
             with listfile.open("w", encoding="utf-8") as f:
                 for p in downloaded:

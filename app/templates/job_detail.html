@@ -6,7 +6,12 @@
       // Poll for updates every 2 seconds for active jobs
       let pollInterval = setInterval(function() {
         fetch('/jobs/{{ job_id }}?format=json')
-          .then(response => response.json())
+          .then(response => {
+            if (!response.ok) {
+              throw new Error('HTTP ' + response.status);
+            }
+            return response.json();
+          })
           .then(data => {
             // Update progress
             document.getElementById('progress-value').textContent = data.progress + '%';
@@ -49,7 +54,9 @@
               setTimeout(() => window.location.reload(), 500);
             }
           })
-          .catch(err => console.error('Poll error:', err));
+          .catch(err => {
+            console.warn('Poll failed (will retry):', err.message);
+          });
       }, 2000);
     </script>
   {% endif %}
