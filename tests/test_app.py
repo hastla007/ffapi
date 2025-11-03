@@ -269,7 +269,7 @@ def test_publish_file_rejects_invalid_extension(app_module, tmp_path):
     src.write_bytes(b"data")
 
     with pytest.raises(ValueError):
-        app_module.publish_file(src, "bad")
+        asyncio.run(app_module.publish_file(src, "bad"))
 
 
 @pytest.fixture(scope="session")
@@ -311,7 +311,7 @@ def patched_app(app_module, monkeypatch, tmp_path):
     publish_root.mkdir(parents=True, exist_ok=True)
     counter = count()
 
-    def fake_publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None):
+    async def fake_publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None):
         dst = publish_root / f"file_{next(counter)}{ext}"
         src_path = Path(src)
         if src_path.exists():
@@ -2320,7 +2320,7 @@ def test_compose_from_tracks_concats_multiple_videos(patched_app, monkeypatch):
 
     commands: List[List[str]] = []
 
-    def fake_run_ffmpeg_with_timeout(
+    async def fake_run_ffmpeg_with_timeout(
         cmd: List[str],
         log_handle,
         *,
@@ -2528,7 +2528,7 @@ def test_run_ffmpeg_with_timeout_handles_spawn_failure(app_module, monkeypatch):
     monkeypatch.setattr(app_module.subprocess, "Popen", boom_popen)
 
     with pytest.raises(app_module.HTTPException) as exc:
-        app_module.run_ffmpeg_with_timeout(["ffmpeg", "-i", "in.mp4", "out.mp4"], io.StringIO())
+        asyncio.run(app_module.run_ffmpeg_with_timeout(["ffmpeg", "-i", "in.mp4", "out.mp4"], io.StringIO()))
 
     assert exc.value.status_code == 500
 
@@ -2563,7 +2563,7 @@ def test_run_ffmpeg_with_timeout_handles_timeout(app_module, monkeypatch):
     monkeypatch.setattr(app_module.subprocess, "Popen", slow_popen)
 
     with pytest.raises(app_module.HTTPException) as exc:
-        app_module.run_ffmpeg_with_timeout(["ffmpeg", "-i", "in.mp4", "out.mp4"], io.StringIO())
+        asyncio.run(app_module.run_ffmpeg_with_timeout(["ffmpeg", "-i", "in.mp4", "out.mp4"], io.StringIO()))
 
     assert exc.value.status_code == 504
     assert terminated is True
