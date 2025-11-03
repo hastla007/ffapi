@@ -101,7 +101,7 @@
             <td><span class="status {{ job.status_class }}">{{ job.status }}</span></td>
             <td>{{ job.created }}</td>
             <td>{{ job.duration }}</td>
-            <td><a href="/jobs/{{ job.job_id }}" target="_blank">View</a></td>
+            <td><a href="/jobs/{{ job.job_id }}?format=html" target="_blank">View</a></td>
           </tr>
         {% endfor %}
       {% else %}
