@@ -3071,6 +3071,7 @@ async def run_ffmpeg_with_timeout(
 
     return await _run_with_asyncio_process()
 
+    return await _run_with_asyncio_process()
 
 async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
     suffix = video_path.suffix.lower()
@@ -4364,7 +4365,7 @@ def documentation(request: Request):
   <div class="path">/v2/run-ffmpeg-job</div>
   <div class="desc">Execute FFmpeg with structured inputs and filter_complex</div>
   <div class="params">
-    <span class="param">task.inputs</span> - Array of input file URLs<br>
+    <span class="param">task.inputs</span> - Array of input file URLs with optional per-input options<br>
     <span class="param">task.filter_complex</span> - FFmpeg filter_complex string<br>
     <span class="param">task.outputs</span> - Array of output specifications with options<br>
     <span class="param">as_json</span> - Return JSON instead of file (default: false)
@@ -4385,7 +4386,7 @@ def documentation(request: Request):
   <div class="path">/v2/run-ffmpeg-job/async</div>
   <div class="desc">Queue an FFmpeg job and poll /jobs/{job_id} for status</div>
   <div class="params">
-    <span class="param">task.inputs</span> - Array of input file URLs<br>
+    <span class="param">task.inputs</span> - Array of input file URLs with optional per-input options<br>
     <span class="param">task.filter_complex</span> - FFmpeg filter_complex string<br>
     <span class="param">task.outputs</span> - Array of output specifications with options<br>
     <span class="param">headers</span> - Optional headers forwarded to source downloads
@@ -5568,7 +5569,7 @@ class ConcatJob(BaseModel):
 
 class FFmpegInput(BaseModel):
     file_path: HttpUrl
-    options: List[str] = []
+    options: List[str] = Field(default_factory=list)
 
     @field_validator("file_path", mode="before")
     @classmethod
@@ -5583,8 +5584,8 @@ class FFmpegInput(BaseModel):
 
 class FFmpegOutput(BaseModel):
     file: str
-    options: List[str] = []
-    maps: List[str] = []
+    options: List[str] = Field(default_factory=list)
+    maps: List[str] = Field(default_factory=list)
 
     @field_validator("file")
     @classmethod
@@ -6994,7 +6995,7 @@ def jobs_history(
                 <td><span class="status {status_class}">{status}</span></td>
                 <td>{created}</td>
                 <td>{duration}</td>
-                <td><a href="/jobs/{job_id}" target="_blank">View</a></td>
+                <td><a href="/jobs/{job_id}?format=html" target="_blank">View</a></td>
             </tr>
             """.format(
                 job_id=html.escape(job["job_id"]),
@@ -7070,15 +7071,286 @@ def jobs_history(
 
 
 @app.get("/jobs/{job_id}")
-async def job_status(job_id: str):
+async def job_status(request: Request, job_id: str, format: str = "json"):
+    """Get job status - supports both JSON API and HTML view"""
     cleanup_old_jobs()
     with JOBS_LOCK:
         data = JOBS.get(job_id)
     if data is None:
+        if format == "html":
+            redirect = ensure_dashboard_access(request)
+            if redirect:
+                return redirect
+            raise HTTPException(status_code=404, detail="Job not found")
         raise HTTPException(status_code=404, detail="job_not_found")
-    payload = {"job_id": job_id}
+
+    # Calculate ETA if job is processing
+    eta_seconds: Optional[float] = None
+    elapsed_seconds: Optional[float] = None
+    if data.get("status") == "processing":
+        started = data.get("started")
+        progress = data.get("progress", 0)
+        if started and progress > 0:
+            elapsed_seconds = time.time() - started
+            estimated_total = (elapsed_seconds / progress) * 100
+            eta_seconds = max(0.0, estimated_total - elapsed_seconds)
+
+    if format == "html":
+        redirect = ensure_dashboard_access(request)
+        if redirect:
+            return redirect
+
+        csrf_token = ensure_csrf_token(request)
+
+        created_ts = data.get("created") or 0
+        created_dt = datetime.fromtimestamp(created_ts, tz=timezone.utc)
+        created_str = created_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        started_ts = data.get("started")
+        started_str = None
+        if started_ts:
+            started_dt = datetime.fromtimestamp(started_ts, tz=timezone.utc)
+            started_str = started_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        history_items = []
+        for item in data.get("history", [])[-20:]:
+            ts = item.get("timestamp", 0)
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            history_items.append(
+                {
+                    "timestamp": dt.strftime("%H:%M:%S"),
+                    "progress": item.get("progress", 0),
+                    "message": item.get("message", ""),
+                }
+            )
+
+        context = {
+            "request": request,
+            "title": f"Job {job_id}",
+            "max_width": "1000px",
+            **nav_context("/jobs"),
+            "job_id": job_id,
+            "status": data.get("status", "unknown"),
+            "progress": data.get("progress", 0),
+            "message": data.get("message", ""),
+            "created": created_str,
+            "started": started_str,
+            "elapsed_seconds": elapsed_seconds,
+            "eta_seconds": eta_seconds,
+            "duration_ms": data.get("duration_ms"),
+            "result": data.get("result"),
+            "error": data.get("error"),
+            "history": history_items,
+            "csrf_token": csrf_token,
+        }
+
+        if templates is not None:
+            return templates.TemplateResponse("job_detail.html", context)
+
+        return HTMLResponse(_job_detail_fallback_html(context))
+
+    payload: Dict[str, Any] = {"job_id": job_id}
     payload.update(data)
+    if eta_seconds is not None:
+        payload["eta_seconds"] = int(eta_seconds)
+    if elapsed_seconds is not None:
+        payload["elapsed_seconds"] = int(elapsed_seconds)
     return payload
+
+
+def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
+    """Fallback HTML for job detail page when templates unavailable"""
+    job_id = context["job_id"]
+    status = context["status"]
+    progress = context["progress"]
+    message = context.get("message", "")
+    created = context["created"]
+    started = context.get("started", "Not started") or "Not started"
+    elapsed = context.get("elapsed_seconds")
+    eta = context.get("eta_seconds")
+    duration_ms = context.get("duration_ms")
+    result = context.get("result")
+    error = context.get("error")
+    history = context.get("history", [])
+
+    status_class = {
+        "finished": "success",
+        "failed": "error",
+        "processing": "warning",
+        "queued": "info",
+    }.get(status, "")
+
+    eta_display = ""
+    if eta is not None and status == "processing":
+        minutes = int(eta // 60)
+        seconds = int(eta % 60)
+        eta_display = f"<p><strong>Estimated time remaining:</strong> {minutes}m {seconds}s</p>"
+
+    elapsed_display = ""
+    if elapsed is not None:
+        minutes = int(elapsed // 60)
+        seconds = int(elapsed % 60)
+        elapsed_display = f"<p><strong>Elapsed:</strong> {minutes}m {seconds}s</p>"
+    elif duration_ms is not None:
+        seconds_total = duration_ms / 1000
+        minutes = int(seconds_total // 60)
+        seconds = int(seconds_total % 60)
+        elapsed_display = f"<p><strong>Duration:</strong> {minutes}m {seconds}s</p>"
+
+    result_html = ""
+    if result:
+        if isinstance(result, dict):
+            if "file_url" in result:
+                path_html = ""
+                if result.get("path"):
+                    path_html = (
+                        f"<p><strong>Path:</strong> <code>{html.escape(result.get('path', ''), quote=True)}</code></p>"
+                    )
+                result_html = f"""
+                <div class=\"result-box\">
+                    <h3>Result</h3>
+                    <p><a href=\"{html.escape(result['file_url'], quote=True)}\" target=\"_blank\" class=\"download-link\">Download file</a></p>
+                    {path_html}
+                </div>
+                """
+            elif "outputs" in result:
+                outputs_list = "".join(
+                    f"<li><a href=\"{html.escape(url, quote=True)}\" target=\"_blank\">{html.escape(name)}</a></li>"
+                    for name, url in result["outputs"].items()
+                )
+                result_html = f"""
+                <div class=\"result-box\">
+                    <h3>Result Files</h3>
+                    <ul>{outputs_list}</ul>
+                </div>
+                """
+
+    error_html = ""
+    if error:
+        error_text = error if isinstance(error, str) else str(error)
+        error_html = f"""
+        <div class=\"error-box\">
+            <h3>Error</h3>
+            <pre>{html.escape(error_text)}</pre>
+        </div>
+        """
+
+    history_rows = ""
+    for item in history:
+        history_rows += f"""
+        <tr>
+            <td>{html.escape(item['timestamp'])}</td>
+            <td>{item['progress']}%</td>
+            <td>{html.escape(item['message'])}</td>
+        </tr>
+        """
+
+    if not history_rows:
+        history_rows = "<tr><td colspan=\"3\">No history yet</td></tr>"
+
+    auto_refresh = ""
+    if status in {"queued", "processing"}:
+        auto_refresh = '<meta http-equiv="refresh" content="2">'
+
+    top_bar_html = fallback_top_bar_html("/jobs")
+
+    return f"""
+    <!doctype html>
+    <html>
+    <head>
+        <meta charset=\"utf-8\" />
+        <title>Job {html.escape(job_id)}</title>
+        {auto_refresh}
+        <style>
+            body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1000px; margin: 0 auto; }}
+            .top-bar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }}
+            .brand {{ font-size: 32px; font-weight: bold; margin: 0; text-decoration: none; display: inline-flex; align-items: center; gap: 2px; color: #000; }}
+            .brand .ff {{ color: #28a745; }}
+            .brand .api {{ color: #000; }}
+            .main-nav {{ margin: 0; margin-left: auto; display: flex; gap: 12px; flex-wrap: wrap; }}
+            .main-nav a {{ padding: 8px 14px; border-radius: 6px; background: #e2e8f0; color: #6b7280; text-decoration: none; font-weight: 600; }}
+            .main-nav a:hover {{ background: #d1d5db; color: #000; }}
+            .main-nav a.active {{ background: #28a745; color: #fff; }}
+
+            .job-header {{ background: #f8fafc; padding: 20px; border-radius: 8px; margin-bottom: 24px; }}
+            .job-id {{ font-family: monospace; font-size: 18px; color: #1f2937; }}
+            .status {{ display: inline-block; padding: 6px 12px; border-radius: 4px; font-weight: 600; text-transform: capitalize; }}
+            .status.success {{ background: #e8f5e9; color: #256029; }}
+            .status.error {{ background: #fdecea; color: #b3261e; }}
+            .status.warning {{ background: #fff3cd; color: #856404; }}
+            .status.info {{ background: #e0f2fe; color: #1f7a34; }}
+
+            .progress-section {{ background: #fff; padding: 20px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+            .progress-bar-container {{ background: #e2e8f0; border-radius: 8px; height: 32px; overflow: hidden; margin: 16px 0; }}
+            .progress-bar {{ background: linear-gradient(90deg, #28a745, #20c997); height: 100%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; color: white; font-weight: 600; }}
+
+            .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
+            .info-box {{ background: #f8fafc; padding: 12px; border-radius: 6px; }}
+            .info-box strong {{ display: block; color: #6b7280; font-size: 12px; margin-bottom: 4px; }}
+
+            .result-box, .error-box {{ background: #fff; padding: 20px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+            .result-box h3, .error-box h3 {{ margin-top: 0; }}
+            .download-link {{ display: inline-block; padding: 10px 20px; background: #28a745; color: white; text-decoration: none; border-radius: 6px; font-weight: 600; }}
+            .download-link:hover {{ background: #1f7a34; }}
+            .error-box {{ background: #fdecea; border-left: 4px solid #b3261e; }}
+            .error-box pre {{ background: #fff; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 12px; }}
+
+            table {{ width: 100%; border-collapse: collapse; background: #fff; margin-top: 16px; }}
+            th, td {{ padding: 10px 12px; border-bottom: 1px solid #e2e8f0; font-size: 14px; text-align: left; }}
+            th {{ background: #f8fafc; color: #1f2937; font-weight: 600; }}
+
+            .back-link {{ display: inline-block; margin-bottom: 20px; color: #28a745; text-decoration: none; font-weight: 600; }}
+            .back-link:hover {{ text-decoration: underline; }}
+        </style>
+    </head>
+    <body>
+{top_bar_html}
+        <a href="/jobs" class="back-link">&larr; Back to Jobs</a>
+
+        <div class="job-header">
+            <h1>Job Details</h1>
+            <p class="job-id">{html.escape(job_id)}</p>
+            <span class="status {status_class}">{html.escape(status)}</span>
+        </div>
+
+        <div class="progress-section">
+            <h2>Progress: {progress}%</h2>
+            <div class="progress-bar-container">
+                <div class="progress-bar" style="width: {progress}%">
+                    {progress}%
+                </div>
+            </div>
+            <p><strong>Current status:</strong> {html.escape(message)}</p>
+            {eta_display}
+            {elapsed_display}
+        </div>
+
+        <div class="info-grid">
+            <div class="info-box">
+                <strong>Created</strong>
+                {html.escape(created)}
+            </div>
+            <div class="info-box">
+                <strong>Started</strong>
+                {html.escape(started)}
+            </div>
+        </div>
+
+        {result_html}
+        {error_html}
+
+        <h3>Progress History</h3>
+        <table>
+            <thead>
+                <tr><th>Time</th><th>Progress</th><th>Message</th></tr>
+            </thead>
+            <tbody>
+                {history_rows}
+            </tbody>
+        </table>
+    </body>
+    </html>
+    """
 
 
 @app.post("/compose/from-tracks")
