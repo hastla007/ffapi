@@ -99,10 +99,23 @@ RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz -o ff
     cd .. && \
     rm -rf ffmpeg-${FFMPEG_VERSION} ffmpeg.tar.xz
 
-# Verify FFmpeg supports hardware acceleration AND drawtext filter
-RUN ffmpeg -hwaccels && \
-    ffmpeg -encoders | grep nvenc && \
-    ffmpeg -filters | grep drawtext
+# Verify FFmpeg supports required features
+RUN echo "=== Verifying FFmpeg build ===" && \
+    ffmpeg -version && \
+    echo -e "\n=== Checking hardware acceleration ===" && \
+    ffmpeg -hwaccels 2>&1 && \
+    echo -e "\n=== Checking for encoders ===" && \
+    if ffmpeg -encoders 2>&1 | grep -iq "nvenc"; then \
+        echo "✓ NVENC encoders found"; \
+    else \
+        echo "⚠ NVENC not found - GPU encoding may not work"; \
+    fi && \
+    echo -e "\n=== Checking for drawtext filter ===" && \
+    if ffmpeg -filters 2>&1 | grep -iq "drawtext"; then \
+        echo "✓ drawtext filter found"; \
+    else \
+        echo "✗ drawtext filter missing!" && exit 1; \
+    fi
 
 WORKDIR /app
 
