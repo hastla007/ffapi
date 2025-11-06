@@ -34,6 +34,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvorbis-dev \
     libass-dev \
     libfreetype6-dev \
+    libfontconfig1-dev \
+    libharfbuzz-dev \
+    libfribidi-dev \
     libsdl2-dev \
     libva-dev \
     libvdpau-dev \
@@ -44,6 +47,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg-dev \
     zlib1g-dev \
     libpng-dev \
+    # Fonts for text rendering
+    fonts-dejavu-core \
+    fonts-liberation \
+    fonts-liberation2 \
+    fontconfig \
     && rm -rf /var/lib/apt/lists/*
 
 # Install NVIDIA codec headers (required for NVENC/NVDEC)
@@ -73,6 +81,8 @@ RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz -o ff
         --enable-libvorbis \
         --enable-libass \
         --enable-libfreetype \
+        --enable-libfontconfig \
+        --enable-libfribidi \
         --enable-cuda-nvcc \
         --enable-cuvid \
         --enable-nvdec \
@@ -89,8 +99,10 @@ RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz -o ff
     cd .. && \
     rm -rf ffmpeg-${FFMPEG_VERSION} ffmpeg.tar.xz
 
-# Verify FFmpeg supports hardware acceleration
-RUN ffmpeg -hwaccels && ffmpeg -encoders | grep nvenc
+# Verify FFmpeg supports hardware acceleration AND drawtext filter
+RUN ffmpeg -hwaccels && \
+    ffmpeg -encoders | grep nvenc && \
+    ffmpeg -filters | grep drawtext
 
 WORKDIR /app
 
