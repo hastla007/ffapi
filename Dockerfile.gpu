@@ -34,7 +34,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvorbis-dev \
     libass-dev \
     libfreetype6-dev \
+    libfreetype-dev \
     libfontconfig1-dev \
+    libfontconfig-dev \
     libharfbuzz-dev \
     libfribidi-dev \
     libsdl2-dev \
@@ -47,6 +49,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg-dev \
     zlib1g-dev \
     libpng-dev \
+    # Additional tools
+    libglib2.0-dev \
     # Fonts for text rendering
     fonts-dejavu-core \
     fonts-liberation \
@@ -63,22 +67,34 @@ RUN git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
     cd .. && \
     rm -rf nv-codec-headers
 
-# Verify required libraries are installed and detectable
+# Verify required libraries and show their locations
 RUN echo "=== Verifying build dependencies ===" && \
-    pkg-config --exists freetype2 && echo "✓ freetype2 found at: $(pkg-config --cflags freetype2)" || (echo "✗ freetype2 missing!" && exit 1) && \
-    pkg-config --exists fontconfig && echo "✓ fontconfig found at: $(pkg-config --cflags fontconfig)" || (echo "✗ fontconfig missing!" && exit 1) && \
-    pkg-config --exists libass && echo "✓ libass found at: $(pkg-config --cflags libass)" || (echo "✗ libass missing!" && exit 1) && \
-    pkg-config --exists fribidi && echo "✓ fribidi found at: $(pkg-config --cflags fribidi)" || (echo "✗ fribidi missing!" && exit 1) && \
-    echo "=== All dependencies verified ==="
+    echo "Checking freetype2:" && \
+    pkg-config --exists freetype2 && pkg-config --cflags --libs freetype2 && \
+    echo "Checking fontconfig:" && \
+    pkg-config --exists fontconfig && pkg-config --cflags --libs fontconfig && \
+    echo "Checking libass:" && \
+    pkg-config --exists libass && pkg-config --cflags --libs libass && \
+    echo "Checking fribidi:" && \
+    pkg-config --exists fribidi && pkg-config --cflags --libs fribidi && \
+    echo "=== All dependencies found ===" && \
+    ls -la /usr/include/freetype2/ && \
+    ls -la /usr/lib/x86_64-linux-gnu/pkgconfig/freetype2.pc
+
+# Set environment variables for library detection
+ENV PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig:/usr/share/pkgconfig
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu
 
 # Download and compile FFmpeg with NVENC support
 ENV FFMPEG_VERSION=6.1.1
 RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz -o ffmpeg.tar.xz && \
     tar xf ffmpeg.tar.xz && \
     cd ffmpeg-${FFMPEG_VERSION} && \
-    PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig \
     ./configure \
         --prefix=/usr/local \
+        --pkg-config-flags="--static" \
+        --extra-cflags="-I/usr/include -I/usr/include/freetype2 -I/usr/local/cuda/include" \
+        --extra-ldflags="-L/usr/lib/x86_64-linux-gnu -L/usr/local/cuda/lib64" \
         --enable-gpl \
         --enable-nonfree \
         --enable-libx264 \
@@ -98,25 +114,32 @@ RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz -o ff
         --enable-nvdec \
         --enable-nvenc \
         --enable-libnpp \
-        --extra-cflags="-I/usr/local/cuda/include" \
-        --extra-ldflags="-L/usr/local/cuda/lib64" \
         --nvccflags="-gencode arch=compute_52,code=sm_52 -O2" \
         --disable-debug \
         --disable-doc 2>&1 | tee /tmp/ffmpeg-configure.log && \
-    echo -e "\n=== Checking configure results for drawtext ===" && \
-    if grep -q "drawtext" /tmp/ffmpeg-configure.log; then \
-        echo "✓ drawtext mentioned in configure output"; \
+    echo -e "\n=== Checking configure output for critical libraries ===" && \
+    echo "Checking for libfreetype..." && \
+    grep -i "freetype" /tmp/ffmpeg-configure.log | head -n 5 && \
+    echo "Checking for libfontconfig..." && \
+    grep -i "fontconfig" /tmp/ffmpeg-configure.log | head -n 5 && \
+    echo -e "\n=== Verifying in config.h ===" && \
+    if grep -q "CONFIG_LIBFREETYPE 1" config.h; then \
+        echo "✓ CONFIG_LIBFREETYPE is enabled"; \
     else \
-        echo "⚠ Warning: drawtext not mentioned in configure output"; \
-    fi && \
-    echo -e "\n=== Checking if libfreetype was detected ===" && \
-    if grep -q "libfreetype.*yes" config.h 2>/dev/null || grep -q "HAVE_LIBFREETYPE.*1" config.h 2>/dev/null; then \
-        echo "✓ libfreetype detected"; \
-    else \
-        echo "✗ libfreetype NOT detected - drawtext will not work!" && \
-        cat config.h | grep -i freetype && \
+        echo "✗ CONFIG_LIBFREETYPE is NOT enabled!"; \
+        echo "Showing config.h freetype entries:"; \
+        grep -i freetype config.h || echo "No freetype entries found"; \
         exit 1; \
     fi && \
+    if grep -q "CONFIG_DRAWTEXT_FILTER 1" config.h; then \
+        echo "✓ CONFIG_DRAWTEXT_FILTER is enabled"; \
+    else \
+        echo "✗ CONFIG_DRAWTEXT_FILTER is NOT enabled!"; \
+        echo "Showing config.h drawtext entries:"; \
+        grep -i drawtext config.h || echo "No drawtext entries found"; \
+        exit 1; \
+    fi && \
+    echo -e "\n=== Starting FFmpeg compilation ===" && \
     make -j$(nproc) && \
     make install && \
     ldconfig && \
@@ -125,23 +148,25 @@ RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz -o ff
 
 # Verify FFmpeg has the drawtext filter - FAIL BUILD if missing
 RUN echo "=== Final FFmpeg Verification ===" && \
-    ffmpeg -version 2>&1 | head -n 3 && \
+    ffmpeg -version 2>&1 | head -n 5 && \
     echo -e "\n=== Checking for drawtext filter ===" && \
     if ffmpeg -filters 2>&1 | grep -q "drawtext"; then \
-        echo "✓ drawtext filter is available"; \
+        echo "✓ SUCCESS: drawtext filter is available!"; \
         ffmpeg -filters 2>&1 | grep drawtext; \
     else \
-        echo "✗ CRITICAL: drawtext filter is NOT available!"; \
-        echo "Available filters:"; \
-        ffmpeg -filters 2>&1 | head -n 20; \
+        echo "✗ CRITICAL FAILURE: drawtext filter is NOT available!"; \
+        echo "This should not happen - build verification failed"; \
         exit 1; \
     fi && \
     echo -e "\n=== Checking for NVENC encoders ===" && \
     if ffmpeg -encoders 2>&1 | grep -iq "nvenc"; then \
         echo "✓ NVENC encoders found"; \
+        ffmpeg -encoders 2>&1 | grep -i nvenc; \
     else \
         echo "⚠ NVENC encoders not found (GPU encoding may not work at runtime)"; \
-    fi
+    fi && \
+    echo -e "\n=== Hardware acceleration methods ===" && \
+    ffmpeg -hwaccels 2>&1
 
 WORKDIR /app
 
