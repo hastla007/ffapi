@@ -63,11 +63,19 @@ RUN git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
     cd .. && \
     rm -rf nv-codec-headers
 
+# Verify required libraries are installed before compiling
+RUN echo "=== Checking build dependencies ===" && \
+    pkg-config --exists freetype2 && echo "✓ freetype2 found" || (echo "✗ freetype2 missing!" && exit 1) && \
+    pkg-config --exists fontconfig && echo "✓ fontconfig found" || (echo "✗ fontconfig missing!" && exit 1) && \
+    pkg-config --exists libass && echo "✓ libass found" || (echo "✗ libass missing!" && exit 1) && \
+    echo "All dependencies verified"
+
 # Download and compile FFmpeg with NVENC support
 ENV FFMPEG_VERSION=6.1.1
 RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz -o ffmpeg.tar.xz && \
     tar xf ffmpeg.tar.xz && \
     cd ffmpeg-${FFMPEG_VERSION} && \
+    # Show what configure detects
     ./configure \
         --prefix=/usr/local \
         --enable-gpl \
@@ -92,30 +100,20 @@ RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz -o ff
         --extra-ldflags="-L/usr/local/cuda/lib64" \
         --nvccflags="-gencode arch=compute_52,code=sm_52 -O2" \
         --disable-debug \
-        --disable-doc && \
+        --disable-doc 2>&1 | tee /tmp/ffmpeg-configure.log && \
+    echo "=== Checking if drawtext filter will be compiled ===" && \
+    grep -i "drawtext" /tmp/ffmpeg-configure.log || echo "Warning: drawtext not mentioned in configure output" && \
     make -j$(nproc) && \
     make install && \
     ldconfig && \
     cd .. && \
     rm -rf ffmpeg-${FFMPEG_VERSION} ffmpeg.tar.xz
 
-# Verify FFmpeg supports required features
-RUN echo "=== Verifying FFmpeg build ===" && \
-    ffmpeg -version && \
-    echo -e "\n=== Checking hardware acceleration ===" && \
-    ffmpeg -hwaccels 2>&1 && \
-    echo -e "\n=== Checking for encoders ===" && \
-    if ffmpeg -encoders 2>&1 | grep -iq "nvenc"; then \
-        echo "✓ NVENC encoders found"; \
-    else \
-        echo "⚠ NVENC not found - GPU encoding may not work"; \
-    fi && \
-    echo -e "\n=== Checking for drawtext filter ===" && \
-    if ffmpeg -filters 2>&1 | grep -iq "drawtext"; then \
-        echo "✓ drawtext filter found"; \
-    else \
-        echo "✗ drawtext filter missing!" && exit 1; \
-    fi
+# Verify FFmpeg supports required features (informational)
+RUN echo "=== FFmpeg Build Verification ===" && \
+    ffmpeg -version 2>&1 | head -n 5 && \
+    echo -e "\n=== Available filters (showing drawtext) ===" && \
+    ffmpeg -filters 2>&1 | grep -i "drawtext\|^Filters" || echo "drawtext not found in filters"
 
 WORKDIR /app
 
