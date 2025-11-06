@@ -2967,13 +2967,86 @@ def format_duration(seconds: float) -> str:
     return f"{seconds:.2f}s"
 
 
+GPU_FILTER_ERROR_PATTERNS = [
+    "Impossible to convert between the formats",
+    "hwupload",
+    "scale_cuda",
+    "scale_qsv",
+    "Cannot initialize the decoder",
+]
+
+
 async def run_ffmpeg_with_timeout(
     cmd: List[str],
     log_handle,
     *,
     progress_parser: Optional[Callable[[str], None]] = None,
+    allow_gpu_fallback: bool = True,
 ) -> int:
     """Run FFmpeg asynchronously without blocking the event loop."""
+
+    def _read_log_text() -> str:
+        """Best-effort attempt to read the collected log output."""
+
+        if not allow_gpu_fallback:
+            return ""
+
+        try:
+            if hasattr(log_handle, "flush"):
+                log_handle.flush()
+        except Exception:
+            pass
+
+        if hasattr(log_handle, "getvalue"):
+            try:
+                return str(log_handle.getvalue())
+            except Exception:
+                return ""
+
+        if hasattr(log_handle, "read"):
+            try:
+                position = log_handle.tell()
+                try:
+                    log_handle.seek(0)
+                except Exception:
+                    return ""
+                data = log_handle.read()
+                try:
+                    log_handle.seek(position)
+                except Exception:
+                    pass
+                return data if isinstance(data, str) else str(data)
+            except Exception:
+                pass
+
+        log_path = getattr(log_handle, "name", None)
+        if log_path:
+            try:
+                path_obj = Path(log_path)
+            except Exception:
+                path_obj = None
+            if path_obj and path_obj.exists():
+                try:
+                    return path_obj.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    return ""
+
+        return ""
+
+    def _interpret_return_code(return_code: int) -> int:
+        if not allow_gpu_fallback or return_code == 0:
+            return return_code
+
+        try:
+            log_text = _read_log_text()
+        except Exception:
+            log_text = ""
+
+        if log_text and any(pattern in log_text for pattern in GPU_FILTER_ERROR_PATTERNS):
+            logger.warning("GPU filter error detected, will retry with CPU filters")
+            return -999
+
+        return return_code
 
     async def _pump_stream(stream: Optional[asyncio.StreamReader], *, parse_progress: bool) -> None:
         if stream is None:
@@ -3022,7 +3095,7 @@ async def run_ffmpeg_with_timeout(
                             await task
                         except (asyncio.CancelledError, Exception):
                             pass
-            return return_code
+            return _interpret_return_code(return_code)
         except asyncio.TimeoutError:
             proc.terminate()
             try:
@@ -3111,7 +3184,7 @@ async def run_ffmpeg_with_timeout(
                 None,
                 lambda: proc_sync.wait(timeout=FFMPEG_TIMEOUT_SECONDS),
             )
-            return return_code
+            return _interpret_return_code(return_code)
         except subprocess.TimeoutExpired:
             proc_sync.terminate()
             try:
@@ -3135,7 +3208,7 @@ async def run_ffmpeg_with_timeout(
             if reader_thread is not None:
                 reader_thread.join(timeout=1)
 
-        return 0
+        return _interpret_return_code(0)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -3145,7 +3218,7 @@ async def run_ffmpeg_with_timeout(
             stderr=asyncio.subprocess.PIPE,
         )
     except AttributeError as attr_error:
-        return await _run_with_subprocess_fallback(attr_error)
+        return _interpret_return_code(await _run_with_subprocess_fallback(attr_error))
     except Exception as exc:
         logger.error("Failed to launch ffmpeg command %s: %s", cmd, exc)
         _flush_logs()
@@ -6255,10 +6328,37 @@ async def compose_from_binaries(
 async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
     logger.info(f"Starting concat: {len(job.clips)} clips, {job.width}x{job.height}@{job.fps}fps")
     check_disk_space(WORK_DIR)
-    
+
+    max_attempts = 2
+    last_error: Optional[HTTPException] = None
+
+    for attempt in range(max_attempts):
+        use_gpu = attempt == 0
+        try:
+            return await _concat_impl(job, as_json, force_cpu=not use_gpu)
+        except HTTPException as exc:
+            last_error = exc
+            if use_gpu:
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                log_text = detail.get("log", "") if isinstance(detail, dict) else ""
+                if log_text and any(err in str(log_text) for err in GPU_FILTER_ERROR_PATTERNS):
+                    logger.warning("GPU filter failed, retrying with CPU filters")
+                    continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+
+    raise HTTPException(status_code=500, detail="Unknown concat failure")
+
+
+async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
+    if force_cpu:
+        logger.info("CPU fallback enabled for concat normalization")
+
     with TemporaryDirectory(prefix="concat_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
-        
+
         # Step 1: Download all clips
         logger.info("Downloading %d clips...", len(job.clips))
         downloaded = []
@@ -6267,10 +6367,10 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             await _download_to(str(url), raw, None)
             downloaded.append(raw)
             logger.info("Downloaded clip %d/%d", i + 1, len(job.clips))
-        
+
         # Step 2: Probe clips to check compatibility
         logger.info("Probing clips for compatibility...")
-        
+
         def probe_clip(clip_path: Path) -> Optional[Dict[str, Any]]:
             """Probe a video clip and return its stream info."""
             try:
@@ -6300,10 +6400,10 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
                 return float(num) / float(den)
             except Exception:
                 return None
-        
+
         # Probe all clips
         clip_info = [probe_clip(p) for p in downloaded]
-        
+
         # Check if all clips are compatible for stream copy
         all_compatible = True
         baseline = clip_info[0]
@@ -6386,9 +6486,9 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
                             logger.info("Clip %d audio stream mismatch, will re-encode all", i)
                             all_compatible = False
                             break
-        
+
         out_path = work / "output.mp4"
-        
+
         # Step 3: Choose processing path
         if all_compatible:
             # ⚡ FAST PATH: Stream copy (no re-encoding!)
@@ -6399,7 +6499,7 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
             with listfile.open("w", encoding="utf-8") as f:
                 for p in downloaded:
                     f.write(f"file '{_escape_ffmpeg_concat_path(p)}'\n")
-            
+
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat",
@@ -6409,12 +6509,12 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
                 "-movflags", "+faststart",
                 str(out_path)
             ]
-            
+
             log = work / "concat_fast.log"
             with log.open("w", encoding="utf-8", errors="ignore") as lf:
                 code = await run_ffmpeg_with_timeout(cmd, lf)
             save_log(log, "concat-fast")
-            
+
             if code != 0 or not out_path.exists():
                 logger.error("Fast concat failed, falling back to re-encode")
                 all_compatible = False  # Fall through to slow path
@@ -6423,21 +6523,29 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
                         out_path.unlink()
                     except Exception as exc:
                         logger.warning("Failed to remove incomplete fast path output: %s", exc)
-        
+
         if not all_compatible:
             # 🐌 SLOW PATH: Normalize and re-encode incompatible clips
             logger.info("⚠ Clips incompatible or fast path failed - using SLOW re-encode mode")
-            
+
             norm = []
             for i, clip_path in enumerate(downloaded):
                 logger.info("Normalizing clip %d/%d...", i + 1, len(downloaded))
                 out = work / f"norm_{i:03d}.mp4"
-                
-                decoder_args = get_video_decoder(clip_path)
+
+                if force_cpu:
+                    decoder_args: List[str] = []
+                else:
+                    decoder_args = get_video_decoder(clip_path)
+
                 encode_args = build_encode_args(
-                    job.width, job.height, job.fps, decoder_args=decoder_args
+                    job.width,
+                    job.height,
+                    job.fps,
+                    decoder_args=decoder_args,
+                    prefer_gpu_filters=not force_cpu,
                 )
-                
+
                 cmd = [
                     "ffmpeg", "-y",
                 ] + decoder_args + [
@@ -6449,12 +6557,35 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
                     "-movflags", "+faststart",
                     str(out),
                 ]
-                
+
                 log = work / f"norm_{i:03d}.log"
                 with log.open("w", encoding="utf-8", errors="ignore") as lf:
-                    code = await run_ffmpeg_with_timeout(cmd, lf)
+                    code = await run_ffmpeg_with_timeout(cmd, lf, allow_gpu_fallback=not force_cpu)
+
+                if code == -999:
+                    logger.info("Retrying clip %d with CPU filters", i)
+                    encode_args_cpu = build_encode_args(
+                        job.width,
+                        job.height,
+                        job.fps,
+                        decoder_args=[],
+                        prefer_gpu_filters=False,
+                    )
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", str(clip_path),
+                    ] + encode_args_cpu + [
+                        "-c:a", "aac",
+                        "-b:a", "128k",
+                        "-ar", "48000",
+                        "-movflags", "+faststart",
+                        str(out),
+                    ]
+                    with log.open("w", encoding="utf-8", errors="ignore") as lf:
+                        code = await run_ffmpeg_with_timeout(cmd, lf, allow_gpu_fallback=False)
+
                 save_log(log, f"concat-norm-{i}")
-                
+
                 if code != 0 or not out.exists():
                     logger.error("Failed to normalize clip %d", i)
                     for partial in norm:
@@ -6468,24 +6599,22 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
                         except Exception:
                             pass
                     _flush_logs()
-                    return JSONResponse(
-                        status_code=500,
-                        content={
-                            "error": "ffmpeg_failed_on_clip",
-                            "clip": str(job.clips[i]),
-                            "clip_index": i,
-                            "log": log.read_text() if log.exists() else "Log unavailable"
-                        }
-                    )
+                    detail = {
+                        "error": "ffmpeg_failed_on_clip",
+                        "clip": str(job.clips[i]),
+                        "clip_index": i,
+                        "log": log.read_text() if log.exists() else "Log unavailable",
+                    }
+                    raise HTTPException(status_code=500, detail=detail)
                 norm.append(out)
-            
+
             # Concatenate normalized clips
             logger.info("Concatenating %d normalized clips...", len(norm))
             listfile = work / "list.txt"
             with listfile.open("w", encoding="utf-8") as f:
                 for p in norm:
                     f.write(f"file '{_escape_ffmpeg_concat_path(p)}'\n")
-            
+
             cmd2 = [
                 "ffmpeg", "-y",
                 "-f", "concat",
@@ -6495,30 +6624,28 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
                 "-movflags", "+faststart",
                 str(out_path)
             ]
-            
+
             log2 = work / "concat.log"
             with log2.open("w", encoding="utf-8", errors="ignore") as lf:
                 code2 = await run_ffmpeg_with_timeout(cmd2, lf)
             save_log(log2, "concat-final")
-            
+
             if code2 != 0 or not out_path.exists():
                 logger.error("concat failed at final stage")
                 _flush_logs()
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "error": "ffmpeg_failed_concat",
-                        "log": log2.read_text()
-                    }
-                )
-        
+                detail = {
+                    "error": "ffmpeg_failed_concat",
+                    "log": log2.read_text() if log2.exists() else "",
+                }
+                raise HTTPException(status_code=500, detail=detail)
+
         # Step 4: Publish result
         pub = await publish_file(out_path, ".mp4")
         logger.info(f"concat completed: {len(job.clips)} clips -> {pub['rel']}")
-        
+
         if as_json:
             return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
-        
+
         resp = FileResponse(
             pub["dst"],
             media_type="video/mp4",
