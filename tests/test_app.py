@@ -2325,6 +2325,7 @@ def test_compose_from_tracks_concats_multiple_videos(patched_app, monkeypatch):
         log_handle,
         *,
         progress_parser=None,
+        allow_gpu_fallback: bool = True,
     ) -> int:
         commands.append(list(cmd))
         output_path = None
