@@ -2466,7 +2466,7 @@ class FFmpegProgressParser:
     _TIME_PATTERN = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
     _FPS_PATTERN = re.compile(r"fps=\s*(\d+\.?\d*)")
     _SPEED_PATTERN = re.compile(r"speed=\s*(\d+\.?\d*)x")
-    _BITRATE_PATTERN = re.compile(r"bitrate=\s*(\d+\.?\d*)\s*(\w+)")
+    _BITRATE_PATTERN = re.compile(r"bitrate=\s*(\d+\.?\d*)\s*(\w+/?\w*)")
     _FRAME_PATTERN = re.compile(r"frame=\s*(\d+)")
     _SIZE_PATTERN = re.compile(r"size=\s*(\d+\w+)")
 
@@ -7016,12 +7016,48 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
             norm = []
             for i, clip_path in enumerate(downloaded):
                 logger.info("Normalizing clip %d/%d...", i + 1, len(downloaded))
+
+                if not clip_path.exists():
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Clip {i} disappeared: {clip_path}",
+                    )
+
+                file_size = clip_path.stat().st_size
+                if file_size == 0:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Clip {i} is empty (0 bytes): {clip_path}",
+                    )
+
+                logger.info("Clip %d size: %.1f MB", i, file_size / (1024 * 1024))
+
                 out = work / f"norm_{i:03d}.mp4"
 
                 if force_cpu:
                     decoder_args: List[str] = []
                 else:
                     decoder_args = get_video_decoder(clip_path)
+
+                if decoder_args and not force_cpu:
+                    test_cmd = ["ffprobe"] + decoder_args + ["-i", str(clip_path), "-v", "error"]
+                    try:
+                        test_result = subprocess.run(
+                            test_cmd,
+                            capture_output=True,
+                            timeout=10,
+                            check=False,
+                        )
+                        if test_result.returncode != 0:
+                            logger.warning("GPU decoder test failed for clip %d, using CPU", i)
+                            decoder_args = []
+                    except Exception as probe_exc:
+                        logger.warning(
+                            "GPU decoder test exception for clip %d: %s, using CPU",
+                            i,
+                            probe_exc,
+                        )
+                        decoder_args = []
 
                 encode_args = build_encode_args(
                     job.width,
@@ -7044,8 +7080,21 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
                 ]
 
                 log = work / f"norm_{i:03d}.log"
+
+                logger.info("Normalizing clip %d: %s", i, clip_path.name)
+                logger.info("Output: %s", out.name)
+                command_preview = " ".join(cmd[:10]) + "..." if len(cmd) > 10 else " ".join(cmd)
+                logger.info("Command: %s", command_preview)
+                logger.info("GPU decoder args: %s", decoder_args if decoder_args else "None (CPU)")
+
                 with log.open("w", encoding="utf-8", errors="ignore") as lf:
-                    code = await run_ffmpeg_with_timeout(cmd, lf, allow_gpu_fallback=not force_cpu)
+                    lf.write(f"# FFmpeg command:\n# {' '.join(cmd)}\n\n")
+                    lf.flush()
+                    code = await run_ffmpeg_with_timeout(
+                        cmd,
+                        lf,
+                        allow_gpu_fallback=not force_cpu,
+                    )
 
                 if code == -999:
                     logger.info("Retrying clip %d with CPU filters", i)
@@ -7066,13 +7115,36 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
                         "-movflags", "+faststart",
                         str(out),
                     ]
+
+                    logger.info("Retry command (CPU): %s", " ".join(cmd[:10]) + "..." if len(cmd) > 10 else " ".join(cmd))
+
                     with log.open("w", encoding="utf-8", errors="ignore") as lf:
-                        code = await run_ffmpeg_with_timeout(cmd, lf, allow_gpu_fallback=False)
+                        lf.write(f"# FFmpeg command:\n# {' '.join(cmd)}\n\n")
+                        lf.flush()
+                        code = await run_ffmpeg_with_timeout(
+                            cmd,
+                            lf,
+                            allow_gpu_fallback=False,
+                        )
 
                 save_log(log, f"concat-norm-{i}")
 
                 if code != 0 or not out.exists():
                     logger.error("Failed to normalize clip %d", i)
+
+                    log_content = "Log file not found"
+                    if log.exists():
+                        try:
+                            log_content = log.read_text(encoding="utf-8", errors="ignore")
+                            if not log_content.strip():
+                                log_content = "Log file is empty - FFmpeg may have crashed immediately"
+                        except Exception as read_exc:
+                            log_content = f"Failed to read log: {read_exc}"
+
+                    logger.error("Normalization failed for clip %d/%d", i, len(downloaded))
+                    logger.error("FFmpeg command was: %s", " ".join(cmd))
+                    logger.error("FFmpeg log content:\n%s", log_content[:1000])
+
                     for partial in norm:
                         try:
                             partial.unlink()
@@ -7088,7 +7160,9 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
                         "error": "ffmpeg_failed_on_clip",
                         "clip": str(job.clips[i]),
                         "clip_index": i,
-                        "log": log.read_text() if log.exists() else "Log unavailable",
+                        "log": log_content,
+                        "command": " ".join(cmd),
+                        "exit_code": code,
                     }
                     raise HTTPException(status_code=500, detail=detail)
                 norm.append(out)
