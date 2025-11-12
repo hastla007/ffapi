@@ -2860,7 +2860,6 @@ async def startup_event():
     if PUBLIC_CLEANUP_INTERVAL_SECONDS > 0:
         asyncio.create_task(_periodic_public_cleanup())
         asyncio.create_task(_periodic_jobs_cleanup())
-    asyncio.create_task(_periodic_stuck_job_detector())
     asyncio.create_task(_periodic_session_cleanup())
     asyncio.create_task(_periodic_rate_limiter_cleanup())
     if PROBE_CACHE_TTL > 0:
@@ -3614,90 +3613,6 @@ async def _periodic_jobs_cleanup():
             raise
 
 
-
-async def _periodic_stuck_job_detector() -> None:
-    """Detect and mark jobs that are stuck in processing state."""
-    await asyncio.sleep(300)
-
-    while True:
-        try:
-            now = time.time()
-            items: List[Tuple[str, Dict[str, Any]]] = []
-            try:
-                async with safe_lock(JOBS_LOCK, timeout=5.0, operation="stuck_job_scan"):
-                    items = list(JOBS.items())
-            except HTTPException:
-                items = []
-
-            candidates: List[Tuple[str, float, bool]] = []
-            for job_id, data in items:
-                if data.get("status") != "processing":
-                    continue
-
-                updated = data.get("updated", 0.0)
-                elapsed = now - updated
-                with JOB_PROCESSES_LOCK:
-                    has_process = job_id in JOB_PROCESSES
-
-                is_stuck = elapsed > 600 or (not has_process and elapsed > 120)
-                if not is_stuck:
-                    continue
-
-                candidates.append((job_id, elapsed, has_process))
-
-            stuck_jobs: List[str] = []
-            if candidates:
-                async with safe_lock(JOBS_LOCK, timeout=5.0, operation="stuck_job_mark"):
-                    for job_id, elapsed, had_process in candidates:
-                        data = JOBS.get(job_id)
-                        if not data or data.get("status") != "processing":
-                            continue
-
-                        now_mark = time.time()
-                        message = "Job stuck - auto-failed by watchdog"
-                        if not had_process:
-                            message = "Job stuck - process ended with no status update"
-
-                        progress_snapshot = _drain_job_progress(job_id)
-                        history = list(data.get("history", []))
-                        if progress_snapshot is not None:
-                            history.extend(progress_snapshot.get("history", []))
-                        history.append(
-                            {
-                                "timestamp": now_mark,
-                                "progress": data.get("progress", 0),
-                                "message": message,
-                            }
-                        )
-                        if len(history) > JOB_HISTORY_LIMIT:
-                            history = history[-JOB_HISTORY_LIMIT:]
-
-                        JOBS[job_id] = {
-                            **data,
-                            "status": "failed",
-                            "progress": data.get("progress", 0),
-                            "message": message,
-                            "error": (
-                                f"No status update for {int(elapsed)}s"
-                                if had_process
-                                else f"Process ended with no update for {int(elapsed)}s"
-                            ),
-                            "updated": now_mark,
-                            "history": history,
-                        }
-                        stuck_jobs.append(job_id)
-
-            if stuck_jobs:
-                struct_logger.error(
-                    "stuck_jobs_detected",
-                    count=len(stuck_jobs),
-                    job_ids=stuck_jobs,
-                )
-
-        except Exception as exc:
-            logger.error("Stuck job detector failed: %s", exc)
-
-        await asyncio.sleep(60)  # Check every minute instead of 5 minutes
 
 async def _periodic_cache_cleanup():
     try:
@@ -8740,20 +8655,92 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                     )
                     last_logged_time[0] = now
 
-            async def watchdog() -> None:
-                try:
-                    for _ in range(0, FFMPEG_TIMEOUT_SECONDS, 60):
-                        await asyncio.sleep(60)
-                        elapsed = time.time() - start
-                        logger.info(
-                            "[%s] Watchdog: %.0f seconds elapsed, still processing",
-                            job_id,
-                            elapsed,
-                        )
-                except asyncio.CancelledError:
-                    pass
+            async def enhanced_watchdog() -> None:
+                """Monitor job health, enforce timeout, and handle kill signals."""
+                check_interval = 10  # Check every 10 seconds
+                last_log_time = start
 
-            watchdog_task = asyncio.create_task(watchdog())
+                try:
+                    while True:
+                        await asyncio.sleep(check_interval)
+                        elapsed = time.time() - start
+
+                        # Check if job was marked as killed
+                        if _job_marked_killed(job_id):
+                            logger.warning(
+                                "[%s] Watchdog detected kill signal after %.0fs - terminating FFmpeg",
+                                job_id,
+                                elapsed,
+                            )
+                            # Try to terminate the process
+                            with JOB_PROCESSES_LOCK:
+                                handle = JOB_PROCESSES.get(job_id)
+                            if handle:
+                                process = getattr(handle, "process", None)
+                                if process:
+                                    try:
+                                        if isinstance(process, asyncio.subprocess.Process):
+                                            if process.returncode is None:
+                                                process.terminate()
+                                                logger.info("[%s] Watchdog sent SIGTERM to FFmpeg", job_id)
+                                        else:
+                                            if getattr(process, "poll", lambda: None)() is None:
+                                                process.terminate()
+                                                logger.info("[%s] Watchdog sent SIGTERM to FFmpeg", job_id)
+                                    except Exception as term_exc:
+                                        logger.error(
+                                            "[%s] Watchdog failed to terminate process: %s",
+                                            job_id,
+                                            term_exc,
+                                        )
+                            return  # Exit watchdog - let main flow handle cleanup
+
+                        # Check for timeout
+                        if elapsed >= FFMPEG_TIMEOUT_SECONDS:
+                            logger.error(
+                                "[%s] Watchdog detected timeout (%.0fs >= %ds) - killing FFmpeg",
+                                job_id,
+                                elapsed,
+                                FFMPEG_TIMEOUT_SECONDS,
+                            )
+                            # Force kill the process
+                            with JOB_PROCESSES_LOCK:
+                                handle = JOB_PROCESSES.get(job_id)
+                            if handle:
+                                process = getattr(handle, "process", None)
+                                if process:
+                                    try:
+                                        if isinstance(process, asyncio.subprocess.Process):
+                                            if process.returncode is None:
+                                                process.kill()
+                                                logger.warning("[%s] Watchdog sent SIGKILL to FFmpeg", job_id)
+                                        else:
+                                            if getattr(process, "poll", lambda: None)() is None:
+                                                process.kill()
+                                                logger.warning("[%s] Watchdog sent SIGKILL to FFmpeg", job_id)
+                                    except Exception as kill_exc:
+                                        logger.error(
+                                            "[%s] Watchdog failed to kill process: %s",
+                                            job_id,
+                                            kill_exc,
+                                        )
+                            return  # Exit watchdog - timeout will be caught by main flow
+
+                        # Periodic progress logging (every 30 seconds)
+                        if elapsed - last_log_time >= 30:
+                            logger.info(
+                                "[%s] Watchdog: %.0fs elapsed, progress: %d%%, still healthy",
+                                job_id,
+                                elapsed,
+                                current_progress[0],
+                            )
+                            last_log_time = elapsed
+
+                except asyncio.CancelledError:
+                    logger.debug("[%s] Watchdog cancelled normally", job_id)
+                    raise
+
+            watchdog_task = asyncio.create_task(enhanced_watchdog())
 
             logger.info(
                 "[%s] STEP 4: Starting FFmpeg (command: %s)",
