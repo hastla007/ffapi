@@ -3616,7 +3616,7 @@ async def _periodic_jobs_cleanup():
 
 
 async def _periodic_stuck_job_detector() -> None:
-    """Detect and mark jobs that are stuck in processing state."""
+    """Detect and mark jobs that are stuck in processing state, and kill their processes."""
     await asyncio.sleep(300)
 
     while True:
@@ -3629,26 +3629,80 @@ async def _periodic_stuck_job_detector() -> None:
             except HTTPException:
                 items = []
 
-            candidates: List[Tuple[str, float, bool]] = []
+            candidates: List[Tuple[str, float, bool, Any]] = []
             for job_id, data in items:
                 if data.get("status") != "processing":
                     continue
 
                 updated = data.get("updated", 0.0)
+                # Fix: Validate timestamp
+                if updated <= 0:
+                    updated = data.get("created", now)
+
                 elapsed = now - updated
+
+                # Fix: Sanity check on elapsed time
+                if elapsed > 86400 or elapsed < 0:
+                    logger.warning(
+                        "Job %s has invalid elapsed time %.0fs (now=%.0f, updated=%.0f)",
+                        job_id,
+                        elapsed,
+                        now,
+                        updated,
+                    )
+                    elapsed = 86400  # Treat as maximally stuck
+
                 with JOB_PROCESSES_LOCK:
-                    has_process = job_id in JOB_PROCESSES
+                    process_handle = JOB_PROCESSES.get(job_id)
+                has_process = process_handle is not None
+
+                # Fix: Get the actual process object
+                process = None
+                if has_process and process_handle is not None:
+                    process = getattr(process_handle, "process", process_handle)
 
                 is_stuck = elapsed > 600 or (not has_process and elapsed > 120)
                 if not is_stuck:
                     continue
 
-                candidates.append((job_id, elapsed, has_process))
+                candidates.append((job_id, elapsed, has_process, process))
 
             stuck_jobs: List[str] = []
             if candidates:
+                # Fix: Kill processes BEFORE marking as failed
+                for job_id, elapsed, had_process, process in candidates:
+                    if process is not None:
+                        try:
+                            logger.info("Terminating stuck job %s (no update for %.0fs)", job_id, elapsed)
+
+                            if isinstance(process, asyncio.subprocess.Process):
+                                if process.returncode is None:
+                                    process.terminate()
+                                    try:
+                                        await asyncio.wait_for(process.wait(), timeout=5)
+                                    except asyncio.TimeoutError:
+                                        process.kill()
+                                        try:
+                                            await asyncio.wait_for(process.wait(), timeout=1)
+                                        except asyncio.TimeoutError:
+                                            pass
+                            else:
+                                # subprocess.Popen process
+                                if getattr(process, "poll", lambda: None)() is None:
+                                    process.terminate()
+                                    try:
+                                        await asyncio.wait_for(
+                                            asyncio.to_thread(process.wait, timeout=5),
+                                            timeout=5,
+                                        )
+                                    except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+                                        process.kill()
+                        except Exception as exc:
+                            logger.warning("Failed to kill process for job %s: %s", job_id, exc)
+
+                # Then mark jobs as killed
                 async with safe_lock(JOBS_LOCK, timeout=5.0, operation="stuck_job_mark"):
-                    for job_id, elapsed, had_process in candidates:
+                    for job_id, elapsed, had_process, _process in candidates:
                         data = JOBS.get(job_id)
                         if not data or data.get("status") != "processing":
                             continue
@@ -3674,30 +3728,26 @@ async def _periodic_stuck_job_detector() -> None:
 
                         JOBS[job_id] = {
                             **data,
-                            "status": "failed",
-                            "progress": data.get("progress", 0),
+                            "status": "killed",
                             "message": message,
-                            "error": (
-                                f"No status update for {int(elapsed)}s"
-                                if had_process
-                                else f"Process ended with no update for {int(elapsed)}s"
-                            ),
+                            "error": f"No status update for {int(elapsed)}s",
                             "updated": now_mark,
                             "history": history,
                         }
                         stuck_jobs.append(job_id)
 
+                # Fix: Clean up process handles
+                with JOB_PROCESSES_LOCK:
+                    for job_id, _, _, _ in candidates:
+                        JOB_PROCESSES.pop(job_id, None)
+
             if stuck_jobs:
-                struct_logger.error(
-                    "stuck_jobs_detected",
-                    count=len(stuck_jobs),
-                    job_ids=stuck_jobs,
-                )
+                struct_logger.error("stuck_jobs_detected", count=len(stuck_jobs), job_ids=stuck_jobs)
 
         except Exception as exc:
             logger.error("Stuck job detector failed: %s", exc)
 
-        await asyncio.sleep(60)  # Check every minute instead of 5 minutes
+        await asyncio.sleep(60)
 
 async def _periodic_cache_cleanup():
     try:
