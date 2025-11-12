@@ -8473,7 +8473,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
         started=now,
     )
 
-    start = time.perf_counter()
+    start = time.time()
     struct_logger.info("job_started", job_id=job_id, job_type="ffmpeg_job")
 
     process_handle = JobProcessHandle()
@@ -8497,6 +8497,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
             input_paths: List[Path] = []
             total_inputs = max(len(job.task.inputs), 1)
+            logger.info("[%s] STEP 1: Starting input downloads", job_id)
             for index, input_spec in enumerate(job.task.inputs):
                 progress = 10 + int((index / total_inputs) * 40)
                 _update_ffmpeg_async_job(
@@ -8508,15 +8509,27 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 input_url = _normalize_media_url(str(input_spec.file_path))
                 ext = Path(urlparse(input_url).path).suffix or ".bin"
                 input_path = work / f"input_{index:03d}{ext}"
+                logger.info(
+                    "[%s] Downloading input %d/%d: %s",
+                    job_id,
+                    index + 1,
+                    len(job.task.inputs),
+                    input_url,
+                )
                 await _download_to(input_url, input_path, job.headers)
                 input_paths.append(input_path)
+                logger.info(
+                    "[%s] Downloaded input %d/%d", job_id, index + 1, len(job.task.inputs)
+                )
 
             _update_ffmpeg_async_job(
                 job_id,
                 progress=55,
                 message="Inputs downloaded",
             )
+            logger.info("[%s] STEP 2: All inputs downloaded", job_id)
 
+            logger.info("[%s] STEP 3: Building FFmpeg command", job_id)
             cmd = ["ffmpeg", "-y"]
             for index, input_spec in enumerate(job.task.inputs):
                 input_path = input_paths[index]
@@ -8592,7 +8605,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
                 if now - last_logged_time[0] >= 30:
                     logger.info(
-                        "Job %s still processing (progress: %d%%, elapsed: %.0fs)",
+                        "[%s] Still processing (progress: %d%%, elapsed: %.0fs)",
                         job_id,
                         current_progress[0],
                         now - start,
@@ -8605,9 +8618,9 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                         await asyncio.sleep(60)
                         elapsed = time.time() - start
                         logger.info(
-                            "Job %s watchdog: %d seconds elapsed, still processing",
+                            "[%s] Watchdog: %.0f seconds elapsed, still processing",
                             job_id,
-                            int(elapsed),
+                            elapsed,
                         )
                 except asyncio.CancelledError:
                     pass
@@ -8615,16 +8628,13 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
             watchdog_task = asyncio.create_task(watchdog())
 
             logger.info(
-                "Starting FFmpeg for job %s with command: %s",
+                "[%s] STEP 4: Starting FFmpeg (command: %s)",
                 job_id,
                 " ".join(cmd[:15]) + ("..." if len(cmd) > 15 else ""),
             )
 
             if _job_marked_killed(job_id):
-                logger.info(
-                    "FFmpeg job %s marked as killed before launching FFmpeg",
-                    job_id,
-                )
+                logger.info("[%s] Job killed before FFmpeg launch", job_id)
                 mark_killed("Killed before FFmpeg start", progress=current_progress[0])
                 watchdog_task.cancel()
                 try:
@@ -8654,7 +8664,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                     pass
 
             logger.info(
-                "FFmpeg completed for job %s with exit code %d (took %.1fs)",
+                "[%s] STEP 5: FFmpeg completed with exit code %d (took %.1fs)",
                 job_id,
                 code,
                 time.time() - start,
@@ -8665,7 +8675,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
             if code != 0:
                 if _job_marked_killed(job_id):
                     logger.info(
-                        "FFmpeg job %s marked as killed after exit code %d",
+                        "[%s] Job killed after FFmpeg exit code %d",
                         job_id,
                         code,
                     )
@@ -8687,11 +8697,12 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 )
                 return
 
+            logger.info(f"[{job_id}] STEP 6: Checking output files")
             missing_outputs = [p for p in output_paths if not p.exists()]
             if missing_outputs:
                 if _job_marked_killed(job_id):
                     logger.info(
-                        "FFmpeg job %s marked as killed while checking outputs",
+                        "[%s] Job killed while checking outputs",
                         job_id,
                     )
                     mark_killed("Killed while checking outputs")
@@ -8713,7 +8724,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 return
 
             if _job_marked_killed(job_id):
-                logger.info("FFmpeg job %s marked as killed before publishing outputs", job_id)
+                logger.info("[%s] Job killed before publishing outputs", job_id)
                 mark_killed("Killed before publishing outputs", progress=current_progress[0])
                 return
 
@@ -8724,16 +8735,47 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
             )
 
             published_outputs: Dict[str, str] = {}
-            for output_path in output_paths:
-                pub = await publish_file(output_path, output_path.suffix or ".bin")
+            logger.info("[%s] STEP 7: Publishing outputs", job_id)
+            for idx, output_path in enumerate(output_paths):
+                logger.info(
+                    "[%s] Publishing output %d/%d: %s",
+                    job_id,
+                    idx + 1,
+                    len(output_paths),
+                    output_path.name,
+                )
+                try:
+                    pub = await asyncio.wait_for(
+                        publish_file(output_path, output_path.suffix or ".bin"),
+                        timeout=180,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "[%s] TIMEOUT publishing output %s after 3 minutes",
+                        job_id,
+                        output_path.name,
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Timeout publishing {output_path.name}",
+                    )
                 published_outputs[output_path.name] = pub["url"]
-                logger.info("Published output: %s -> %s", output_path.name, pub["rel"])
+                logger.info(
+                    "[%s] Published output %d/%d: %s -> %s",
+                    job_id,
+                    idx + 1,
+                    len(output_paths),
+                    output_path.name,
+                    pub["rel"],
+                )
 
-            duration_ms = (time.perf_counter() - start) * 1000.0
+            logger.info("[%s] STEP 8: All outputs published successfully", job_id)
+            duration_ms = (time.time() - start) * 1000.0
             if _job_marked_killed(job_id):
-                logger.info("FFmpeg job %s completed after being killed", job_id)
+                logger.info("[%s] Job completed but was killed", job_id)
                 mark_killed("Killed after publishing outputs")
                 return
+            logger.info("[%s] STEP 9: Updating job to finished status", job_id)
             _update_ffmpeg_async_job(
                 job_id,
                 progress=100,
@@ -8742,6 +8784,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 result={"outputs": published_outputs},
                 duration_ms=duration_ms,
             )
+            logger.info("[%s] STEP 10: Job marked as finished", job_id)
             struct_logger.info(
                 "job_completed",
                 job_id=job_id,
@@ -8751,13 +8794,13 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
     except HTTPException as exc:
         if _job_marked_killed(job_id):
-            logger.info("FFmpeg job %s failed after kill: %s", job_id, exc)
+            logger.info("[%s] Job failed after kill: %s", job_id, exc)
             mark_killed("Killed")
             return
 
         detail = exc.detail if isinstance(exc.detail, (str, dict)) else str(exc.detail)
         status_code = exc.status_code if hasattr(exc, "status_code") else 500
-        logger.error("Async FFmpeg job %s failed with HTTP error: %s", job_id, detail)
+        logger.error("[%s] Async FFmpeg job failed with HTTP error: %s", job_id, detail)
         _update_ffmpeg_async_job(
             job_id,
             progress=100,
@@ -8777,11 +8820,11 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
     except Exception as exc:
         if _job_marked_killed(job_id):
-            logger.info("FFmpeg job %s stopped after kill: %s", job_id, exc)
+            logger.info("[%s] Job stopped after kill: %s", job_id, exc)
             mark_killed("Killed")
             return
 
-        logger.exception("Async FFmpeg job %s failed", job_id)
+        logger.exception("[%s] Async FFmpeg job failed", job_id)
         _update_ffmpeg_async_job(
             job_id,
             progress=100,
@@ -8797,8 +8840,10 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
         )
         return
     finally:
+        logger.info(f"[{job_id}] CLEANUP: Removing from JOB_PROCESSES")
         with JOB_PROCESSES_LOCK:
             JOB_PROCESSES.pop(job_id, None)
+        logger.info(f"[{job_id}] CLEANUP: Complete")
 
 # ---------- audio endpoints ----------
 
