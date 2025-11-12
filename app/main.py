@@ -3097,6 +3097,11 @@ async def run_ffmpeg_with_timeout(
                             pass
             return _interpret_return_code(return_code)
         except asyncio.TimeoutError:
+            logger.error(
+                "FFmpeg process timed out after %d seconds for command: %s",
+                FFMPEG_TIMEOUT_SECONDS,
+                " ".join(cmd[:10]),
+            )
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
@@ -3186,6 +3191,11 @@ async def run_ffmpeg_with_timeout(
             )
             return _interpret_return_code(return_code)
         except subprocess.TimeoutExpired:
+            logger.error(
+                "FFmpeg process timed out after %d seconds for command: %s",
+                FFMPEG_TIMEOUT_SECONDS,
+                " ".join(cmd[:10]),
+            )
             proc_sync.terminate()
             try:
                 await asyncio.wait_for(
@@ -8031,8 +8041,49 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 progress=60,
                 message="Processing with FFmpeg",
             )
-            with log_path.open("w", encoding="utf-8", errors="ignore") as lf:
-                code = await run_ffmpeg_with_timeout(cmd, lf)
+            reporter = JobProgressReporter(job_id)
+            last_update = [60]
+
+            def simple_progress_parser(line: str) -> None:
+                match = re.search(r"time=(\d+):(\d+):(\d+)", line)
+                if not match:
+                    return
+
+                current = last_update[0]
+                if current >= 95:
+                    return
+
+                new_progress = min(95, current + 5)
+                if new_progress > current:
+                    reporter.update(
+                        new_progress,
+                        "Processing with FFmpeg",
+                        detail=line[:100],
+                    )
+                    last_update[0] = new_progress
+
+            logger.info(
+                "Starting FFmpeg execution for job %s with command: %s",
+                job_id,
+                " ".join(cmd[:10]),
+            )
+            with log_path.open(
+                "w",
+                encoding="utf-8",
+                errors="ignore",
+                buffering=1,
+            ) as lf:
+                code = await run_ffmpeg_with_timeout(
+                    cmd,
+                    lf,
+                    progress_parser=simple_progress_parser,
+                )
+
+            logger.info(
+                "FFmpeg execution completed for job %s with exit code: %d",
+                job_id,
+                code,
+            )
 
             save_log(log_path, "ffmpeg-job-async")
 
