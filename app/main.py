@@ -894,12 +894,14 @@ class UIAuthManager:
         hashed = self._hash_backup_code(normalized)
         with self._lock:
             entry = self._backup_codes.get(hashed)
-            if not entry or entry["used"]:
-                return False
-            entry["used"] = True
-            self._backup_codes[hashed] = entry
-            self._totp_attempts.pop(self.username, None)
-        return True
+            is_valid = entry is not None and not entry.get("used", True)
+
+            if is_valid:
+                entry["used"] = True
+                self._backup_codes[hashed] = entry
+                self._totp_attempts.pop(self.username, None)
+
+            return is_valid
 
     def pop_pending_backup_codes(self) -> List[str]:
         with self._lock:
@@ -2356,33 +2358,36 @@ def _drain_job_progress(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _merge_job_progress(job_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    snapshot = _get_progress_snapshot(job_id)
-    if snapshot is None:
-        return dict(data)
+    """Best-effort merge of cached progress data into a job record."""
 
-    merged = dict(data)
-    progress = snapshot.get("progress")
-    message = snapshot.get("message")
-    detail = snapshot.get("detail")
-    ffmpeg_stats = snapshot.get("ffmpeg_stats")
-    updated_ts = snapshot.get("updated")
-    history = list(merged.get("history", []))
-    history.extend(snapshot.get("history", []))
-    if len(history) > JOB_HISTORY_LIMIT:
-        history = history[-JOB_HISTORY_LIMIT:]
+    with JOB_PROGRESS_LOCK:
+        snapshot = JOB_PROGRESS.get(job_id)
+        if snapshot is None:
+            return dict(data)
 
-    if progress is not None:
-        merged["progress"] = progress
-    if message is not None:
-        merged["message"] = message
-    if detail is not None:
-        merged["detail"] = detail
-    if ffmpeg_stats is not None:
-        merged["ffmpeg_stats"] = ffmpeg_stats
-    if updated_ts is not None:
-        merged["updated"] = updated_ts
-    merged["history"] = history
-    return merged
+        merged = dict(data)
+        progress = snapshot.get("progress")
+        message = snapshot.get("message")
+        detail = snapshot.get("detail")
+        ffmpeg_stats = snapshot.get("ffmpeg_stats")
+        updated_ts = snapshot.get("updated")
+        history = list(merged.get("history", []))
+        history.extend(snapshot.get("history", []))
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+
+        if progress is not None:
+            merged["progress"] = progress
+        if message is not None:
+            merged["message"] = message
+        if detail is not None:
+            merged["detail"] = detail
+        if ffmpeg_stats is not None:
+            merged["ffmpeg_stats"] = ffmpeg_stats
+        if updated_ts is not None:
+            merged["updated"] = updated_ts
+        merged["history"] = history
+        return merged
 
 
 class JobProgressReporter:
@@ -6212,6 +6217,10 @@ def _normalize_media_url(url: str) -> str:
     double_proxy = f"{proxy_base}/{proxy_base}"
 
     def _bounded_replace(value: str, prefix: str, replacement: str, label: str) -> str:
+        if replacement.startswith(prefix):
+            raise ValueError(
+                f"Replacement '{replacement}' cannot start with prefix '{prefix}'"
+            )
         max_iterations = 10
         iterations = 0
         while value.startswith(prefix):
@@ -8597,19 +8606,20 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 message="Processing with FFmpeg",
             )
 
-            last_update_time = [time.time()]
-            current_progress = [60]
-            last_logged_time = [time.time()]
+            last_update_time = time.time()
+            current_progress = 60
+            last_logged_time = time.time()
 
             def smart_progress_updater(line: str) -> None:
                 """Update progress based on time elapsed and FFmpeg metrics."""
 
+                nonlocal last_update_time, current_progress, last_logged_time
                 now = time.time()
 
-                if now - last_update_time[0] >= 3:
-                    if current_progress[0] < 95:
-                        increment = 2 if current_progress[0] < 80 else 1
-                        current_progress[0] = min(95, current_progress[0] + increment)
+                if now - last_update_time >= 3:
+                    if current_progress < 95:
+                        increment = 2 if current_progress < 80 else 1
+                        current_progress = min(95, current_progress + increment)
 
                     metrics: Dict[str, str] = {}
                     detail_parts: List[str] = []
@@ -8639,21 +8649,21 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
                     _update_ffmpeg_async_job(
                         job_id,
-                        progress=current_progress[0],
+                        progress=current_progress,
                         message="Processing with FFmpeg",
                         detail=detail,
                         ffmpeg_stats=metrics or None,
                     )
-                    last_update_time[0] = now
+                    last_update_time = now
 
-                if now - last_logged_time[0] >= 30:
+                if now - last_logged_time >= 30:
                     logger.info(
                         "[%s] Still processing (progress: %d%%, elapsed: %.0fs)",
                         job_id,
-                        current_progress[0],
+                        current_progress,
                         now - start,
                     )
-                    last_logged_time[0] = now
+                    last_logged_time = now
 
             async def enhanced_watchdog() -> None:
                 """Monitor job health, enforce timeout, and handle kill signals."""
@@ -8732,7 +8742,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                                 "[%s] Watchdog: %.0fs elapsed, progress: %d%%, still healthy",
                                 job_id,
                                 elapsed,
-                                current_progress[0],
+                                current_progress,
                             )
                             last_log_elapsed = elapsed
 
@@ -8750,7 +8760,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
             if _job_marked_killed(job_id):
                 logger.info("[%s] Job killed before FFmpeg launch", job_id)
-                mark_killed("Killed before FFmpeg start", progress=current_progress[0])
+                mark_killed("Killed before FFmpeg start", progress=current_progress)
                 watchdog_task.cancel()
                 try:
                     await watchdog_task
@@ -8794,7 +8804,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                         job_id,
                         code,
                     )
-                    mark_killed("Killed after FFmpeg", progress=current_progress[0])
+                    mark_killed("Killed after FFmpeg", progress=current_progress)
                     return
                 error_text = log_path.read_text(encoding="utf-8", errors="ignore")
                 _update_ffmpeg_async_job(
@@ -8840,7 +8850,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
             if _job_marked_killed(job_id):
                 logger.info("[%s] Job killed before publishing outputs", job_id)
-                mark_killed("Killed before publishing outputs", progress=current_progress[0])
+                mark_killed("Killed before publishing outputs", progress=current_progress)
                 return
 
             _update_ffmpeg_async_job(
