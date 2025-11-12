@@ -1,5 +1,5 @@
 import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit, hmac, hashlib, secrets, base64, struct, math, ipaddress
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict, deque, OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
@@ -10,6 +10,7 @@ from urllib.parse import urlencode, quote, parse_qs, urlparse
 from uuid import uuid4
 
 import re
+import signal
 import threading
 
 try:  # pragma: no cover - structlog may be unavailable in minimal environments
@@ -115,6 +116,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+from starlette.datastructures import FormData
 
 from fastapi_csrf_protect import CsrfProtect, CsrfProtectException
 try:  # pragma: no cover - optional dependency for QR generation
@@ -276,8 +278,49 @@ VIDEO_THUMBNAIL_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 THUMBNAIL_DIR_NAME = "thumbnails"
 JOB_HISTORY_LIMIT = 20
 PROBE_CACHE_TTL = 3600
-PROBE_CACHE: Dict[str, Tuple[dict, float]] = {}
+PROBE_CACHE_MAX_SIZE = 1000
 PROBE_CACHE_LOCK = threading.Lock()
+
+
+class LRUCache:
+    def __init__(self, max_size: int = 1000, ttl: int = 3600) -> None:
+        self._cache: "OrderedDict[str, Tuple[dict, float]]" = OrderedDict()
+        self._max_size = max(0, max_size)
+        self._ttl = max(0, ttl)
+
+    def get(self, key: str) -> Optional[Tuple[dict, float]]:
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        value, timestamp = entry
+        if self._ttl and time.time() - timestamp >= self._ttl:
+            self._cache.pop(key, None)
+            return None
+        self._cache.move_to_end(key)
+        return value, timestamp
+
+    def set(self, key: str, value: dict) -> None:
+        self._cache[key] = (value, time.time())
+        self._cache.move_to_end(key)
+        if self._max_size and len(self._cache) > self._max_size:
+            self._cache.popitem(last=False)
+
+    def cleanup_expired(self) -> int:
+        if not self._ttl:
+            return 0
+        cutoff = time.time() - self._ttl
+        removed = 0
+        for cache_key, (_, timestamp) in list(self._cache.items()):
+            if timestamp < cutoff:
+                self._cache.pop(cache_key, None)
+                removed += 1
+        return removed
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+
+PROBE_CACHE = LRUCache(max_size=PROBE_CACHE_MAX_SIZE, ttl=PROBE_CACHE_TTL)
 
 
 # ========== GPU Acceleration Helpers ==========
@@ -289,7 +332,7 @@ class GPUState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._runtime_disabled = False
-        self._filter_fallback_warned = False
+        self._filter_fallback_warned_at: Optional[float] = None
 
     def disable_runtime(self) -> None:
         with self._lock:
@@ -301,10 +344,14 @@ class GPUState:
 
     def should_warn_filter_fallback(self) -> bool:
         with self._lock:
-            if self._filter_fallback_warned:
-                return False
-            self._filter_fallback_warned = True
-            return True
+            now = time.time()
+            if self._filter_fallback_warned_at is None:
+                self._filter_fallback_warned_at = now
+                return True
+            if now - self._filter_fallback_warned_at >= 600:
+                self._filter_fallback_warned_at = now
+                return True
+            return False
 
 
 GPU_STATE = GPUState()
@@ -2596,11 +2643,9 @@ async def csrf_middleware(request: Request, call_next):
             csrf_protect.validate_csrf(token, cookie_token)
         except CsrfProtectException as exc:
             return JSONResponse({"detail": exc.message}, status_code=exc.status_code)
-
-        async def receive():
-            return {"type": "http.request", "body": body_bytes, "more_body": False}
-
-        request._receive = receive
+        if parsed:
+            form_items = [(key, value) for key, values in parsed.items() for value in values]
+            request._form = FormData(form_items)
     response = await call_next(request)
     token_to_set = getattr(request.state, "_csrf_token_to_set", None)
     if token_to_set:
@@ -2920,31 +2965,58 @@ async def stream_upload_to_path(upload: UploadFile, dest: Path) -> int:
                     MAX_FILE_SIZE_BYTES,
                 )
                 raise HTTPException(status_code=413, detail="File too large")
+    temp_dest = dest.with_name(dest.name + ".partial")
+    space_check_interval = 64 * 1024 * 1024
+    last_space_check = 0
     try:
-        with dest.open("wb") as buffer:
-            while chunk := await upload.read(UPLOAD_CHUNK_SIZE):
-                total += len(chunk)
-                if total > MAX_FILE_SIZE_BYTES:
+        with temp_dest.open("wb") as buffer:
+            while True:
+                chunk = await upload.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                chunk_len = len(chunk)
+                if total + chunk_len > MAX_FILE_SIZE_BYTES:
                     logger.warning("Upload exceeded max size: %s", upload.filename)
                     _flush_logs()
                     raise HTTPException(status_code=413, detail="File too large")
                 buffer.write(chunk)
+                total += chunk_len
+                if total - last_space_check >= space_check_interval:
+                    try:
+                        check_disk_space(temp_dest.parent)
+                    except HTTPException:
+                        raise
+                    last_space_check = total
     except HTTPException:
-        if dest.exists():
+        if temp_dest.exists():
             try:
-                dest.unlink()
+                temp_dest.unlink()
             except Exception as exc:
-                logger.warning("Failed cleaning partial upload %s: %s", dest, exc)
+                logger.warning("Failed cleaning partial upload %s: %s", temp_dest, exc)
         raise
     except Exception as exc:
-        if dest.exists():
+        if temp_dest.exists():
             try:
-                dest.unlink()
+                temp_dest.unlink()
             except Exception as cleanup_exc:
-                logger.warning("Failed removing incomplete upload %s: %s", dest, cleanup_exc)
+                logger.warning("Failed removing incomplete upload %s: %s", temp_dest, cleanup_exc)
         logger.error("Failed to persist upload %s: %s", upload.filename, exc)
         _flush_logs()
         raise HTTPException(status_code=500, detail="Failed to save upload") from exc
+    else:
+        try:
+            if dest.exists():
+                dest.unlink()
+            temp_dest.replace(dest)
+        except Exception as exc:
+            if temp_dest.exists():
+                try:
+                    temp_dest.unlink()
+                except Exception:
+                    pass
+            logger.error("Failed to finalize upload %s: %s", upload.filename, exc)
+            _flush_logs()
+            raise HTTPException(status_code=500, detail="Failed to finalize upload") from exc
     return total
 
 
@@ -3142,9 +3214,7 @@ async def run_ffmpeg_with_timeout(
 
     async def _run_with_subprocess_fallback(launch_error: Optional[Exception] = None) -> int:
         try:
-            proc_sync = await asyncio.to_thread(
-                subprocess.Popen,
-                cmd,
+            popen_kwargs = dict(
                 stdin=subprocess.DEVNULL,
                 stdout=log_handle if hasattr(log_handle, "write") else subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -3152,6 +3222,14 @@ async def run_ffmpeg_with_timeout(
                 encoding="utf-8",
                 errors="ignore",
                 bufsize=1,
+            )
+            if os.name != "nt":
+                popen_kwargs["preexec_fn"] = _child_setup
+
+            proc_sync = await asyncio.to_thread(
+                subprocess.Popen,
+                cmd,
+                **popen_kwargs,
             )
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.error("Failed to launch ffmpeg command %s: %s", cmd, exc)
@@ -3229,12 +3307,21 @@ async def run_ffmpeg_with_timeout(
 
         return _interpret_return_code(0)
 
+    def _child_setup() -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    subprocess_kwargs: Dict[str, Any] = {
+        "stdin": asyncio.subprocess.DEVNULL,
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+    if os.name != "nt":
+        subprocess_kwargs["preexec_fn"] = _child_setup
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            **subprocess_kwargs,
         )
     except AttributeError as attr_error:
         return _interpret_return_code(await _run_with_subprocess_fallback(attr_error))
@@ -3255,6 +3342,9 @@ async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
     thumb_dir = video_path.parent / THUMBNAIL_DIR_NAME
     try:
         thumb_dir.mkdir(parents=True, exist_ok=True)
+    except FileNotFoundError as exc:
+        logger.debug("Parent directory missing for thumbnail %s: %s", video_path, exc)
+        return None
     except Exception as exc:
         logger.debug("Unable to create thumbnail directory %s: %s", thumb_dir, exc)
         return None
@@ -3427,16 +3517,10 @@ async def _periodic_cache_cleanup():
         raise
     while True:
         try:
-            cutoff = time.time() - PROBE_CACHE_TTL
-            expired: List[str] = []
             with PROBE_CACHE_LOCK:
-                for key, (_, timestamp) in list(PROBE_CACHE.items()):
-                    if timestamp < cutoff:
-                        expired.append(key)
-                for key in expired:
-                    PROBE_CACHE.pop(key, None)
-            if expired:
-                logger.info("Cleaned %d expired probe cache entries", len(expired))
+                removed = PROBE_CACHE.cleanup_expired()
+            if removed:
+                logger.info("Cleaned %d expired probe cache entries", removed)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -4914,13 +4998,15 @@ async def settings_login(request: Request):
                 )
         token = UI_AUTH.create_session()
         response = RedirectResponse(url=next_path, status_code=303)
+        cookie_is_secure = request.url.scheme == "https"
+        samesite_policy = "strict" if cookie_is_secure else "lax"
         response.set_cookie(
             SESSION_COOKIE_NAME,
             token,
             max_age=SESSION_TTL_SECONDS,
             httponly=True,
-            samesite="lax",
-            secure=request.url.scheme == "https",
+            samesite=samesite_policy,
+            secure=cookie_is_secure,
         )
         return response
 
@@ -6007,23 +6093,42 @@ def _normalize_media_url(url: str) -> str:
     double_prefix = f"{proxy_base}/{localhost_base}"
     double_proxy = f"{proxy_base}/{proxy_base}"
 
-    while normalized.startswith(double_proxy):
-        normalized = proxy_base + normalized[len(double_proxy) :]
+    def _bounded_replace(value: str, prefix: str, replacement: str, label: str) -> str:
+        max_iterations = 10
+        iterations = 0
+        while value.startswith(prefix):
+            value = replacement + value[len(prefix) :]
+            iterations += 1
+            if iterations >= max_iterations:
+                logger.warning("URL normalization hit max iterations (%s): %s", label, url)
+                break
+        return value
 
-    while normalized.startswith(double_prefix):
-        normalized = proxy_base + normalized[len(double_prefix) :]
+    normalized = _bounded_replace(normalized, double_proxy, proxy_base, "double-proxy")
+
+    normalized = _bounded_replace(normalized, double_prefix, proxy_base, "proxy-prefix")
 
     if normalized.startswith(localhost_base):
         normalized = proxy_base + normalized[len(localhost_base) :]
 
     proxy_http_prefix = f"{proxy_base}/http://"
-    while normalized.startswith(proxy_http_prefix):
-        normalized = normalized[len(proxy_base) + 1 :]
+    normalized = _bounded_replace(
+        normalized,
+        proxy_http_prefix,
+        "http://",
+        "proxy-http",
+    )
 
     if normalized.startswith("http://"):
         rest = normalized[len("http://") :]
+        max_repeats = 10
+        repeats = 0
         while rest.startswith("http://"):
             rest = rest[len("http://") :]
+            repeats += 1
+            if repeats >= max_repeats:
+                logger.warning("URL normalization trimmed repeated scheme %s times: %s", repeats, url)
+                break
         normalized = "http://" + rest
 
     parsed = urlparse(normalized)
@@ -6088,6 +6193,8 @@ async def _download_to(
                         _flush_logs()
                     existing_size = 0
 
+                downloaded = existing_size
+                wrote_data = False
                 use_resume = can_resume and existing_size > 0
 
                 if use_resume:
@@ -6142,6 +6249,7 @@ async def _download_to(
                                     ) from cleanup_exc
                             mode = "wb"
                             existing_size = 0
+                            downloaded = 0
                             can_resume = False
                         else:
                             logger.error(
@@ -6177,14 +6285,18 @@ async def _download_to(
                         )
                     check_disk_space(dest.parent, required_mb=required_mb)
 
-                    downloaded = existing_size
                     last_log = downloaded
+                    space_check_interval = 64 * 1024 * 1024
+                    last_space_check = downloaded
+                    periodic_required_mb = required_mb
 
                     with dest.open(mode) as f:
                         async for chunk in r.aiter_bytes(chunk_size):
                             if chunk:
+                                chunk_len = len(chunk)
                                 f.write(chunk)
-                                downloaded += len(chunk)
+                                downloaded += chunk_len
+                                wrote_data = True
 
                                 if downloaded - last_log >= 50 * 1024 * 1024:
                                     if total_size:
@@ -6199,6 +6311,32 @@ async def _download_to(
                                         logger.info("Downloaded: %.0fMB", downloaded / 1024 / 1024)
                                     last_log = downloaded
 
+                                if downloaded - last_space_check >= space_check_interval:
+                                    if total_size:
+                                        remaining = total_size - downloaded
+                                        if remaining < 0:
+                                            remaining = 0
+                                        remaining_mb = (remaining + 1024 * 1024 - 1) // (
+                                            1024 * 1024
+                                        )
+                                        new_required = max(
+                                            MIN_FREE_SPACE_MB,
+                                            MIN_FREE_SPACE_MB + remaining_mb,
+                                        )
+                                        periodic_required_mb = max(
+                                            periodic_required_mb,
+                                            new_required,
+                                        )
+                                    else:
+                                        periodic_required_mb = MIN_FREE_SPACE_MB
+                                    try:
+                                        check_disk_space(
+                                            dest.parent, required_mb=periodic_required_mb
+                                        )
+                                    except HTTPException:
+                                        raise
+                                    last_space_check = downloaded
+
                     if total_size and downloaded != total_size:
                         raise Exception(
                             f"Download incomplete: got {downloaded} bytes, expected {total_size}"
@@ -6210,6 +6348,16 @@ async def _download_to(
                     return
 
             except HTTPException:
+                remove_partial = not use_resume or wrote_data
+                if remove_partial and dest.exists():
+                    try:
+                        dest.unlink()
+                    except Exception as cleanup_exc:
+                        logger.warning(
+                            "Failed removing incomplete download %s: %s",
+                            dest,
+                            cleanup_exc,
+                        )
                 raise
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -7951,33 +8099,37 @@ def _update_ffmpeg_async_job(
     **extra: Any,
 ) -> None:
     with JOBS_LOCK:
-        existing = JOBS.get(job_id, {})
-        created = existing.get("created", time.time())
-        history = list(existing.get("history", []))
-        if progress is not None or message is not None:
-            history.append(
-                {
-                    "timestamp": time.time(),
-                    "progress": progress if progress is not None else existing.get("progress", 0),
-                    "message": message if message is not None else existing.get("message", ""),
-                }
-            )
-            if len(history) > JOB_HISTORY_LIMIT:
-                history = history[-JOB_HISTORY_LIMIT:]
+        existing = dict(JOBS.get(job_id, {}))
 
-        updated: Dict[str, Any] = {
-            **existing,
-            "created": created,
-            "updated": time.time(),
-            "history": history,
-        }
-        if progress is not None:
-            updated["progress"] = progress
-        if message is not None:
-            updated["message"] = message
-        if status is not None:
-            updated["status"] = status
-        updated.update(extra)
+    timestamp = time.time()
+    created = existing.get("created", timestamp)
+    history = list(existing.get("history", []))
+    if progress is not None or message is not None:
+        history.append(
+            {
+                "timestamp": timestamp,
+                "progress": progress if progress is not None else existing.get("progress", 0),
+                "message": message if message is not None else existing.get("message", ""),
+            }
+        )
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+
+    updated: Dict[str, Any] = {
+        **existing,
+        "created": created,
+        "updated": timestamp,
+        "history": history,
+    }
+    if progress is not None:
+        updated["progress"] = progress
+    if message is not None:
+        updated["message"] = message
+    if status is not None:
+        updated["status"] = status
+    updated.update(extra)
+
+    with JOBS_LOCK:
         JOBS[job_id] = updated
 
 
@@ -8538,15 +8690,13 @@ def probe_from_urls(job: ProbeUrlJob):
     }
     cache_key = _probe_cache_key(str(job.url), cache_params)
     cached: Optional[Tuple[dict, float]] = None
-    now = time.time()
     if PROBE_CACHE_TTL > 0:
         with PROBE_CACHE_LOCK:
             cached = PROBE_CACHE.get(cache_key)
     if cached is not None:
-        result, timestamp = cached
-        if now - timestamp < PROBE_CACHE_TTL:
-            logger.info("Probe cache hit for %s", job.url)
-            return result
+        result, _timestamp = cached
+        logger.info("Probe cache hit for %s", job.url)
+        return result
 
     cmd = _ffprobe_cmd_base(
         job.show_format,
@@ -8584,7 +8734,7 @@ def probe_from_urls(job: ProbeUrlJob):
 
     if PROBE_CACHE_TTL > 0:
         with PROBE_CACHE_LOCK:
-            PROBE_CACHE[cache_key] = (result, time.time())
+            PROBE_CACHE.set(cache_key, result)
         logger.info("Probe result cached for %s", job.url)
     return result
 
