@@ -262,6 +262,8 @@ JOBS: Dict[str, Dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
 JOB_PROCESSES: Dict[str, Any] = {}
 JOB_PROCESSES_LOCK = threading.Lock()
+JOB_PROGRESS: Dict[str, Dict[str, Any]] = {}
+JOB_PROGRESS_LOCK = threading.Lock()
 SETTINGS_LOCK = threading.Lock()
 TEMPO_HISTORY: Deque[Dict[str, Any]] = deque(maxlen=200)
 TEMPO_HISTORY_LOCK = threading.Lock()
@@ -2306,17 +2308,22 @@ def cleanup_old_jobs(max_age_seconds: int = 3600, max_total_jobs: int = 1000) ->
             if created is None:
                 to_remove.append(job_id)
                 continue
-            if status in {"finished", "failed"} and created < cutoff:
+            if status in {"finished", "failed", "killed"} and created < cutoff:
+                to_remove.append(job_id)
+            elif status == "processing" and created < (cutoff - 86400):
+                logger.warning("Removing ancient stuck job %s", job_id)
                 to_remove.append(job_id)
         for job_id in to_remove:
             JOBS.pop(job_id, None)
+            with JOB_PROGRESS_LOCK:
+                JOB_PROGRESS.pop(job_id, None)
 
         if max_total_jobs > 0 and len(JOBS) > max_total_jobs:
             finished_jobs = sorted(
                 (
                     (job_id, data.get("created", 0.0))
                     for job_id, data in JOBS.items()
-                    if data.get("status") in {"finished", "failed"}
+                    if data.get("status") in {"finished", "failed", "killed"}
                 ),
                 key=lambda item: item[1] or 0.0,
             )
@@ -2325,7 +2332,57 @@ def cleanup_old_jobs(max_age_seconds: int = 3600, max_total_jobs: int = 1000) ->
                 if excess <= 0:
                     break
                 JOBS.pop(job_id, None)
+                with JOB_PROGRESS_LOCK:
+                    JOB_PROGRESS.pop(job_id, None)
                 excess -= 1
+
+
+def _get_progress_snapshot(job_id: str) -> Optional[Dict[str, Any]]:
+    with JOB_PROGRESS_LOCK:
+        snapshot = JOB_PROGRESS.get(job_id)
+        if snapshot is None:
+            return None
+        history = list(snapshot.get("history", []))
+        return {**snapshot, "history": history}
+
+
+def _drain_job_progress(job_id: str) -> Optional[Dict[str, Any]]:
+    with JOB_PROGRESS_LOCK:
+        snapshot = JOB_PROGRESS.pop(job_id, None)
+        if snapshot is None:
+            return None
+        history = list(snapshot.get("history", []))
+        return {**snapshot, "history": history}
+
+
+def _merge_job_progress(job_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot = _get_progress_snapshot(job_id)
+    if snapshot is None:
+        return dict(data)
+
+    merged = dict(data)
+    progress = snapshot.get("progress")
+    message = snapshot.get("message")
+    detail = snapshot.get("detail")
+    ffmpeg_stats = snapshot.get("ffmpeg_stats")
+    updated_ts = snapshot.get("updated")
+    history = list(merged.get("history", []))
+    history.extend(snapshot.get("history", []))
+    if len(history) > JOB_HISTORY_LIMIT:
+        history = history[-JOB_HISTORY_LIMIT:]
+
+    if progress is not None:
+        merged["progress"] = progress
+    if message is not None:
+        merged["message"] = message
+    if detail is not None:
+        merged["detail"] = detail
+    if ffmpeg_stats is not None:
+        merged["ffmpeg_stats"] = ffmpeg_stats
+    if updated_ts is not None:
+        merged["updated"] = updated_ts
+    merged["history"] = history
+    return merged
 
 
 class JobProgressReporter:
@@ -2342,32 +2399,36 @@ class JobProgressReporter:
         clamped = max(0, min(100, int(percent)))
         now = time.time()
         with JOBS_LOCK:
-            data = JOBS.get(self.job_id)
-            if not data or data.get("status") not in {"queued", "processing"}:
-                return
-            updated = dict(data)
-            updated["progress"] = clamped
-            updated["message"] = message
-            if detail is not None:
-                updated["detail"] = detail
-            if ffmpeg_stats:
-                updated["ffmpeg_stats"] = ffmpeg_stats
+            status = JOBS.get(self.job_id, {}).get("status")
+        if status not in {"queued", "processing"}:
+            return
 
-            history = list(updated.get("history", []))
-            history_entry = {
-                "timestamp": now,
-                "progress": clamped,
-                "message": message,
-            }
-            if ffmpeg_stats:
-                history_entry["ffmpeg"] = ffmpeg_stats
+        history_entry: Dict[str, Any] = {
+            "timestamp": now,
+            "progress": clamped,
+            "message": message,
+        }
+        if ffmpeg_stats:
+            history_entry["ffmpeg"] = ffmpeg_stats
 
+        with JOB_PROGRESS_LOCK:
+            snapshot = dict(JOB_PROGRESS.get(self.job_id, {}))
+            history = list(snapshot.get("history", []))
             history.append(history_entry)
             if len(history) > JOB_HISTORY_LIMIT:
                 history = history[-JOB_HISTORY_LIMIT:]
-            updated["history"] = history
+
+            updated = dict(snapshot)
+            updated["progress"] = clamped
+            updated["message"] = message
             updated["updated"] = now
-            JOBS[self.job_id] = updated
+            updated["history"] = history
+            if detail is not None:
+                updated["detail"] = detail
+            if ffmpeg_stats is not None:
+                updated["ffmpeg_stats"] = ffmpeg_stats
+
+            JOB_PROGRESS[self.job_id] = updated
 
 
 class FFmpegProgressParser:
@@ -3553,6 +3614,7 @@ async def _periodic_jobs_cleanup():
             raise
 
 
+
 async def _periodic_stuck_job_detector() -> None:
     """Detect and mark jobs that are stuck in processing state."""
     await asyncio.sleep(300)
@@ -3560,36 +3622,70 @@ async def _periodic_stuck_job_detector() -> None:
     while True:
         try:
             now = time.time()
-            stuck_jobs: List[str] = []
-
+            items: List[Tuple[str, Dict[str, Any]]] = []
             try:
                 async with safe_lock(JOBS_LOCK, timeout=5.0, operation="stuck_job_scan"):
                     items = list(JOBS.items())
-                    for job_id, data in items:
-                        if data.get("status") != "processing":
+            except HTTPException:
+                items = []
+
+            candidates: List[Tuple[str, float, bool]] = []
+            for job_id, data in items:
+                if data.get("status") != "processing":
+                    continue
+
+                updated = data.get("updated", 0.0)
+                elapsed = now - updated
+                with JOB_PROCESSES_LOCK:
+                    has_process = job_id in JOB_PROCESSES
+
+                is_stuck = elapsed > 600 or (not has_process and elapsed > 120)
+                if not is_stuck:
+                    continue
+
+                candidates.append((job_id, elapsed, has_process))
+
+            stuck_jobs: List[str] = []
+            if candidates:
+                async with safe_lock(JOBS_LOCK, timeout=5.0, operation="stuck_job_mark"):
+                    for job_id, elapsed, had_process in candidates:
+                        data = JOBS.get(job_id)
+                        if not data or data.get("status") != "processing":
                             continue
 
-                        updated = data.get("updated", 0)
-                        if now - updated <= 600:
-                            continue
+                        now_mark = time.time()
+                        message = "Job stuck - auto-failed by watchdog"
+                        if not had_process:
+                            message = "Job stuck - process ended with no status update"
 
-                        stuck_jobs.append(job_id)
-                        logger.error(
-                            "Detected stuck job %s (no update for %.0f seconds)",
-                            job_id,
-                            now - updated,
+                        progress_snapshot = _drain_job_progress(job_id)
+                        history = list(data.get("history", []))
+                        if progress_snapshot is not None:
+                            history.extend(progress_snapshot.get("history", []))
+                        history.append(
+                            {
+                                "timestamp": now_mark,
+                                "progress": data.get("progress", 0),
+                                "message": message,
+                            }
                         )
+                        if len(history) > JOB_HISTORY_LIMIT:
+                            history = history[-JOB_HISTORY_LIMIT:]
+
                         JOBS[job_id] = {
                             **data,
                             "status": "failed",
                             "progress": data.get("progress", 0),
-                            "message": "Job stuck - auto-failed by watchdog",
-                            "error": f"No status update for {int(now - updated)}s",
-                            "updated": now,
+                            "message": message,
+                            "error": (
+                                f"No status update for {int(elapsed)}s"
+                                if had_process
+                                else f"Process ended with no update for {int(elapsed)}s"
+                            ),
+                            "updated": now_mark,
+                            "history": history,
                         }
-            except HTTPException:
-                # The safe_lock helper already logged the failure and raised; continue loop
-                pass
+                        stuck_jobs.append(job_id)
 
             if stuck_jobs:
                 struct_logger.error(
@@ -3601,8 +3697,7 @@ async def _periodic_stuck_job_detector() -> None:
         except Exception as exc:
             logger.error("Stuck job detector failed: %s", exc)
 
-        await asyncio.sleep(300)
-
+        await asyncio.sleep(60)  # Check every minute instead of 5 minutes
 
 async def _periodic_cache_cleanup():
     try:
@@ -7259,6 +7354,7 @@ async def _notify_webhook(
             pass
 
 
+
 async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -> None:
     async with safe_lock(JOBS_LOCK, timeout=5.0, operation="jobs_start"):
         existing = JOBS.get(job_id, {})
@@ -7279,12 +7375,27 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
             "history": history,
         }
 
+    with JOB_PROGRESS_LOCK:
+        JOB_PROGRESS.pop(job_id, None)
+
     reporter = JobProgressReporter(job_id)
     start = time.perf_counter()
     struct_logger.info("job_started", job_id=job_id, job_type="compose_from_urls")
     process_handle = JobProcessHandle()
     with JOB_PROCESSES_LOCK:
         JOB_PROCESSES[job_id] = process_handle
+
+    final_status = "processing"
+    final_message: Optional[str] = "Job started"
+    final_progress: Optional[int] = 10
+    final_result: Optional[Dict[str, Any]] = None
+    final_error: Optional[Any] = None
+    final_status_code: Optional[int] = None
+    final_duration_ms: Optional[float] = None
+    notify_webhook = False
+    webhook_status: Optional[str] = None
+    webhook_result: Optional[Dict[str, Any]] = None
+    webhook_error: Optional[Any] = None
 
     try:
         pub = await _compose_from_urls_impl(
@@ -7294,54 +7405,32 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
             job_id=job_id,
         )
 
-        with JOB_PROCESSES_LOCK:
-            JOB_PROCESSES.pop(job_id, None)
-
         if _job_marked_killed(job_id):
             logger.info("Compose job %s completed but was killed", job_id)
-            async with safe_lock(JOBS_LOCK, timeout=5.0, operation="jobs_killed"):
-                existing = JOBS.get(job_id, {})
-                created = existing.get("created", time.time())
-                history = list(existing.get("history", []))
-                history.append({"timestamp": time.time(), "progress": 100, "message": "Killed"})
-                if len(history) > JOB_HISTORY_LIMIT:
-                    history = history[-JOB_HISTORY_LIMIT:]
-                JOBS[job_id] = {
-                    **existing,
-                    "status": "killed",
-                    "progress": 100,
-                    "message": "Killed (processing completed)",
-                    "created": created,
-                    "updated": time.time(),
-                    "history": history,
-                }
+            final_status = "killed"
+            final_message = "Killed (processing completed)"
+            final_progress = 100
+            final_result = None
+            final_error = None
+            final_status_code = None
             return
 
         reporter.update(100, "Completed")
         duration_ms = (time.perf_counter() - start) * 1000.0
-        async with safe_lock(JOBS_LOCK, timeout=5.0, operation="jobs_finish"):
-            existing = JOBS.get(job_id, {})
-            created = existing.get("created", time.time())
-            history = list(existing.get("history", []))
-            history.append({"timestamp": time.time(), "progress": 100, "message": "Completed"})
-            if len(history) > JOB_HISTORY_LIMIT:
-                history = history[-JOB_HISTORY_LIMIT:]
-            JOBS[job_id] = {
-                **existing,
-                "status": "finished",
-                "progress": 100,
-                "message": "Completed",
-                "result": {
-                    "file_url": pub["url"],
-                    "path": pub["dst"],
-                    "rel": pub["rel"],
-                    "thumbnail": pub.get("thumbnail"),
-                },
-                "duration_ms": duration_ms,
-                "created": created,
-                "updated": time.time(),
-                "history": history,
-            }
+        final_status = "finished"
+        final_message = "Completed"
+        final_progress = 100
+        final_result = {
+            "file_url": pub["url"],
+            "path": pub["dst"],
+            "rel": pub["rel"],
+            "thumbnail": pub.get("thumbnail"),
+        }
+        final_duration_ms = duration_ms
+        notify_webhook = True
+        webhook_status = "finished"
+        webhook_result = final_result
+        webhook_error = None
         struct_logger.info(
             "job_completed",
             job_id=job_id,
@@ -7349,41 +7438,17 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
             duration_ms=duration_ms,
             output_rel=pub["rel"],
         )
-        await _notify_webhook(
-            str(job.webhook_url) if job.webhook_url else None,
-            job_id=job_id,
-            status="finished",
-            result={
-                "file_url": pub["url"],
-                "path": pub["dst"],
-                "rel": pub["rel"],
-                "thumbnail": pub.get("thumbnail"),
-            },
-            headers=job.webhook_headers,
-        )
+        return
 
     except HTTPException as exc:
-        with JOB_PROCESSES_LOCK:
-            JOB_PROCESSES.pop(job_id, None)
-
         if _job_marked_killed(job_id):
             logger.info("Compose job %s failed after being killed", job_id)
-            async with safe_lock(JOBS_LOCK, timeout=5.0, operation="jobs_killed"):
-                existing = JOBS.get(job_id, {})
-                created = existing.get("created", time.time())
-                history = list(existing.get("history", []))
-                history.append({"timestamp": time.time(), "progress": 100, "message": "Killed"})
-                if len(history) > JOB_HISTORY_LIMIT:
-                    history = history[-JOB_HISTORY_LIMIT:]
-                JOBS[job_id] = {
-                    **existing,
-                    "status": "killed",
-                    "progress": 100,
-                    "message": "Killed",
-                    "created": created,
-                    "updated": time.time(),
-                    "history": history,
-                }
+            final_status = "killed"
+            final_message = "Killed"
+            final_progress = 100
+            final_result = None
+            final_error = None
+            final_status_code = None
             return
 
         reporter.update(100, "Composition failed")
@@ -7395,55 +7460,27 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
             status_code=exc.status_code,
             error=detail,
         )
-        async with safe_lock(JOBS_LOCK, timeout=5.0, operation="jobs_fail"):
-            existing = JOBS.get(job_id, {})
-            created = existing.get("created", time.time())
-            history = list(existing.get("history", []))
-            history.append({"timestamp": time.time(), "progress": 100, "message": "Failed"})
-            if len(history) > JOB_HISTORY_LIMIT:
-                history = history[-JOB_HISTORY_LIMIT:]
-            JOBS[job_id] = {
-                **existing,
-                "status": "failed",
-                "progress": 100,
-                "message": "Failed",
-                "status_code": exc.status_code,
-                "error": detail,
-                "created": created,
-                "updated": time.time(),
-                "history": history,
-            }
-        await _notify_webhook(
-            str(job.webhook_url) if job.webhook_url else None,
-            job_id=job_id,
-            status="failed",
-            error=detail,
-            headers=job.webhook_headers,
-        )
+        final_status = "failed"
+        final_message = "Failed"
+        final_progress = 100
+        final_result = None
+        final_error = detail
+        final_status_code = exc.status_code
+        notify_webhook = True
+        webhook_status = "failed"
+        webhook_error = detail
+        webhook_result = None
         return
 
     except Exception as exc:
-        with JOB_PROCESSES_LOCK:
-            JOB_PROCESSES.pop(job_id, None)
-
         if _job_marked_killed(job_id):
             logger.info("Compose job %s encountered exception after being killed", job_id)
-            async with safe_lock(JOBS_LOCK, timeout=5.0, operation="jobs_killed"):
-                existing = JOBS.get(job_id, {})
-                created = existing.get("created", time.time())
-                history = list(existing.get("history", []))
-                history.append({"timestamp": time.time(), "progress": 100, "message": "Killed"})
-                if len(history) > JOB_HISTORY_LIMIT:
-                    history = history[-JOB_HISTORY_LIMIT:]
-                JOBS[job_id] = {
-                    **existing,
-                    "status": "killed",
-                    "progress": 100,
-                    "message": "Killed",
-                    "created": created,
-                    "updated": time.time(),
-                    "history": history,
-                }
+            final_status = "killed"
+            final_message = "Killed"
+            final_progress = 100
+            final_result = None
+            final_error = None
+            final_status_code = None
             return
 
         reporter.update(100, "Unexpected failure")
@@ -7455,33 +7492,117 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
             status_code=500,
             error=str(exc),
         )
-        async with safe_lock(JOBS_LOCK, timeout=5.0, operation="jobs_fail"):
-            existing = JOBS.get(job_id, {})
-            created = existing.get("created", time.time())
-            history = list(existing.get("history", []))
-            history.append({"timestamp": time.time(), "progress": 100, "message": "Failed"})
-            if len(history) > JOB_HISTORY_LIMIT:
-                history = history[-JOB_HISTORY_LIMIT:]
-            JOBS[job_id] = {
-                **existing,
-                "status": "failed",
-                "progress": 100,
-                "message": "Failed",
-                "status_code": 500,
-                "error": str(exc),
-                "created": created,
-                "updated": time.time(),
-                "history": history,
-            }
-        await _notify_webhook(
-            str(job.webhook_url) if job.webhook_url else None,
-            job_id=job_id,
-            status="failed",
-            error=str(exc),
-            headers=job.webhook_headers,
-        )
+        final_status = "failed"
+        final_message = "Failed"
+        final_progress = 100
+        final_result = None
+        final_error = str(exc)
+        final_status_code = 500
+        notify_webhook = True
+        webhook_status = "failed"
+        webhook_error = str(exc)
+        webhook_result = None
         return
 
+    finally:
+        logger.info("[%s] CLEANUP: Removing from JOB_PROCESSES", job_id)
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
+
+        progress_snapshot = _drain_job_progress(job_id)
+        if final_progress is None and progress_snapshot is not None:
+            final_progress = progress_snapshot.get("progress")
+
+        message_to_store = final_message
+        if message_to_store is None and progress_snapshot is not None:
+            message_to_store = progress_snapshot.get("message")
+
+        history_updates: List[Dict[str, Any]] = []
+        if progress_snapshot is not None:
+            history_updates.extend(progress_snapshot.get("history", []))
+
+        now_ts = time.time()
+        if final_progress is not None and message_to_store is not None:
+            history_updates.append(
+                {
+                    "timestamp": now_ts,
+                    "progress": final_progress,
+                    "message": message_to_store,
+                }
+            )
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with safe_lock(JOBS_LOCK, timeout=30.0, operation="jobs_final"):
+                    existing = JOBS.get(job_id, {})
+                    created = existing.get("created", now_ts)
+                    history = list(existing.get("history", []))
+                    history.extend(history_updates)
+                    if len(history) > JOB_HISTORY_LIMIT:
+                        history = history[-JOB_HISTORY_LIMIT:]
+
+                    progress_value = final_progress
+                    if progress_value is None:
+                        progress_value = existing.get("progress", 0)
+
+                    message_value = message_to_store or existing.get("message")
+
+                    updated = {
+                        **existing,
+                        "status": final_status,
+                        "progress": progress_value,
+                        "message": message_value,
+                        "created": created,
+                        "updated": now_ts,
+                        "history": history,
+                    }
+
+                    if progress_snapshot is not None:
+                        if "detail" in progress_snapshot:
+                            updated["detail"] = progress_snapshot["detail"]
+                        if "ffmpeg_stats" in progress_snapshot:
+                            updated["ffmpeg_stats"] = progress_snapshot["ffmpeg_stats"]
+
+                    if final_duration_ms is not None:
+                        updated["duration_ms"] = final_duration_ms
+                    if final_result is not None:
+                        updated["result"] = final_result
+                    elif final_status != "finished":
+                        updated.pop("result", None)
+
+                    if final_error is not None:
+                        updated["error"] = final_error
+                    elif final_status == "finished":
+                        updated.pop("error", None)
+
+                    if final_status_code is not None:
+                        updated["status_code"] = final_status_code
+                    elif final_status == "finished":
+                        updated.pop("status_code", None)
+
+                    JOBS[job_id] = updated
+                break
+            except Exception as lock_exc:  # pragma: no cover - defensive logging
+                if attempt == max_retries - 1:
+                    logger.error(
+                        "Failed to update final status for job %s after %d attempts: %s",
+                        job_id,
+                        max_retries,
+                        lock_exc,
+                    )
+                else:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+        if notify_webhook:
+            await _notify_webhook(
+                str(job.webhook_url) if job.webhook_url else None,
+                job_id=job_id,
+                status=webhook_status or final_status,
+                result=webhook_result,
+                error=webhook_error,
+                headers=job.webhook_headers,
+            )
 
 @app.post("/compose/from-urls/async")
 async def compose_from_urls_async(job: ComposeFromUrlsJob):
@@ -7518,6 +7639,8 @@ def jobs_history(
             {**data, "job_id": job_id}
             for job_id, data in JOBS.items()
         ]
+
+    all_jobs = [_merge_job_progress(job["job_id"], job) for job in all_jobs]
 
     all_jobs.sort(key=lambda item: item.get("created", 0), reverse=True)
     if status:
@@ -7679,6 +7802,8 @@ async def job_status(request: Request, job_id: str, format: str = "json"):
                 return redirect
             raise HTTPException(status_code=404, detail="Job not found")
         raise HTTPException(status_code=404, detail="job_not_found")
+
+    data = _merge_job_progress(job_id, data)
 
     # Calculate ETA if job is processing
     eta_seconds: Optional[float] = None
@@ -7845,6 +7970,9 @@ async def kill_job(request: Request, job_id: str):
             "updated": time.time(),
             "history": history,
         }
+
+    with JOB_PROGRESS_LOCK:
+        JOB_PROGRESS.pop(job_id, None)
 
     with JOB_PROCESSES_LOCK:
         JOB_PROCESSES.pop(job_id, None)
@@ -8844,6 +8972,18 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
         with JOB_PROCESSES_LOCK:
             JOB_PROCESSES.pop(job_id, None)
         logger.info(f"[{job_id}] CLEANUP: Complete")
+
+        with JOBS_LOCK:
+            current_status = dict(JOBS.get(job_id, {}))
+        if current_status and current_status.get("status") == "processing":
+            logger.error("[%s] Job left in processing state after worker exit", job_id)
+            _update_ffmpeg_async_job(
+                job_id,
+                progress=current_status.get("progress", 0),
+                message="Failed",
+                status="failed",
+                error="Job ended without final status update",
+            )
 
 # ---------- audio endpoints ----------
 
