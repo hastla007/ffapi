@@ -3242,14 +3242,19 @@ async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
     suffix = video_path.suffix.lower()
     if suffix not in VIDEO_THUMBNAIL_EXTENSIONS:
         return None
+
     thumb_dir = video_path.parent / THUMBNAIL_DIR_NAME
     try:
         thumb_dir.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
         logger.debug("Unable to create thumbnail directory %s: %s", thumb_dir, exc)
         return None
+
     thumb_path = thumb_dir / f"{video_path.stem}.jpg"
     temp_log = WORK_DIR / f"thumb_{video_path.stem}.log"
+
+    logger.info("Starting thumbnail generation for %s", video_path.name)
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -3263,10 +3268,29 @@ async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
         "scale=320:-1",
         str(thumb_path),
     ]
+
+    code: Optional[int] = None
     try:
         with temp_log.open("w", encoding="utf-8", errors="ignore") as log_handle:
-            code = await run_ffmpeg_with_timeout(cmd, log_handle)
+            code = await asyncio.wait_for(
+                run_ffmpeg_with_timeout(
+                    cmd,
+                    log_handle,
+                    allow_gpu_fallback=False,
+                ),
+                timeout=30,
+            )
+        logger.info("Thumbnail generation completed with code %d", code)
+    except asyncio.TimeoutError:
+        logger.warning("Thumbnail generation timed out for %s", video_path)
+        if thumb_path.exists():
+            try:
+                thumb_path.unlink()
+            except Exception:
+                pass
+        return None
     except HTTPException:
+        logger.warning("Thumbnail generation failed for %s", video_path)
         if thumb_path.exists():
             try:
                 thumb_path.unlink()
@@ -3279,6 +3303,7 @@ async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
                 temp_log.unlink()
             except Exception:
                 pass
+
     if code != 0 or not thumb_path.exists():
         if thumb_path.exists():
             try:
@@ -3286,6 +3311,8 @@ async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
             except Exception as exc:
                 logger.warning("Failed to remove thumbnail %s: %s", thumb_path, exc)
         return None
+
+    logger.info("Thumbnail saved to %s", thumb_path)
     return thumb_path
 
 def cleanup_old_public(days: Optional[float] = None, *, batch_size: Optional[int] = None) -> None:
@@ -3476,9 +3503,11 @@ async def publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None
         duration_ms=duration_ms,
     )
 
+    logger.info("File published: %s, starting thumbnail generation", name)
     thumbnail_rel: Optional[str] = None
     try:
         thumb_path = await generate_video_thumbnail(dst)
+        logger.info("Thumbnail generation finished for %s", name)
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.debug("Thumbnail generation failed for %s: %s", dst, exc)
     else:
