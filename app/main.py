@@ -7987,6 +7987,7 @@ async def job_status(request: Request, job_id: str, format: str = "json"):
             "history": history_items,
             "ffmpeg_stats": data.get("ffmpeg_stats"),
             "log_path": data.get("log_path"),
+            "total_frames": data.get("total_frames"),
             "csrf_token": csrf_token,
         }
 
@@ -8820,6 +8821,59 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
             )
             logger.info("[%s] STEP 2: All inputs downloaded", job_id)
 
+            if input_paths:
+                try:
+                    probe_cmd = [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "v:0",
+                        "-count_frames",
+                        "-show_entries",
+                        "stream=nb_read_frames,duration,r_frame_rate",
+                        "-of",
+                        "json",
+                        str(input_paths[0]),
+                    ]
+                    probe_result = await asyncio.to_thread(
+                        subprocess.run,
+                        probe_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    if probe_result.returncode == 0 and probe_result.stdout:
+                        try:
+                            probe_data = json.loads(probe_result.stdout)
+                        except json.JSONDecodeError:
+                            probe_data = {}
+                        stream_info = (probe_data.get("streams") or [{}])[0]
+                        nb_frames_raw = stream_info.get("nb_read_frames")
+                        frame_count: Optional[int] = None
+                        if isinstance(nb_frames_raw, str) and nb_frames_raw.isdigit():
+                            frame_count = int(nb_frames_raw)
+                        elif isinstance(nb_frames_raw, (int, float)):
+                            frame_count = int(nb_frames_raw)
+                        else:
+                            duration_raw = stream_info.get("duration")
+                            rate_raw = stream_info.get("r_frame_rate")
+                            if duration_raw and rate_raw and rate_raw != "0/0":
+                                try:
+                                    num, den = rate_raw.split("/")
+                                    fps = float(num) / float(den or 1)
+                                    frame_count = int(float(duration_raw) * fps)
+                                except (ValueError, ZeroDivisionError):
+                                    frame_count = None
+                        if frame_count and frame_count > 0:
+                            _update_ffmpeg_async_job(job_id, total_frames=frame_count)
+                except Exception as probe_exc:
+                    logger.debug(
+                        "[%s] Unable to determine total frames via ffprobe: %s",
+                        job_id,
+                        probe_exc,
+                    )
+
             logger.info("[%s] STEP 3: Building FFmpeg command", job_id)
             cmd = ["ffmpeg", "-y"]
             for index, input_spec in enumerate(job.task.inputs):
@@ -8866,7 +8920,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                     if time_match:
                         hours, minutes, seconds = time_match.groups()
                         total_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-                        metrics["time"] = f"{total_seconds:.1f}s"
+                        metrics["time"] = f"{total_seconds:.1f}"
                         detail_parts.append(f"time={total_seconds:.1f}s")
 
                     fps_match = re.search(r"fps=\s*(\d+\.?\d*)", line)
@@ -8876,7 +8930,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
                     speed_match = re.search(r"speed=\s*(\d+\.?\d*)x", line)
                     if speed_match:
-                        metrics["speed"] = f"{speed_match.group(1)}x"
+                        metrics["speed"] = speed_match.group(1)
                         detail_parts.append(f"speed={speed_match.group(1)}x")
 
                     frame_match = re.search(r"frame=\s*(\d+)", line)
