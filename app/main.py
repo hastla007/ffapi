@@ -8767,6 +8767,25 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
         with TemporaryDirectory(prefix="ffmpeg_job_", dir=str(WORK_DIR)) as workdir:
             work = Path(workdir)
 
+            check_disk_space(LOGS_DIR)
+
+            now_dt = datetime.now(timezone.utc)
+            day = now_dt.strftime("%Y%m%d")
+            log_folder = LOGS_DIR / day
+            log_folder.mkdir(parents=True, exist_ok=True)
+            check_disk_space(log_folder)
+            log_name = (
+                now_dt.strftime("%Y%m%d_%H%M%S_") + _rand() + "_ffmpeg-job-async.log"
+            )
+            persistent_log_path = log_folder / log_name
+            try:
+                log_rel_path = str(persistent_log_path.relative_to(LOGS_DIR))
+            except ValueError:
+                log_rel_path = str(persistent_log_path)
+            except Exception:
+                log_rel_path = str(persistent_log_path)
+            _update_ffmpeg_async_job(job_id, log_path=log_rel_path)
+
             input_paths: List[Path] = []
             total_inputs = max(len(job.task.inputs), 1)
             logger.info("[%s] STEP 1: Starting input downloads", job_id)
@@ -8819,7 +8838,6 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 cmd += output_spec.options
                 cmd += [str(output_path)]
 
-            log_path = work / "ffmpeg.log"
             _update_ffmpeg_async_job(
                 job_id,
                 progress=60,
@@ -8989,7 +9007,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 return
 
             try:
-                with log_path.open(
+                with persistent_log_path.open(
                     "w",
                     encoding="utf-8",
                     errors="ignore",
@@ -9015,16 +9033,6 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 time.time() - start,
             )
 
-            saved_log_path = save_log(log_path, "ffmpeg-job-async")
-            if saved_log_path is not None:
-                try:
-                    log_rel_path = str(saved_log_path.relative_to(LOGS_DIR))
-                except ValueError:
-                    log_rel_path = str(saved_log_path)
-                except Exception:
-                    log_rel_path = str(saved_log_path)
-                _update_ffmpeg_async_job(job_id, log_path=log_rel_path)
-
             if code != 0:
                 if _job_marked_killed(job_id):
                     logger.info(
@@ -9034,7 +9042,9 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                     )
                     mark_killed("Killed after FFmpeg", progress=current_progress)
                     return
-                error_text = log_path.read_text(encoding="utf-8", errors="ignore")
+                error_text = persistent_log_path.read_text(
+                    encoding="utf-8", errors="ignore"
+                )
                 update_kwargs: Dict[str, Any] = {
                     "progress": 100,
                     "message": "FFmpeg failed",
