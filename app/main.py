@@ -8905,6 +8905,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
             def smart_progress_updater(line: str) -> None:
                 """Update progress based on time elapsed and FFmpeg metrics."""
 
+                logger.debug("[%s] FFmpeg line: %s", job_id, line[:100])
                 nonlocal last_update_time, current_progress, last_logged_time
                 now = time.time()
 
