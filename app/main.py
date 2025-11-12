@@ -114,7 +114,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.utils import get_openapi
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 from fastapi_csrf_protect import CsrfProtect, CsrfProtectException
 try:  # pragma: no cover - optional dependency for QR generation
@@ -4894,8 +4894,6 @@ async def settings_login(request: Request):
             if not second_factor_ok:
                 if backup_code:
                     second_factor_ok = UI_AUTH.verify_backup_code(backup_code)
-                elif totp_code:
-                    second_factor_ok = UI_AUTH.verify_backup_code(totp_code)
             if not second_factor_ok:
                 csrf_token = ensure_csrf_token(request)
                 return login_template_response(
@@ -6062,11 +6060,21 @@ async def _download_to(
         for attempt in range(max_retries):
             try:
                 req_hdr = dict(base_headers)
-                existing_size = dest.stat().st_size if dest.exists() else 0
+                existing_size = 0
+                had_existing_file = False
+                try:
+                    stat_result = dest.stat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    existing_size = stat_result.st_size
+                    had_existing_file = True
 
-                if not can_resume and dest.exists():
+                if not can_resume and had_existing_file:
                     try:
                         dest.unlink()
+                    except FileNotFoundError:
+                        pass
                     except Exception as cleanup_exc:
                         logger.warning("Failed to reset download %s: %s", dest, cleanup_exc)
                         _flush_logs()
@@ -6365,6 +6373,8 @@ async def compose_from_binaries(
 
 @app.post("/video/concat-from-urls")
 async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
+    if not job.clips:
+        raise HTTPException(status_code=422, detail="At least one video clip is required")
     logger.info(f"Starting concat: {len(job.clips)} clips, {job.width}x{job.height}@{job.fps}fps")
     check_disk_space(WORK_DIR)
 
@@ -6694,51 +6704,33 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
         return resp
 
 
-class ConcatAliasJob(BaseModel):
-    clips: Optional[List[HttpUrl]] = None
+class ConcatAliasJob(ConcatJob):
     urls: Optional[List[HttpUrl]] = None
-    width: int = 1920
-    height: int = 1080
-    fps: int = 30
 
-    @field_validator("clips", "urls", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def validate_optional_clips(cls, value):
-        if value is None:
-            return value
-        if not value:
-            raise ValueError("Clip list cannot be empty")
-        if isinstance(value, (str, bytes)):
-            raise ValueError("Clips must be provided as a list of URLs")
-        if len(value) > 100:
-            raise ValueError("Too many clips (max 100)")
-        for clip in value:
-            clip_str = str(clip)
-            if not clip_str.startswith(("http://", "https://")):
-                raise ValueError("Only http:// and https:// clip URLs are supported")
-        return value
+    def apply_url_alias(cls, values: Any) -> Any:
+        if isinstance(values, dict):
+            clips = values.get("clips")
+            urls = values.get("urls")
+            if not clips and urls:
+                values = dict(values)
+                values["clips"] = urls
+        return values
 
-    @field_validator("width", "height")
-    @classmethod
-    def validate_dimensions(cls, value: int) -> int:
-        if not (1 <= value <= 7680):
-            raise ValueError(f"Dimension must be 1-7680, got {value}")
-        return value
-
-    @field_validator("fps")
-    @classmethod
-    def validate_fps(cls, value: int) -> int:
-        if not (1 <= value <= 240):
-            raise ValueError(f"FPS must be 1-240, got {value}")
-        return value
+    @model_validator(mode="after")
+    def ensure_urls_reflect_clips(self) -> "ConcatAliasJob":
+        if not self.clips:
+            raise ValueError("Provide 'clips' (preferred) or 'urls' array of video URLs")
+        if self.urls is None:
+            self.urls = self.clips
+        return self
 
 @app.post("/video/concat")
 async def video_concat_alias(job: ConcatAliasJob, as_json: bool = False):
-    clip_list = job.clips or job.urls
-    if not clip_list:
+    if not job.clips:
         raise HTTPException(status_code=422, detail="Provide 'clips' (preferred) or 'urls' array of video URLs")
-    cj = ConcatJob(clips=clip_list, width=job.width, height=job.height, fps=job.fps)
-    return await video_concat_from_urls(cj, as_json=as_json)
+    return await video_concat_from_urls(job, as_json=as_json)
 
 
 async def _compose_from_urls_impl(
@@ -8070,48 +8062,110 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 progress=60,
                 message="Processing with FFmpeg",
             )
-            reporter = JobProgressReporter(job_id)
-            last_update = [60]
 
-            def simple_progress_parser(line: str) -> None:
-                match = re.search(r"time=(\d+):(\d+):(\d+)", line)
-                if not match:
-                    return
+            last_update_time = [time.time()]
+            current_progress = [60]
+            last_logged_time = [time.time()]
 
-                current = last_update[0]
-                if current >= 95:
-                    return
+            def smart_progress_updater(line: str) -> None:
+                """Update progress based on time elapsed and FFmpeg metrics."""
 
-                new_progress = min(95, current + 5)
-                if new_progress > current:
-                    reporter.update(
-                        new_progress,
-                        "Processing with FFmpeg",
-                        detail=line[:100],
+                now = time.time()
+
+                if now - last_update_time[0] >= 3:
+                    if current_progress[0] < 95:
+                        increment = 2 if current_progress[0] < 80 else 1
+                        current_progress[0] = min(95, current_progress[0] + increment)
+
+                    metrics: Dict[str, str] = {}
+                    detail_parts: List[str] = []
+
+                    time_match = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
+                    if time_match:
+                        hours, minutes, seconds = time_match.groups()
+                        total_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+                        metrics["time"] = f"{total_seconds:.1f}s"
+                        detail_parts.append(f"time={total_seconds:.1f}s")
+
+                    fps_match = re.search(r"fps=\s*(\d+\.?\d*)", line)
+                    if fps_match:
+                        metrics["fps"] = fps_match.group(1)
+                        detail_parts.append(f"fps={fps_match.group(1)}")
+
+                    speed_match = re.search(r"speed=\s*(\d+\.?\d*)x", line)
+                    if speed_match:
+                        metrics["speed"] = f"{speed_match.group(1)}x"
+                        detail_parts.append(f"speed={speed_match.group(1)}x")
+
+                    frame_match = re.search(r"frame=\s*(\d+)", line)
+                    if frame_match:
+                        metrics["frame"] = frame_match.group(1)
+
+                    detail = " | ".join(detail_parts) if detail_parts else "Active"
+
+                    _update_ffmpeg_async_job(
+                        job_id,
+                        progress=current_progress[0],
+                        message="Processing with FFmpeg",
+                        detail=detail,
+                        ffmpeg_stats=metrics or None,
                     )
-                    last_update[0] = new_progress
+                    last_update_time[0] = now
+
+                if now - last_logged_time[0] >= 30:
+                    logger.info(
+                        "Job %s still processing (progress: %d%%, elapsed: %.0fs)",
+                        job_id,
+                        current_progress[0],
+                        now - start,
+                    )
+                    last_logged_time[0] = now
+
+            async def watchdog() -> None:
+                try:
+                    for _ in range(0, FFMPEG_TIMEOUT_SECONDS, 60):
+                        await asyncio.sleep(60)
+                        elapsed = time.time() - start
+                        logger.info(
+                            "Job %s watchdog: %d seconds elapsed, still processing",
+                            job_id,
+                            int(elapsed),
+                        )
+                except asyncio.CancelledError:
+                    pass
+
+            watchdog_task = asyncio.create_task(watchdog())
 
             logger.info(
-                "Starting FFmpeg execution for job %s with command: %s",
+                "Starting FFmpeg for job %s with command: %s",
                 job_id,
-                " ".join(cmd[:10]),
+                " ".join(cmd[:15]) + ("..." if len(cmd) > 15 else ""),
             )
-            with log_path.open(
-                "w",
-                encoding="utf-8",
-                errors="ignore",
-                buffering=1,
-            ) as lf:
-                code = await run_ffmpeg_with_timeout(
-                    cmd,
-                    lf,
-                    progress_parser=simple_progress_parser,
-                )
+
+            try:
+                with log_path.open(
+                    "w",
+                    encoding="utf-8",
+                    errors="ignore",
+                    buffering=1,
+                ) as lf:
+                    code = await run_ffmpeg_with_timeout(
+                        cmd,
+                        lf,
+                        progress_parser=smart_progress_updater,
+                    )
+            finally:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
 
             logger.info(
-                "FFmpeg execution completed for job %s with exit code: %d",
+                "FFmpeg completed for job %s with exit code %d (took %.1fs)",
                 job_id,
                 code,
+                time.time() - start,
             )
 
             save_log(log_path, "ffmpeg-job-async")
