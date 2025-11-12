@@ -8908,6 +8908,9 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 nonlocal last_update_time, current_progress, last_logged_time
                 now = time.time()
 
+                if "time=" in line or "frame=" in line:
+                    logger.debug("[%s] Progress line: %s", job_id, line.strip())
+
                 if now - last_update_time >= 3:
                     if current_progress < 95:
                         increment = 2 if current_progress < 80 else 1
@@ -8938,6 +8941,8 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                         metrics["frame"] = frame_match.group(1)
 
                     detail = " | ".join(detail_parts) if detail_parts else "Active"
+
+                    logger.info("[%s] Extracted metrics: %s", job_id, metrics)
 
                     _update_ffmpeg_async_job(
                         job_id,
