@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Deque
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Deque, Type
 from urllib.parse import urlencode, quote, parse_qs, urlparse
 from uuid import uuid4
 
@@ -312,6 +312,31 @@ class JobProcessHandle:
 
     def __init__(self) -> None:
         self.process: Optional[Any] = None
+
+
+class JobTransaction:
+    """Context manager for atomic job updates."""
+
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+        self.updates: Dict[str, Any] = {}
+
+    def __enter__(self) -> "JobTransaction":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[Any],
+    ) -> None:
+        if exc_type is None and self.updates:
+            with JOBS_LOCK:
+                existing = JOBS.get(self.job_id, {})
+                JOBS[self.job_id] = {**existing, **self.updates}
+
+    def set(self, **kwargs: Any) -> None:
+        self.updates.update(kwargs)
 
 
 class LRUCache:
@@ -2867,6 +2892,7 @@ async def startup_event():
         asyncio.create_task(_periodic_jobs_cleanup())
     asyncio.create_task(_periodic_session_cleanup())
     asyncio.create_task(_periodic_rate_limiter_cleanup())
+    asyncio.create_task(_periodic_stuck_job_cleanup())
     if PROBE_CACHE_TTL > 0:
         asyncio.create_task(_periodic_cache_cleanup())
     _flush_logs()
@@ -3617,6 +3643,103 @@ async def _periodic_jobs_cleanup():
         except asyncio.CancelledError:
             raise
 
+
+async def _periodic_stuck_job_cleanup() -> None:
+    """Kill jobs stuck in processing for too long."""
+
+    while True:
+        await asyncio.sleep(3600)
+        now = time.time()
+        cutoff = now - (2 * FFMPEG_TIMEOUT_SECONDS)
+        candidates: List[Tuple[str, Dict[str, Any]]] = []
+
+        with JOBS_LOCK:
+            for job_id, data in JOBS.items():
+                if data.get("status") != "processing":
+                    continue
+                started = data.get("started")
+                if started is None:
+                    started = data.get("created", now)
+                if started is None or started >= cutoff:
+                    continue
+                candidates.append((job_id, dict(data)))
+
+        if not candidates:
+            continue
+
+        struct_logger.error(
+            "stuck_jobs_cleanup_detected",
+            count=len(candidates),
+            job_ids=[job_id for job_id, _ in candidates],
+        )
+
+        for job_id, data in candidates:
+            with JOB_PROCESSES_LOCK:
+                handle = JOB_PROCESSES.get(job_id)
+            process = getattr(handle, "process", None) if handle is not None else None
+
+            if process is not None:
+                try:
+                    if isinstance(process, asyncio.subprocess.Process):
+                        if process.returncode is None:
+                            process.terminate()
+                            try:
+                                await asyncio.wait_for(process.wait(), timeout=5)
+                            except asyncio.TimeoutError:
+                                process.kill()
+                                try:
+                                    await asyncio.wait_for(process.wait(), timeout=1)
+                                except asyncio.TimeoutError:
+                                    pass
+                    else:
+                        if getattr(process, "poll", lambda: None)() is None:
+                            process.terminate()
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.to_thread(process.wait, timeout=5),
+                                    timeout=5,
+                                )
+                            except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+                                process.kill()
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.warning("Failed to terminate stuck job %s: %s", job_id, exc)
+
+            with JOB_PROCESSES_LOCK:
+                JOB_PROCESSES.pop(job_id, None)
+
+            progress_snapshot = _drain_job_progress(job_id)
+            history = list(data.get("history", []))
+            if progress_snapshot is not None:
+                history.extend(progress_snapshot.get("history", []))
+
+            now_mark = time.time()
+            history.append(
+                {
+                    "timestamp": now_mark,
+                    "progress": data.get("progress", 0),
+                    "message": "Job exceeded maximum processing time",
+                }
+            )
+            if len(history) > JOB_HISTORY_LIMIT:
+                history = history[-JOB_HISTORY_LIMIT:]
+
+            updates: Dict[str, Any] = {
+                "status": "failed",
+                "message": "Job exceeded maximum processing time",
+                "error": "Job exceeded maximum processing time",
+                "updated": now_mark,
+                "history": history,
+            }
+            if progress_snapshot is not None:
+                if "progress" in progress_snapshot:
+                    updates.setdefault("progress", progress_snapshot["progress"])
+                if "detail" in progress_snapshot:
+                    updates["detail"] = progress_snapshot["detail"]
+                if "ffmpeg_stats" in progress_snapshot:
+                    updates["ffmpeg_stats"] = progress_snapshot["ffmpeg_stats"]
+
+            with JobTransaction(job_id) as txn:
+                txn.set(**updates)
 
 
 async def _periodic_cache_cleanup():
