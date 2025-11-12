@@ -259,6 +259,8 @@ _FFMPEG_VERSION_CACHE: Optional[Dict[str, Optional[str]]] = None
 
 JOBS: Dict[str, Dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
+JOB_PROCESSES: Dict[str, Any] = {}
+JOB_PROCESSES_LOCK = threading.Lock()
 SETTINGS_LOCK = threading.Lock()
 TEMPO_HISTORY: Deque[Dict[str, Any]] = deque(maxlen=200)
 TEMPO_HISTORY_LOCK = threading.Lock()
@@ -280,6 +282,13 @@ JOB_HISTORY_LIMIT = 20
 PROBE_CACHE_TTL = 3600
 PROBE_CACHE_MAX_SIZE = 1000
 PROBE_CACHE_LOCK = threading.Lock()
+
+
+class JobProcessHandle:
+    __slots__ = ("process",)
+
+    def __init__(self) -> None:
+        self.process: Optional[Any] = None
 
 
 class LRUCache:
@@ -3063,6 +3072,7 @@ async def run_ffmpeg_with_timeout(
     *,
     progress_parser: Optional[Callable[[str], None]] = None,
     allow_gpu_fallback: bool = True,
+    process_handle: Optional[JobProcessHandle] = None,
 ) -> int:
     """Run FFmpeg asynchronously without blocking the event loop."""
 
@@ -3212,7 +3222,9 @@ async def run_ffmpeg_with_timeout(
                     pass
             raise
 
-    async def _run_with_subprocess_fallback(launch_error: Optional[Exception] = None) -> int:
+    async def _run_with_subprocess_fallback(
+        launch_error: Optional[Exception] = None,
+    ) -> int:
         try:
             popen_kwargs = dict(
                 stdin=subprocess.DEVNULL,
@@ -3231,6 +3243,8 @@ async def run_ffmpeg_with_timeout(
                 cmd,
                 **popen_kwargs,
             )
+            if process_handle is not None:
+                process_handle.process = proc_sync
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.error("Failed to launch ffmpeg command %s: %s", cmd, exc)
             _flush_logs()
@@ -3238,72 +3252,76 @@ async def run_ffmpeg_with_timeout(
                 raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from launch_error
             raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from exc
 
-        reader_thread: Optional[threading.Thread] = None
-        if proc_sync.stderr is not None:
+        try:
+            reader_thread: Optional[threading.Thread] = None
+            if proc_sync.stderr is not None:
 
-            def _reader() -> None:
-                try:
-                    for line in proc_sync.stderr:
+                def _reader() -> None:
+                    try:
+                        for line in proc_sync.stderr:
+                            try:
+                                if hasattr(log_handle, "write"):
+                                    log_handle.write(line)
+                                    if hasattr(log_handle, "flush"):
+                                        log_handle.flush()
+                            except Exception:
+                                pass
+                            if progress_parser is not None:
+                                try:
+                                    progress_parser(line)
+                                except Exception as exc:
+                                    logger.debug(
+                                        "Progress parser failed on line: %s - %s",
+                                        line[:100],
+                                        exc,
+                                    )
+                    finally:
                         try:
-                            if hasattr(log_handle, "write"):
-                                log_handle.write(line)
-                                if hasattr(log_handle, "flush"):
-                                    log_handle.flush()
+                            proc_sync.stderr.close()
                         except Exception:
                             pass
-                        if progress_parser is not None:
-                            try:
-                                progress_parser(line)
-                            except Exception as exc:
-                                logger.debug(
-                                    "Progress parser failed on line: %s - %s",
-                                    line[:100],
-                                    exc,
-                                )
-                finally:
-                    try:
-                        proc_sync.stderr.close()
-                    except Exception:
-                        pass
 
-            reader_thread = threading.Thread(target=_reader, daemon=True)
-            reader_thread.start()
+                reader_thread = threading.Thread(target=_reader, daemon=True)
+                reader_thread.start()
 
-        loop = asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
 
-        try:
-            return_code = await loop.run_in_executor(
-                None,
-                lambda: proc_sync.wait(timeout=FFMPEG_TIMEOUT_SECONDS),
-            )
-            return _interpret_return_code(return_code)
-        except subprocess.TimeoutExpired:
-            logger.error(
-                "FFmpeg process timed out after %d seconds for command: %s",
-                FFMPEG_TIMEOUT_SECONDS,
-                " ".join(cmd[:10]),
-            )
-            proc_sync.terminate()
             try:
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: proc_sync.wait(timeout=5)),
-                    timeout=5,
+                return_code = await loop.run_in_executor(
+                    None,
+                    lambda: proc_sync.wait(timeout=FFMPEG_TIMEOUT_SECONDS),
                 )
-            except (asyncio.TimeoutError, subprocess.TimeoutExpired):
-                proc_sync.kill()
+                return _interpret_return_code(return_code)
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "FFmpeg process timed out after %d seconds for command: %s",
+                    FFMPEG_TIMEOUT_SECONDS,
+                    " ".join(cmd[:10]),
+                )
+                proc_sync.terminate()
                 try:
                     await asyncio.wait_for(
-                        loop.run_in_executor(None, lambda: proc_sync.wait(timeout=1)),
-                        timeout=1,
+                        loop.run_in_executor(None, lambda: proc_sync.wait(timeout=5)),
+                        timeout=5,
                     )
                 except (asyncio.TimeoutError, subprocess.TimeoutExpired):
-                    pass
-            logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
-            _flush_logs()
-            raise HTTPException(status_code=504, detail="Processing timeout")
+                    proc_sync.kill()
+                    try:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, lambda: proc_sync.wait(timeout=1)),
+                            timeout=1,
+                        )
+                    except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+                        pass
+                logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
+                _flush_logs()
+                raise HTTPException(status_code=504, detail="Processing timeout")
+            finally:
+                if reader_thread is not None:
+                    reader_thread.join(timeout=1)
         finally:
-            if reader_thread is not None:
-                reader_thread.join(timeout=1)
+            if process_handle is not None:
+                process_handle.process = None
 
         return _interpret_return_code(0)
 
@@ -3330,7 +3348,13 @@ async def run_ffmpeg_with_timeout(
         _flush_logs()
         raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from exc
     else:
-        return await _run_with_asyncio_process()
+        if process_handle is not None:
+            process_handle.process = proc
+        try:
+            return await _run_with_asyncio_process()
+        finally:
+            if process_handle is not None:
+                process_handle.process = None
 
     return await _run_with_asyncio_process()
 
@@ -6889,7 +6913,11 @@ async def video_concat_alias(job: ConcatAliasJob, as_json: bool = False):
 
 
 async def _compose_from_urls_impl(
-    job: ComposeFromUrlsJob, progress: Optional[JobProgressReporter] = None
+    job: ComposeFromUrlsJob,
+    progress: Optional[JobProgressReporter] = None,
+    *,
+    process_handle: Optional[JobProcessHandle] = None,
+    job_id: Optional[str] = None,
 ) -> Dict[str, str]:
     check_disk_space(WORK_DIR)
 
@@ -7011,8 +7039,16 @@ async def _compose_from_urls_impl(
             )
         elif progress:
             progress.update(70, "Rendering composition (unknown duration)")
+        if job_id and _job_marked_killed(job_id):
+            raise RuntimeError("job_killed")
+
         with log_path.open("w", encoding="utf-8", errors="ignore") as logf:
-            code = await run_ffmpeg_with_timeout(cmd, logf, progress_parser=parser)
+            code = await run_ffmpeg_with_timeout(
+                cmd,
+                logf,
+                progress_parser=parser,
+                process_handle=process_handle,
+            )
         save_log(log_path, "compose-urls")
         if code != 0 or not out_path.exists():
             logger.error("compose-from-urls failed")
@@ -7162,9 +7198,22 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
     reporter = JobProgressReporter(job_id)
     start = time.perf_counter()
     struct_logger.info("job_started", job_id=job_id, job_type="compose_from_urls")
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
     try:
-        pub = await _compose_from_urls_impl(job, reporter)
+        pub = await _compose_from_urls_impl(
+            job,
+            reporter,
+            process_handle=process_handle,
+            job_id=job_id,
+        )
     except HTTPException as exc:
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
+        if _job_marked_killed(job_id):
+            logger.info("Compose job %s marked as killed during HTTPException", job_id)
+            return
         reporter.update(100, "Composition failed")
         detail = exc.detail if isinstance(exc.detail, (str, dict)) else str(exc.detail)
         struct_logger.error(
@@ -7201,6 +7250,11 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
         )
         return
     except Exception as exc:
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
+        if _job_marked_killed(job_id):
+            logger.info("Compose job %s marked as killed during unexpected failure", job_id)
+            return
         reporter.update(100, "Unexpected failure")
         logger.exception("Async compose job %s failed", job_id)
         struct_logger.error(
@@ -7237,6 +7291,11 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
         )
         return
 
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES.pop(job_id, None)
+    if _job_marked_killed(job_id):
+        logger.info("Compose job %s completed after being killed", job_id)
+        return
     reporter.update(100, "Completed")
     duration_ms = (time.perf_counter() - start) * 1000.0
     with JOBS_LOCK:
@@ -7554,6 +7613,112 @@ async def job_status(request: Request, job_id: str, format: str = "json"):
     if elapsed_seconds is not None:
         payload["elapsed_seconds"] = int(elapsed_seconds)
     return payload
+
+
+def _job_marked_killed(job_id: str) -> bool:
+    with JOBS_LOCK:
+        return JOBS.get(job_id, {}).get("status") == "killed"
+
+
+@app.post("/jobs/{job_id}/kill")
+async def kill_job(request: Request, job_id: str):
+    """Kill a running job and mark it as killed."""
+
+    accept_header = request.headers.get("accept", "")
+    if accept_header.startswith("text/html"):
+        redirect = ensure_dashboard_access(request)
+        if redirect:
+            return redirect
+
+    cleanup_old_jobs()
+
+    with JOBS_LOCK:
+        job_data = JOBS.get(job_id)
+
+    if job_data is None:
+        raise HTTPException(status_code=404, detail="job_not_found")
+
+    status = job_data.get("status")
+    if status not in {"queued", "processing"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot kill job with status '{status}'. Only queued/processing jobs can be killed.",
+        )
+
+    with JOB_PROCESSES_LOCK:
+        process_handle = JOB_PROCESSES.get(job_id)
+
+    process = None
+    if process_handle is not None:
+        process = getattr(process_handle, "process", process_handle)
+    killed = False
+
+    if process is not None:
+        try:
+            if isinstance(process, asyncio.subprocess.Process):
+                if process.returncode is None:
+                    process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                        killed = True
+                    except asyncio.TimeoutError:
+                        process.kill()
+                        try:
+                            await asyncio.wait_for(process.wait(), timeout=1)
+                            killed = True
+                        except asyncio.TimeoutError:
+                            pass
+            else:
+                if getattr(process, "poll", lambda: None)() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                        killed = True
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        try:
+                            process.wait(timeout=1)
+                            killed = True
+                        except subprocess.TimeoutExpired:
+                            pass
+        except Exception as exc:
+            logger.warning("Failed to kill process for job %s: %s", job_id, exc)
+
+    with JOBS_LOCK:
+        existing = JOBS.get(job_id, {})
+        history = list(existing.get("history", []))
+        history.append(
+            {
+                "timestamp": time.time(),
+                "progress": existing.get("progress", 0),
+                "message": "Killed by user",
+            }
+        )
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+
+        JOBS[job_id] = {
+            **existing,
+            "status": "killed",
+            "message": "Killed by user",
+            "updated": time.time(),
+            "history": history,
+        }
+
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES.pop(job_id, None)
+
+    logger.info("Job %s killed by user (process killed: %s)", job_id, killed)
+
+    if accept_header.startswith("text/html"):
+        return RedirectResponse(url="/jobs", status_code=303)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "killed",
+        "process_killed": killed,
+    }
 
 
 def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
@@ -8170,6 +8335,10 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
     start = time.perf_counter()
     struct_logger.info("job_started", job_id=job_id, job_type="ffmpeg_job")
 
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
+
     try:
         check_disk_space(WORK_DIR)
 
@@ -8301,6 +8470,18 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 " ".join(cmd[:15]) + ("..." if len(cmd) > 15 else ""),
             )
 
+            if _job_marked_killed(job_id):
+                logger.info(
+                    "FFmpeg job %s marked as killed before launching FFmpeg",
+                    job_id,
+                )
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
+                return
+
             try:
                 with log_path.open(
                     "w",
@@ -8312,6 +8493,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                         cmd,
                         lf,
                         progress_parser=smart_progress_updater,
+                        process_handle=process_handle,
                     )
             finally:
                 watchdog_task.cancel()
@@ -8330,6 +8512,13 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
             save_log(log_path, "ffmpeg-job-async")
 
             if code != 0:
+                if _job_marked_killed(job_id):
+                    logger.info(
+                        "FFmpeg job %s marked as killed after exit code %d",
+                        job_id,
+                        code,
+                    )
+                    return
                 error_text = log_path.read_text(encoding="utf-8", errors="ignore")
                 _update_ffmpeg_async_job(
                     job_id,
@@ -8348,6 +8537,12 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
             missing_outputs = [p for p in output_paths if not p.exists()]
             if missing_outputs:
+                if _job_marked_killed(job_id):
+                    logger.info(
+                        "FFmpeg job %s marked as killed while checking outputs",
+                        job_id,
+                    )
+                    return
                 _update_ffmpeg_async_job(
                     job_id,
                     progress=100,
@@ -8364,6 +8559,10 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 )
                 return
 
+            if _job_marked_killed(job_id):
+                logger.info("FFmpeg job %s marked as killed before publishing outputs", job_id)
+                return
+
             _update_ffmpeg_async_job(
                 job_id,
                 progress=90,
@@ -8377,6 +8576,9 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 logger.info("Published output: %s -> %s", output_path.name, pub["rel"])
 
             duration_ms = (time.perf_counter() - start) * 1000.0
+            if _job_marked_killed(job_id):
+                logger.info("FFmpeg job %s completed after being killed", job_id)
+                return
             _update_ffmpeg_async_job(
                 job_id,
                 progress=100,
@@ -8393,20 +8595,26 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
             )
 
     except Exception as exc:
-        logger.exception("Async FFmpeg job %s failed", job_id)
-        _update_ffmpeg_async_job(
-            job_id,
-            progress=100,
-            message="Failed",
-            status="failed",
-            error=str(exc),
-        )
-        struct_logger.error(
-            "job_failed",
-            job_id=job_id,
-            job_type="ffmpeg_job",
-            error=str(exc),
-        )
+        if _job_marked_killed(job_id):
+            logger.info("FFmpeg job %s stopped after kill: %s", job_id, exc)
+        else:
+            logger.exception("Async FFmpeg job %s failed", job_id)
+            _update_ffmpeg_async_job(
+                job_id,
+                progress=100,
+                message="Failed",
+                status="failed",
+                error=str(exc),
+            )
+            struct_logger.error(
+                "job_failed",
+                job_id=job_id,
+                job_type="ffmpeg_job",
+                error=str(exc),
+            )
+    finally:
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
 
 # ---------- audio endpoints ----------
 
