@@ -78,6 +78,23 @@
         box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
         padding: 24px;
       }
+      footer.site-footer {
+        margin-top: 32px;
+        padding: 16px 0;
+        text-align: center;
+        color: #475569;
+        font-size: 14px;
+      }
+      .site-footer .heart-icon {
+        display: inline-flex;
+        margin: 0 4px;
+        vertical-align: middle;
+        color: #22c55e;
+        font-weight: 700;
+      }
+      .site-footer .heart-icon::before {
+        content: '\2665';
+      }
     </style>
     {% block head_extra %}{% endblock %}
   </head>
@@ -91,5 +108,10 @@
     <div class="page-content">
       {% block content %}{% endblock %}
     </div>
+    <footer class="site-footer">
+      Made with <span class="heart-icon" aria-hidden="true"></span> for Your Business &amp; Automations.<br />
+      &copy; 2025 LocalHostingAPI by Nowdoo.at<br />
+      Version: 1.00.1
+    </footer>
   </body>
 </html>

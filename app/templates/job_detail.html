@@ -87,12 +87,13 @@
             statusBadge.className = 'status ' + {
               'finished': 'success',
               'failed': 'error',
+              'killed': 'error',
               'processing': 'warning',
               'queued': 'info'
             }[data.status];
-            
-            // If job finished or failed, stop polling and reload page
-            if (data.status === 'finished' || data.status === 'failed') {
+
+            // If job finished, failed, or killed, stop polling and reload page
+            if (data.status === 'finished' || data.status === 'failed' || data.status === 'killed') {
               clearInterval(pollInterval);
               setTimeout(() => window.location.reload(), 500);
             }
@@ -101,6 +102,43 @@
             console.warn('Poll failed (will retry):', err.message);
           });
       }, 2000);
+
+      async function killJob() {
+        if (!confirm('Are you sure you want to kill this job? This action cannot be undone.')) {
+          return;
+        }
+
+        const button = document.getElementById('kill-job-btn');
+        button.disabled = true;
+        button.textContent = 'Killing...';
+
+        try {
+          const response = await fetch('/jobs/{{ job_id }}/kill', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            }
+          });
+
+          if (response.ok) {
+            clearInterval(pollInterval);
+            button.textContent = 'Killed';
+            const statusBadge = document.getElementById('status-badge');
+            statusBadge.textContent = 'killed';
+            statusBadge.className = 'status error';
+            setTimeout(() => window.location.reload(), 1000);
+          } else {
+            const data = await response.json();
+            alert('Failed to kill job: ' + (data.detail || 'Unknown error'));
+            button.disabled = false;
+            button.textContent = 'Kill Job';
+          }
+        } catch (error) {
+          alert('Error killing job: ' + error.message);
+          button.disabled = false;
+          button.textContent = 'Kill Job';
+        }
+      }
     </script>
   {% endif %}
   <style>
@@ -110,10 +148,26 @@
       border-radius: 8px;
       margin-bottom: 24px;
     }
+    .job-header-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 12px;
+    }
+    .job-header-top h1 {
+      margin: 0;
+    }
+    .job-header-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
     .job-id {
       font-family: monospace;
       font-size: 18px;
       color: #1f2937;
+      margin: 0;
     }
     .status {
       display: inline-block;
@@ -137,6 +191,24 @@
     .status.info {
       background: #e0f2fe;
       color: #1f7a34;
+    }
+    .kill-btn {
+      padding: 10px 20px;
+      background: #dc3545;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .kill-btn:hover {
+      background: #c82333;
+    }
+    .kill-btn:disabled {
+      background: #6c757d;
+      cursor: not-allowed;
+      opacity: 0.6;
     }
     .progress-section {
       background: #fff;
@@ -302,8 +374,15 @@
   <a href="/jobs" class="back-link">&larr; Back to Jobs</a>
 
   <div class="job-header">
-    <h1>Job Details</h1>
-    <p class="job-id">{{ job_id }}</p>
+    <div class="job-header-top">
+      <div class="job-header-meta">
+        <h1>Job Details</h1>
+        <p class="job-id">{{ job_id }}</p>
+      </div>
+      {% if status in ['queued', 'processing'] %}
+        <button id="kill-job-btn" class="kill-btn" onclick="killJob()">Kill Job</button>
+      {% endif %}
+    </div>
     <span class="status {{ 'success' if status == 'finished' else 'error' if status == 'failed' else 'warning' if status == 'processing' else 'info' }}" id="status-badge">{{ status }}</span>
   </div>
 
