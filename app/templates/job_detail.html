@@ -385,11 +385,6 @@
     </div>
     <span class="status {{ 'success' if status == 'finished' else 'error' if status == 'failed' else 'warning' if status == 'processing' else 'info' }}" id="status-badge">{{ status }}</span>
 
-    {% if status in ['queued', 'processing'] %}
-      <div style="margin-top: 16px;">
-        <button id="kill-job-btn" class="kill-btn" onclick="killJob()">Kill Job</button>
-      </div>
-    {% endif %}
   </div>
 
   <div class="progress-section">
