@@ -3257,26 +3257,54 @@ async def run_ffmpeg_with_timeout(
         if stream is None:
             return
         try:
-            async for raw_line in stream:
-                if not raw_line:
-                    continue
-                line = raw_line.decode("utf-8", errors="ignore")
+            buffer = ""
+            while True:
+                # Read small chunks to capture FFmpeg's \r-terminated stats
+                chunk = await stream.read(1024)
+                if not chunk:
+                    break
+
+                text = chunk.decode("utf-8", errors="ignore")
+                buffer += text
+
+                # Split on both \r and \n to capture FFmpeg stats
+                lines = buffer.split('\r')
+                buffer = lines[-1]  # Keep incomplete line in buffer
+
+                for line in lines[:-1]:
+                    # Further split on \n for regular output
+                    sublines = line.split('\n')
+                    for subline in sublines:
+                        if not subline:
+                            continue
+
+                        full_line = subline + '\n'
+
+                        try:
+                            if hasattr(log_handle, "write"):
+                                log_handle.write(full_line)
+                                if hasattr(log_handle, "flush"):
+                                    log_handle.flush()
+                        except Exception:
+                            pass
+
+                        if parse_progress and progress_parser is not None:
+                            try:
+                                progress_parser(subline)
+                            except Exception as exc:
+                                logger.debug(
+                                    "Progress parser failed on line: %s - %s",
+                                    subline[:100],
+                                    exc,
+                                )
+
+            # Process any remaining buffer
+            if buffer and parse_progress and progress_parser is not None:
                 try:
-                    if hasattr(log_handle, "write"):
-                        log_handle.write(line)
-                        if hasattr(log_handle, "flush"):
-                            log_handle.flush()
+                    progress_parser(buffer)
                 except Exception:
                     pass
-                if parse_progress and progress_parser is not None:
-                    try:
-                        progress_parser(line)
-                    except Exception as exc:
-                        logger.debug(
-                            "Progress parser failed on line: %s - %s",
-                            line[:100],
-                            exc,
-                        )
+
         except asyncio.CancelledError:
             raise
         except Exception:
