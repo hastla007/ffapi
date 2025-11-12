@@ -148,10 +148,26 @@
       border-radius: 8px;
       margin-bottom: 24px;
     }
+    .job-header-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 12px;
+    }
+    .job-header-top h1 {
+      margin: 0;
+    }
+    .job-header-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
     .job-id {
       font-family: monospace;
       font-size: 18px;
       color: #1f2937;
+      margin: 0;
     }
     .status {
       display: inline-block;
@@ -358,8 +374,15 @@
   <a href="/jobs" class="back-link">&larr; Back to Jobs</a>
 
   <div class="job-header">
-    <h1>Job Details</h1>
-    <p class="job-id">{{ job_id }}</p>
+    <div class="job-header-top">
+      <div class="job-header-meta">
+        <h1>Job Details</h1>
+        <p class="job-id">{{ job_id }}</p>
+      </div>
+      {% if status in ['queued', 'processing'] %}
+        <button id="kill-job-btn" class="kill-btn" onclick="killJob()">Kill Job</button>
+      {% endif %}
+    </div>
     <span class="status {{ 'success' if status == 'finished' else 'error' if status == 'failed' else 'warning' if status == 'processing' else 'info' }}" id="status-badge">{{ status }}</span>
 
     {% if status in ['queued', 'processing'] %}

@@ -78,34 +78,62 @@
       gap: 8px;
       align-items: center;
     }
-    .kill-btn {
-      padding: 4px 12px;
-      background: #dc3545;
-      color: white;
+    .kill-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
       border: none;
-      border-radius: 4px;
+      background: #dc3545;
+      color: #fff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       cursor: pointer;
-      font-size: 13px;
-      font-weight: 600;
+      transition: background 0.15s ease;
+      position: relative;
     }
-    .kill-btn:hover {
+    .kill-icon .icon {
+      font-size: 16px;
+      line-height: 1;
+    }
+    .kill-icon:hover {
       background: #c82333;
     }
-    .kill-btn:disabled {
+    .kill-icon:disabled {
       background: #6c757d;
       cursor: not-allowed;
       opacity: 0.6;
     }
+    .kill-icon.loading {
+      background: #f59e0b;
+    }
+    .kill-icon.success {
+      background: #28a745;
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
   </style>
   <script>
-    async function killJob(jobId, statusSpan) {
+    async function killJob(jobId, statusSpan, button) {
       if (!confirm('Are you sure you want to kill this job? This action cannot be undone.')) {
         return;
       }
 
-      const button = event.target;
+      const originalContent = button.innerHTML;
+      button.dataset.originalContent = originalContent;
       button.disabled = true;
-      button.textContent = 'Killing...';
+      button.classList.remove('success');
+      button.classList.add('loading');
+      button.innerHTML = '<span class="icon" aria-hidden="true">&#x23F9;</span><span class="sr-only">Killing job</span>';
 
       try {
         const response = await fetch(`/jobs/${jobId}/kill`, {
@@ -118,18 +146,27 @@
         if (response.ok) {
           statusSpan.textContent = 'killed';
           statusSpan.className = 'status error';
-          button.textContent = 'Killed';
+          button.classList.remove('loading');
+          button.classList.add('success');
+          button.innerHTML = '<span class="icon" aria-hidden="true">&#x2714;</span><span class="sr-only">Job killed</span>';
           setTimeout(() => window.location.reload(), 1000);
         } else {
-          const data = await response.json();
+          let data = {};
+          try {
+            data = await response.json();
+          } catch (_) {
+            // Ignore parse errors and fallback to generic message
+          }
           alert('Failed to kill job: ' + (data.detail || 'Unknown error'));
           button.disabled = false;
-          button.textContent = 'Kill';
+          button.classList.remove('loading');
+          button.innerHTML = originalContent;
         }
       } catch (error) {
         alert('Error killing job: ' + error.message);
         button.disabled = false;
-        button.textContent = 'Kill';
+        button.classList.remove('loading');
+        button.innerHTML = originalContent;
       }
     }
   </script>
@@ -164,7 +201,10 @@
               <div class="action-buttons">
                 <a href="/jobs/{{ job.job_id }}?format=html">View</a>
                 {% if job.status in ['queued', 'processing'] %}
-                  <button class="kill-btn" onclick="killJob('{{ job.job_id }}', document.getElementById('status-{{ job.job_id }}'))">Kill</button>
+                  <button class="kill-icon" onclick="killJob('{{ job.job_id }}', document.getElementById('status-{{ job.job_id }}'), this)">
+                    <span class="icon" aria-hidden="true">&#x2716;</span>
+                    <span class="sr-only">Kill job</span>
+                  </button>
                 {% endif %}
               </div>
             </td>
