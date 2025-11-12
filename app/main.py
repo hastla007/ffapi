@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Deque, Type
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Deque, Type, Union
 from urllib.parse import urlencode, quote, parse_qs, urlparse
 from uuid import uuid4
 
@@ -560,7 +560,7 @@ def build_encode_args(
     """Build complete encoding arguments including filters and codec settings."""
 
     codec, codec_args = get_video_encoder()
-    decoder_args = decoder_args or []  # noqa: F841 - kept for backward compatibility
+    decoder_args = decoder_args or []
 
     # Check environment variable for GPU filters
     gpu_filters_env = os.getenv("ENABLE_GPU_FILTERS", "false").lower() == "true"
@@ -585,6 +585,28 @@ def build_encode_args(
     scale_filter = get_scaling_filter(width, height, codec, use_gpu_filters)
 
     filter_chain = f"{scale_filter},fps={fps}"
+
+    using_gpu_encoder = codec in [
+        "h264_nvenc",
+        "hevc_nvenc",
+        "av1_nvenc",
+        "h264_amf",
+        "hevc_amf",
+        "h264_qsv",
+        "hevc_qsv",
+    ]
+    cpu_decode = not decoder_args or not _decoder_args_use_hw_frames(decoder_args)
+
+    if using_gpu_encoder and cpu_decode and not use_gpu_filters:
+        if "nvenc" in codec:
+            filter_chain += ",format=nv12,hwupload_cuda"
+            logger.debug("Added hwupload_cuda for CPU->NVENC pipeline")
+        elif "qsv" in codec:
+            filter_chain += ",format=nv12,hwupload=extra_hw_frames=64"
+            logger.debug("Added hwupload for CPU->QSV pipeline")
+        elif "amf" in codec:
+            filter_chain += ",format=nv12"
+            logger.debug("Added format=nv12 for CPU->AMF pipeline")
 
     args = [
         "-vf",
@@ -2414,6 +2436,54 @@ def _merge_job_progress(job_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
             merged["updated"] = updated_ts
         merged["history"] = history
         return merged
+
+
+def _finalize_sync_job_failure(
+    job_id: str,
+    start_time: float,
+    error: Any,
+    log_path: Optional[str],
+    *,
+    failure_message: str,
+) -> None:
+    duration_ms = (time.time() - start_time) * 1000
+    progress_snapshot = _drain_job_progress(job_id)
+    history_updates: List[Dict[str, Any]] = []
+    if progress_snapshot is not None:
+        history_updates.extend(progress_snapshot.get("history", []))
+
+    now_ts = time.time()
+    history_updates.append(
+        {
+            "timestamp": now_ts,
+            "progress": 100,
+            "message": failure_message,
+        }
+    )
+
+    with JOBS_LOCK:
+        existing = JOBS.get(job_id, {})
+        history = list(existing.get("history", []))
+
+    history.extend(history_updates)
+    if len(history) > JOB_HISTORY_LIMIT:
+        history = history[-JOB_HISTORY_LIMIT:]
+
+    update_payload: Dict[str, Any] = {
+        "status": "failed",
+        "progress": 100,
+        "message": failure_message,
+        "error": error,
+        "updated": now_ts,
+        "duration_ms": duration_ms,
+        "history": history,
+        "result": None,
+    }
+    if log_path is not None:
+        update_payload["log_path"] = log_path
+
+    with JobTransaction(job_id) as tx:
+        tx.set(**update_payload)
 
 
 class JobProgressReporter:
@@ -6811,35 +6881,189 @@ async def compose_from_binaries(
 async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
     if not job.clips:
         raise HTTPException(status_code=422, detail="At least one video clip is required")
-    logger.info(f"Starting concat: {len(job.clips)} clips, {job.width}x{job.height}@{job.fps}fps")
-    check_disk_space(WORK_DIR)
 
-    max_attempts = 2
-    last_error: Optional[HTTPException] = None
+    logger.info(
+        "Starting concat: %d clips, %dx%d@%dfps",
+        len(job.clips),
+        job.width,
+        job.height,
+        job.fps,
+    )
 
-    for attempt in range(max_attempts):
-        use_gpu = attempt == 0
-        try:
-            return await _concat_impl(job, as_json, force_cpu=not use_gpu)
-        except HTTPException as exc:
-            last_error = exc
-            if use_gpu:
+    cleanup_old_jobs()
+    job_id = str(uuid4())
+    start_time = time.time()
+
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "processing",
+            "progress": 0,
+            "message": "Starting concat",
+            "history": [
+                {
+                    "timestamp": start_time,
+                    "progress": 0,
+                    "message": "Starting concat",
+                }
+            ],
+            "created": start_time,
+            "updated": start_time,
+            "started": start_time,
+        }
+
+    reporter = JobProgressReporter(job_id)
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
+
+    log_rel_path: Optional[str] = None
+
+    try:
+        reporter.update(5, "Preparing concat job")
+        check_disk_space(WORK_DIR)
+
+        max_attempts = 2
+        last_error: Optional[HTTPException] = None
+        result_response: Optional[Union[FileResponse, Dict[str, Any]]] = None
+        result_payload: Optional[Dict[str, Any]] = None
+
+        for attempt in range(max_attempts):
+            use_gpu = attempt == 0
+            try:
+                (
+                    result_response,
+                    result_payload,
+                    log_rel_path,
+                ) = await _concat_impl_with_tracking(
+                    job,
+                    as_json,
+                    force_cpu=not use_gpu,
+                    reporter=reporter,
+                    job_id=job_id,
+                    process_handle=process_handle,
+                )
+                break
+            except HTTPException as exc:
+                last_error = exc
                 detail = exc.detail if isinstance(exc.detail, dict) else {}
-                log_text = detail.get("log", "") if isinstance(detail, dict) else ""
-                if log_text and any(err in str(log_text) for err in GPU_FILTER_ERROR_PATTERNS):
-                    logger.warning("GPU filter failed, retrying with CPU filters")
-                    continue
-            raise
+                if log_rel_path is None and isinstance(detail, dict):
+                    maybe_path = detail.get("log_path")
+                    if isinstance(maybe_path, str):
+                        log_rel_path = maybe_path
+                if use_gpu:
+                    log_text = ""
+                    if isinstance(detail, dict):
+                        log_text = str(detail.get("log", ""))
+                    if log_text and any(err in log_text for err in GPU_FILTER_ERROR_PATTERNS):
+                        reporter.update(45, "GPU filters failed - retrying on CPU")
+                        logger.warning("GPU filter failed, retrying with CPU filters")
+                        continue
+                raise
 
-    if last_error is not None:
-        raise last_error
+        if result_response is None:
+            if last_error is not None:
+                raise last_error
+            raise HTTPException(status_code=500, detail="Unknown concat failure")
 
-    raise HTTPException(status_code=500, detail="Unknown concat failure")
+        duration_ms = (time.time() - start_time) * 1000
+        now_ts = time.time()
+        progress_snapshot = _drain_job_progress(job_id)
+        history_updates: List[Dict[str, Any]] = []
+        if progress_snapshot is not None:
+            history_updates.extend(progress_snapshot.get("history", []))
+        history_updates.append(
+            {
+                "timestamp": now_ts,
+                "progress": 100,
+                "message": "Completed",
+            }
+        )
+
+        with JOBS_LOCK:
+            existing = JOBS.get(job_id, {})
+            history = list(existing.get("history", []))
+        history.extend(history_updates)
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+
+        with JobTransaction(job_id) as tx:
+            tx.set(
+                status="finished",
+                progress=100,
+                message="Completed",
+                updated=now_ts,
+                duration_ms=duration_ms,
+                history=history,
+                result=result_payload,
+                log_path=log_rel_path,
+            )
+
+        logger.info("Concat job %s completed in %.1fs", job_id, duration_ms / 1000)
+
+        if isinstance(result_response, FileResponse):
+            result_response.headers["X-Job-ID"] = job_id
+            result_response.headers["X-Job-Status-URL"] = f"/jobs/{job_id}"
+        elif isinstance(result_response, dict):
+            enriched = dict(result_response)
+            enriched["job_id"] = job_id
+            enriched["job_status_url"] = f"/jobs/{job_id}"
+            result_response = enriched
+
+        return result_response
+
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, (dict, str)) else str(exc)
+        if isinstance(exc.detail, dict):
+            maybe_path = exc.detail.get("log_path")
+            if isinstance(maybe_path, str):
+                log_rel_path = log_rel_path or maybe_path
+        _finalize_sync_job_failure(
+            job_id,
+            start_time,
+            detail,
+            log_rel_path,
+            failure_message="Failed",
+        )
+        raise
+    except Exception as exc:
+        _finalize_sync_job_failure(
+            job_id,
+            start_time,
+            str(exc),
+            log_rel_path,
+            failure_message="Failed",
+        )
+        raise
+    finally:
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
 
 
-async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
+async def _concat_impl_with_tracking(
+    job: ConcatJob,
+    as_json: bool,
+    force_cpu: bool = False,
+    *,
+    reporter: Optional[JobProgressReporter] = None,
+    job_id: Optional[str] = None,
+    process_handle: Optional[JobProcessHandle] = None,
+) -> Tuple[Union[FileResponse, Dict[str, Any]], Dict[str, Any], Optional[str]]:
     if force_cpu:
         logger.info("CPU fallback enabled for concat normalization")
+
+    log_rel_path: Optional[str] = None
+
+    def _record_log_path(saved: Optional[Path]) -> None:
+        nonlocal log_rel_path
+        if saved is None:
+            return
+        try:
+            log_rel_path = str(saved.relative_to(LOGS_DIR))
+        except Exception:
+            log_rel_path = str(saved)
+
+    if reporter:
+        reporter.update(10, "Downloading clips")
 
     with TemporaryDirectory(prefix="concat_", dir=str(WORK_DIR)) as workdir:
         work = Path(workdir)
@@ -6847,14 +7071,20 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
         # Step 1: Download all clips
         logger.info("Downloading %d clips...", len(job.clips))
         downloaded = []
+        total_clips = max(len(job.clips), 1)
         for i, url in enumerate(job.clips):
             raw = work / f"in_{i:03d}.mp4"
             await _download_to(str(url), raw, None)
             downloaded.append(raw)
             logger.info("Downloaded clip %d/%d", i + 1, len(job.clips))
+            if reporter:
+                progress = 10 + int(((i + 1) / total_clips) * 25)
+                reporter.update(progress, f"Downloading clip {i + 1}/{total_clips}")
 
         # Step 2: Probe clips to check compatibility
         logger.info("Probing clips for compatibility...")
+        if reporter:
+            reporter.update(35, "Probing clips for compatibility")
 
         def probe_clip(clip_path: Path) -> Optional[Dict[str, Any]]:
             """Probe a video clip and return its stream info."""
@@ -6979,6 +7209,8 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
             # ⚡ FAST PATH: Stream copy (no re-encoding!)
             logger.info("✓ All clips compatible - using FAST stream copy mode")
             logger.info("GPU acceleration not needed (no encoding performed)")
+            if reporter:
+                reporter.update(40, "Using fast stream copy mode")
 
             listfile = work / "list.txt"
             with listfile.open("w", encoding="utf-8") as f:
@@ -6997,8 +7229,12 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
 
             log = work / "concat_fast.log"
             with log.open("w", encoding="utf-8", errors="ignore") as lf:
-                code = await run_ffmpeg_with_timeout(cmd, lf)
-            save_log(log, "concat-fast")
+                code = await run_ffmpeg_with_timeout(
+                    cmd,
+                    lf,
+                    process_handle=process_handle,
+                )
+            _record_log_path(save_log(log, "concat-fast"))
 
             if code != 0 or not out_path.exists():
                 logger.error("Fast concat failed, falling back to re-encode")
@@ -7008,14 +7244,23 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
                         out_path.unlink()
                     except Exception as exc:
                         logger.warning("Failed to remove incomplete fast path output: %s", exc)
+            else:
+                if reporter:
+                    reporter.update(80, "Finalizing output")
 
         if not all_compatible:
             # 🐌 SLOW PATH: Normalize and re-encode incompatible clips
             logger.info("⚠ Clips incompatible or fast path failed - using SLOW re-encode mode")
+            if reporter:
+                reporter.update(40, "Normalizing incompatible clips")
 
             norm = []
+            total_norm = max(len(downloaded), 1)
             for i, clip_path in enumerate(downloaded):
                 logger.info("Normalizing clip %d/%d...", i + 1, len(downloaded))
+                if reporter:
+                    progress = 40 + int((i / total_norm) * 40)
+                    reporter.update(progress, f"Normalizing clip {i + 1}/{total_norm}")
 
                 if not clip_path.exists():
                     raise HTTPException(
@@ -7094,6 +7339,7 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
                         cmd,
                         lf,
                         allow_gpu_fallback=not force_cpu,
+                        process_handle=process_handle,
                     )
 
                 if code == -999:
@@ -7125,9 +7371,10 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
                             cmd,
                             lf,
                             allow_gpu_fallback=False,
+                            process_handle=process_handle,
                         )
 
-                save_log(log, f"concat-norm-{i}")
+                _record_log_path(save_log(log, f"concat-norm-{i}"))
 
                 if code != 0 or not out.exists():
                     logger.error("Failed to normalize clip %d", i)
@@ -7164,11 +7411,18 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
                         "command": " ".join(cmd),
                         "exit_code": code,
                     }
+                    if log_rel_path:
+                        detail["log_path"] = log_rel_path
                     raise HTTPException(status_code=500, detail=detail)
                 norm.append(out)
+                if reporter:
+                    progress = 40 + int(((i + 1) / total_norm) * 40)
+                    reporter.update(progress, f"Normalized clip {i + 1}/{total_norm}")
 
             # Concatenate normalized clips
             logger.info("Concatenating %d normalized clips...", len(norm))
+            if reporter:
+                reporter.update(85, "Concatenating normalized clips")
             listfile = work / "list.txt"
             with listfile.open("w", encoding="utf-8") as f:
                 for p in norm:
@@ -7186,8 +7440,12 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
 
             log2 = work / "concat.log"
             with log2.open("w", encoding="utf-8", errors="ignore") as lf:
-                code2 = await run_ffmpeg_with_timeout(cmd2, lf)
-            save_log(log2, "concat-final")
+                code2 = await run_ffmpeg_with_timeout(
+                    cmd2,
+                    lf,
+                    process_handle=process_handle,
+                )
+            _record_log_path(save_log(log2, "concat-final"))
 
             if code2 != 0 or not out_path.exists():
                 logger.error("concat failed at final stage")
@@ -7196,14 +7454,23 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
                     "error": "ffmpeg_failed_concat",
                     "log": log2.read_text() if log2.exists() else "",
                 }
+                if log_rel_path:
+                    detail["log_path"] = log_rel_path
                 raise HTTPException(status_code=500, detail=detail)
 
         # Step 4: Publish result
+        if reporter:
+            reporter.update(90, "Publishing result")
         pub = await publish_file(out_path, ".mp4")
         logger.info(f"concat completed: {len(job.clips)} clips -> {pub['rel']}")
+        if reporter:
+            reporter.update(95, "Complete")
+
+        result_payload = {"file_url": pub["url"], "path": pub["dst"]}
 
         if as_json:
-            return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
+            response_payload: Dict[str, Any] = {"ok": True, **result_payload}
+            return response_payload, result_payload, log_rel_path
 
         resp = FileResponse(
             pub["dst"],
@@ -7211,7 +7478,7 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
             filename=os.path.basename(pub["dst"])
         )
         resp.headers["X-File-URL"] = pub["url"]
-        return resp
+        return resp, result_payload, log_rel_path
 
 
 class ConcatAliasJob(ConcatJob):
@@ -8954,59 +9221,211 @@ async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
 
 @app.post("/v1/run-ffmpeg-command")
 async def run_rendi(job: RendiJob):
-    check_disk_space(WORK_DIR)
-    with TemporaryDirectory(prefix="rendi_", dir=str(WORK_DIR)) as workdir:
-        work = Path(workdir)
-        resolved = {}
-        for key, url in job.input_files.items():
-            p = work / f"{key}"
-            await _download_to(str(url), p, None)
-            resolved[key] = str(p)
+    cleanup_old_jobs()
+    job_id = str(uuid4())
+    start_time = time.time()
 
-        out_paths: Dict[str, Path] = {}
-        for key, name in job.output_files.items():
-            out_paths[key] = work / name
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "processing",
+            "progress": 0,
+            "message": "Starting FFmpeg command",
+            "history": [
+                {
+                    "timestamp": start_time,
+                    "progress": 0,
+                    "message": "Starting",
+                }
+            ],
+            "created": start_time,
+            "updated": start_time,
+            "started": start_time,
+        }
 
-        cmd_text = job.ffmpeg_command
-        for k, p in resolved.items():
-            cmd_text = cmd_text.replace("{{" + k + "}}", p)
-        for k, p in out_paths.items():
-            cmd_text = cmd_text.replace("{{" + k + "}}", str(p))
+    reporter = JobProgressReporter(job_id)
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
 
-        cmd_lower = cmd_text.lower()
-        dangerous_patterns = ["-f lavfi", "-i /dev/", "-i file:", "-i concat:"]
-        for pattern in dangerous_patterns:
-            if pattern in cmd_lower:
-                raise HTTPException(status_code=400, detail={"error": "forbidden_pattern", "pattern": pattern})
-        if REQUIRE_DURATION_LIMIT and "-t" not in cmd_lower and "-frames" not in cmd_lower:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": "missing_limit", "detail": "Command must include -t or -frames"},
-            )
+    log_rel_path: Optional[str] = None
+    published: Dict[str, str] = {}
+    result_payload: Optional[Dict[str, Any]] = None
 
+    def _record_log_path(saved: Optional[Path]) -> None:
+        nonlocal log_rel_path
+        if saved is None:
+            return
         try:
-            args = shlex.split(cmd_text)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail={"error": "invalid_command", "msg": str(exc)}) from exc
+            log_rel_path = str(saved.relative_to(LOGS_DIR))
+        except Exception:
+            log_rel_path = str(saved)
 
-        log = work / "ffmpeg.log"
-        run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args
-        with log.open("w", encoding="utf-8", errors="ignore") as lf:
-            code = await run_ffmpeg_with_timeout(run_args, lf)
-        save_log(log, "rendi-command")
-        if code != 0:
-            logger.error("run-ffmpeg-command failed")
-            _flush_logs()
-            return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": run_args, "log": log.read_text()})
+    try:
+        check_disk_space(WORK_DIR)
+        reporter.update(10, "Preparing workspace")
 
-        published = {}
-        for key, p in out_paths.items():
-            if p.exists():
-                pub = await publish_file(p, Path(p).suffix or ".bin")
-                published[key] = pub["url"]
-        if not published:
-            return JSONResponse(status_code=500, content={"error": "no_outputs_found", "log": log.read_text()})
-        return {"ok": True, "outputs": published}
+        with TemporaryDirectory(prefix="rendi_", dir=str(WORK_DIR)) as workdir:
+            work = Path(workdir)
+            resolved: Dict[str, str] = {}
+
+            reporter.update(20, "Downloading input files")
+            total_inputs = max(len(job.input_files), 1)
+            for idx, (key, url) in enumerate(job.input_files.items()):
+                progress = 20 + int(((idx + 1) / total_inputs) * 30)
+                reporter.update(progress, f"Downloading input {idx + 1}/{total_inputs}")
+                p = work / f"{key}"
+                await _download_to(str(url), p, None)
+                resolved[key] = str(p)
+
+            out_paths: Dict[str, Path] = {key: work / name for key, name in job.output_files.items()}
+
+            reporter.update(50, "Building FFmpeg command")
+            cmd_text = job.ffmpeg_command
+            for k, p in resolved.items():
+                cmd_text = cmd_text.replace("{{" + k + "}}", p)
+            for k, p in out_paths.items():
+                cmd_text = cmd_text.replace("{{" + k + "}}", str(p))
+
+            cmd_lower = cmd_text.lower()
+            dangerous_patterns = ["-f lavfi", "-i /dev/", "-i file:", "-i concat:"]
+            for pattern in dangerous_patterns:
+                if pattern in cmd_lower:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error": "forbidden_pattern", "pattern": pattern},
+                    )
+
+            if REQUIRE_DURATION_LIMIT and "-t" not in cmd_lower and "-frames" not in cmd_lower:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "missing_limit", "detail": "Command must include -t or -frames"},
+                )
+
+            try:
+                args = shlex.split(cmd_text)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail={"error": "invalid_command", "msg": str(exc)}) from exc
+
+            log = work / "ffmpeg.log"
+            run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args
+
+            reporter.update(60, "Executing FFmpeg")
+            with log.open("w", encoding="utf-8", errors="ignore") as lf:
+                code = await run_ffmpeg_with_timeout(
+                    run_args,
+                    lf,
+                    process_handle=process_handle,
+                )
+
+            _record_log_path(save_log(log, "rendi-command"))
+
+            if code != 0:
+                logger.error("run-ffmpeg-command failed")
+                _flush_logs()
+                log_text = ""
+                if log.exists():
+                    try:
+                        log_text = log.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        log_text = ""
+                detail = {"error": "ffmpeg_failed", "cmd": run_args, "log": log_text}
+                if log_rel_path:
+                    detail["log_path"] = log_rel_path
+                raise HTTPException(status_code=500, detail=detail)
+
+            reporter.update(80, "Publishing outputs")
+            for key, path_obj in out_paths.items():
+                if path_obj.exists():
+                    pub = await publish_file(path_obj, Path(path_obj).suffix or ".bin")
+                    published[key] = pub["url"]
+
+            if not published:
+                log_text = ""
+                if log.exists():
+                    try:
+                        log_text = log.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        log_text = ""
+                detail = {"error": "no_outputs_found", "log": log_text}
+                if log_rel_path:
+                    detail["log_path"] = log_rel_path
+                raise HTTPException(status_code=500, detail=detail)
+
+            reporter.update(95, "Complete")
+            result_payload = {"outputs": dict(published)}
+
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, (dict, str)) else str(exc)
+        if isinstance(exc.detail, dict):
+            maybe_path = exc.detail.get("log_path")
+            if isinstance(maybe_path, str):
+                log_rel_path = log_rel_path or maybe_path
+        _finalize_sync_job_failure(
+            job_id,
+            start_time,
+            detail,
+            log_rel_path,
+            failure_message="Failed",
+        )
+        raise
+    except Exception as exc:
+        _finalize_sync_job_failure(
+            job_id,
+            start_time,
+            str(exc),
+            log_rel_path,
+            failure_message="Failed",
+        )
+        raise
+    else:
+        duration_ms = (time.time() - start_time) * 1000
+        now_ts = time.time()
+        progress_snapshot = _drain_job_progress(job_id)
+        history_updates: List[Dict[str, Any]] = []
+        if progress_snapshot is not None:
+            history_updates.extend(progress_snapshot.get("history", []))
+        history_updates.append(
+            {
+                "timestamp": now_ts,
+                "progress": 100,
+                "message": "Completed",
+            }
+        )
+
+        with JOBS_LOCK:
+            existing = JOBS.get(job_id, {})
+            history = list(existing.get("history", []))
+
+        history.extend(history_updates)
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+
+        update_payload: Dict[str, Any] = {
+            "status": "finished",
+            "progress": 100,
+            "message": "Completed",
+            "updated": now_ts,
+            "duration_ms": duration_ms,
+            "history": history,
+            "error": None,
+            "result": result_payload,
+        }
+        if log_rel_path is not None:
+            update_payload["log_path"] = log_rel_path
+
+        with JobTransaction(job_id) as tx:
+            tx.set(**update_payload)
+
+        response_payload = {
+            "ok": True,
+            "outputs": dict(published),
+            "job_id": job_id,
+            "job_status_url": f"/jobs/{job_id}",
+        }
+        return response_payload
+    finally:
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
 
 
 @app.post("/v2/run-ffmpeg-job")
