@@ -69,7 +69,7 @@ RUN git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
     rm -rf nv-codec-headers
 
 # Download and compile FFmpeg with NVENC support
-ENV FFMPEG_VERSION=6.1.1
+ENV FFMPEG_VERSION=7.1.2
 RUN curl -fsSL https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz -o ffmpeg.tar.xz && \
     tar xf ffmpeg.tar.xz && \
     cd ffmpeg-${FFMPEG_VERSION} && \
