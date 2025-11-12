@@ -247,7 +247,7 @@ MAX_FILE_SIZE_MB = settings.MAX_FILE_SIZE_MB
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 FFMPEG_TIMEOUT_SECONDS = settings.FFMPEG_TIMEOUT_SECONDS
 MIN_FREE_SPACE_MB = settings.MIN_FREE_SPACE_MB
-UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks
+UPLOAD_CHUNK_SIZE = settings.UPLOAD_CHUNK_SIZE
 PUBLIC_CLEANUP_INTERVAL_SECONDS = settings.PUBLIC_CLEANUP_INTERVAL_SECONDS
 REQUIRE_DURATION_LIMIT = settings.REQUIRE_DURATION_LIMIT
 RATE_LIMITER = RateLimiter(settings.RATE_LIMIT_REQUESTS_PER_MINUTE)
@@ -1295,6 +1295,14 @@ def settings_template_response(
     backup_codes = backup_codes or []
     backup_status = backup_status or []
     if backup_codes:
+        alert_blocks.append(
+            """
+            <div class="alert warning">
+              <strong>⚠️ Save these codes now!</strong>
+              They will be hidden if you refresh this page.
+            </div>
+            """
+        )
         code_items = "".join(
             f"<li><code>{html.escape(code)}</code></li>" for code in backup_codes
         )
@@ -1541,6 +1549,7 @@ def settings_template_response(
         .alert {{ padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }}
         .alert.success {{ background: #e8f5e9; color: #256029; border: 1px solid #c8e6c9; }}
         .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
+        .alert.warning {{ background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; }}
         .alert.info {{ background: #eff6ff; color: #1f7a34; border: 1px solid #bfdbfe; }}
         .alert.info ul {{ margin: 8px 0 0; padding-left: 20px; }}
         .alert.info li {{ font-family: 'Courier New', monospace; margin-bottom: 4px; }}
@@ -4911,6 +4920,7 @@ async def settings_login(request: Request):
             max_age=SESSION_TTL_SECONDS,
             httponly=True,
             samesite="lax",
+            secure=request.url.scheme == "https",
         )
         return response
 
@@ -6003,9 +6013,7 @@ def _normalize_media_url(url: str) -> str:
     while normalized.startswith(double_prefix):
         normalized = proxy_base + normalized[len(double_prefix) :]
 
-    if normalized.startswith(double_prefix):
-        normalized = proxy_base + normalized[len(double_prefix) :]
-    elif normalized.startswith(localhost_base):
+    if normalized.startswith(localhost_base):
         normalized = proxy_base + normalized[len(localhost_base) :]
 
     proxy_http_prefix = f"{proxy_base}/http://"
@@ -6705,6 +6713,7 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
 
 
 class ConcatAliasJob(ConcatJob):
+    clips: Optional[List[HttpUrl]] = None
     urls: Optional[List[HttpUrl]] = None
 
     @model_validator(mode="before")
@@ -6720,9 +6729,7 @@ class ConcatAliasJob(ConcatJob):
 
     @model_validator(mode="after")
     def ensure_urls_reflect_clips(self) -> "ConcatAliasJob":
-        if not self.clips:
-            raise ValueError("Provide 'clips' (preferred) or 'urls' array of video URLs")
-        if self.urls is None:
+        if self.clips and self.urls is None:
             self.urls = self.clips
         return self
 
