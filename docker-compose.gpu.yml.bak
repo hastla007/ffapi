@@ -1,0 +1,51 @@
+services:
+  ffapi:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    runtime: nvidia
+    ports:
+      - "3000:3000"
+    environment:
+      PUBLIC_BASE_URL: "http://localhost:3000"
+      PUBLIC_DIR: "/data/public"
+      WORK_DIR: "/data/work"
+      LOGS_DIR: "/data/logs"
+      RETENTION_DAYS: "7"
+      REQUIRE_DURATION_LIMIT: "false"
+      # GPU Configuration
+      ENABLE_GPU: "true"
+      GPU_ENCODER: "h264_nvenc"  # or hevc_nvenc for H.265
+      GPU_DECODER: "h264_cuvid"
+      GPU_DEVICE: "0"
+      ENABLE_GPU_FILTERS: "true"
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,video,utility"
+      UPLOAD_CHUNK_SIZE: "8388608"
+      FFMPEG_THREADS: "0"
+      RATE_LIMIT_REQUESTS_PER_MINUTE: "120"
+    volumes:
+      - ./public:/data/public
+      - ./work:/data/work
+      - ./logs:/data/logs
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    deploy:
+      resources:
+        limits:
+          cpus: '22.0'
+          memory: 24G
+        reservations:
+          cpus: '4.0'
+          memory: 8G
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video, compute, utility]
