@@ -1,5 +1,5 @@
 import os, io, shlex, json, subprocess, random, string, shutil, time, asyncio, html, types, atexit, hmac, hashlib, secrets, base64, struct, math, ipaddress
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict, deque, OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
@@ -10,6 +10,7 @@ from urllib.parse import urlencode, quote, parse_qs, urlparse
 from uuid import uuid4
 
 import re
+import signal
 import threading
 
 try:  # pragma: no cover - structlog may be unavailable in minimal environments
@@ -114,7 +115,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.utils import get_openapi
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+from starlette.datastructures import FormData
 
 from fastapi_csrf_protect import CsrfProtect, CsrfProtectException
 try:  # pragma: no cover - optional dependency for QR generation
@@ -247,7 +249,7 @@ MAX_FILE_SIZE_MB = settings.MAX_FILE_SIZE_MB
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 FFMPEG_TIMEOUT_SECONDS = settings.FFMPEG_TIMEOUT_SECONDS
 MIN_FREE_SPACE_MB = settings.MIN_FREE_SPACE_MB
-UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks
+UPLOAD_CHUNK_SIZE = settings.UPLOAD_CHUNK_SIZE
 PUBLIC_CLEANUP_INTERVAL_SECONDS = settings.PUBLIC_CLEANUP_INTERVAL_SECONDS
 REQUIRE_DURATION_LIMIT = settings.REQUIRE_DURATION_LIMIT
 RATE_LIMITER = RateLimiter(settings.RATE_LIMIT_REQUESTS_PER_MINUTE)
@@ -257,6 +259,8 @@ _FFMPEG_VERSION_CACHE: Optional[Dict[str, Optional[str]]] = None
 
 JOBS: Dict[str, Dict[str, object]] = {}
 JOBS_LOCK = threading.Lock()
+JOB_PROCESSES: Dict[str, Any] = {}
+JOB_PROCESSES_LOCK = threading.Lock()
 SETTINGS_LOCK = threading.Lock()
 TEMPO_HISTORY: Deque[Dict[str, Any]] = deque(maxlen=200)
 TEMPO_HISTORY_LOCK = threading.Lock()
@@ -276,8 +280,56 @@ VIDEO_THUMBNAIL_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 THUMBNAIL_DIR_NAME = "thumbnails"
 JOB_HISTORY_LIMIT = 20
 PROBE_CACHE_TTL = 3600
-PROBE_CACHE: Dict[str, Tuple[dict, float]] = {}
+PROBE_CACHE_MAX_SIZE = 1000
 PROBE_CACHE_LOCK = threading.Lock()
+
+
+class JobProcessHandle:
+    __slots__ = ("process",)
+
+    def __init__(self) -> None:
+        self.process: Optional[Any] = None
+
+
+class LRUCache:
+    def __init__(self, max_size: int = 1000, ttl: int = 3600) -> None:
+        self._cache: "OrderedDict[str, Tuple[dict, float]]" = OrderedDict()
+        self._max_size = max(0, max_size)
+        self._ttl = max(0, ttl)
+
+    def get(self, key: str) -> Optional[Tuple[dict, float]]:
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        value, timestamp = entry
+        if self._ttl and time.time() - timestamp >= self._ttl:
+            self._cache.pop(key, None)
+            return None
+        self._cache.move_to_end(key)
+        return value, timestamp
+
+    def set(self, key: str, value: dict) -> None:
+        self._cache[key] = (value, time.time())
+        self._cache.move_to_end(key)
+        if self._max_size and len(self._cache) > self._max_size:
+            self._cache.popitem(last=False)
+
+    def cleanup_expired(self) -> int:
+        if not self._ttl:
+            return 0
+        cutoff = time.time() - self._ttl
+        removed = 0
+        for cache_key, (_, timestamp) in list(self._cache.items()):
+            if timestamp < cutoff:
+                self._cache.pop(cache_key, None)
+                removed += 1
+        return removed
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+
+PROBE_CACHE = LRUCache(max_size=PROBE_CACHE_MAX_SIZE, ttl=PROBE_CACHE_TTL)
 
 
 # ========== GPU Acceleration Helpers ==========
@@ -289,7 +341,7 @@ class GPUState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._runtime_disabled = False
-        self._filter_fallback_warned = False
+        self._filter_fallback_warned_at: Optional[float] = None
 
     def disable_runtime(self) -> None:
         with self._lock:
@@ -301,10 +353,14 @@ class GPUState:
 
     def should_warn_filter_fallback(self) -> bool:
         with self._lock:
-            if self._filter_fallback_warned:
-                return False
-            self._filter_fallback_warned = True
-            return True
+            now = time.time()
+            if self._filter_fallback_warned_at is None:
+                self._filter_fallback_warned_at = now
+                return True
+            if now - self._filter_fallback_warned_at >= 600:
+                self._filter_fallback_warned_at = now
+                return True
+            return False
 
 
 GPU_STATE = GPUState()
@@ -1295,6 +1351,14 @@ def settings_template_response(
     backup_codes = backup_codes or []
     backup_status = backup_status or []
     if backup_codes:
+        alert_blocks.append(
+            """
+            <div class="alert warning">
+              <strong>⚠️ Save these codes now!</strong>
+              They will be hidden if you refresh this page.
+            </div>
+            """
+        )
         code_items = "".join(
             f"<li><code>{html.escape(code)}</code></li>" for code in backup_codes
         )
@@ -1541,6 +1605,7 @@ def settings_template_response(
         .alert {{ padding: 12px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }}
         .alert.success {{ background: #e8f5e9; color: #256029; border: 1px solid #c8e6c9; }}
         .alert.error {{ background: #fdecea; color: #b3261e; border: 1px solid #f7c6c4; }}
+        .alert.warning {{ background: #fff7ed; color: #9a3412; border: 1px solid #fed7aa; }}
         .alert.info {{ background: #eff6ff; color: #1f7a34; border: 1px solid #bfdbfe; }}
         .alert.info ul {{ margin: 8px 0 0; padding-left: 20px; }}
         .alert.info li {{ font-family: 'Courier New', monospace; margin-bottom: 4px; }}
@@ -2587,11 +2652,9 @@ async def csrf_middleware(request: Request, call_next):
             csrf_protect.validate_csrf(token, cookie_token)
         except CsrfProtectException as exc:
             return JSONResponse({"detail": exc.message}, status_code=exc.status_code)
-
-        async def receive():
-            return {"type": "http.request", "body": body_bytes, "more_body": False}
-
-        request._receive = receive
+        if parsed:
+            form_items = [(key, value) for key, values in parsed.items() for value in values]
+            request._form = FormData(form_items)
     response = await call_next(request)
     token_to_set = getattr(request.state, "_csrf_token_to_set", None)
     if token_to_set:
@@ -2911,31 +2974,58 @@ async def stream_upload_to_path(upload: UploadFile, dest: Path) -> int:
                     MAX_FILE_SIZE_BYTES,
                 )
                 raise HTTPException(status_code=413, detail="File too large")
+    temp_dest = dest.with_name(dest.name + ".partial")
+    space_check_interval = 64 * 1024 * 1024
+    last_space_check = 0
     try:
-        with dest.open("wb") as buffer:
-            while chunk := await upload.read(UPLOAD_CHUNK_SIZE):
-                total += len(chunk)
-                if total > MAX_FILE_SIZE_BYTES:
+        with temp_dest.open("wb") as buffer:
+            while True:
+                chunk = await upload.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                chunk_len = len(chunk)
+                if total + chunk_len > MAX_FILE_SIZE_BYTES:
                     logger.warning("Upload exceeded max size: %s", upload.filename)
                     _flush_logs()
                     raise HTTPException(status_code=413, detail="File too large")
                 buffer.write(chunk)
+                total += chunk_len
+                if total - last_space_check >= space_check_interval:
+                    try:
+                        check_disk_space(temp_dest.parent)
+                    except HTTPException:
+                        raise
+                    last_space_check = total
     except HTTPException:
-        if dest.exists():
+        if temp_dest.exists():
             try:
-                dest.unlink()
+                temp_dest.unlink()
             except Exception as exc:
-                logger.warning("Failed cleaning partial upload %s: %s", dest, exc)
+                logger.warning("Failed cleaning partial upload %s: %s", temp_dest, exc)
         raise
     except Exception as exc:
-        if dest.exists():
+        if temp_dest.exists():
             try:
-                dest.unlink()
+                temp_dest.unlink()
             except Exception as cleanup_exc:
-                logger.warning("Failed removing incomplete upload %s: %s", dest, cleanup_exc)
+                logger.warning("Failed removing incomplete upload %s: %s", temp_dest, cleanup_exc)
         logger.error("Failed to persist upload %s: %s", upload.filename, exc)
         _flush_logs()
         raise HTTPException(status_code=500, detail="Failed to save upload") from exc
+    else:
+        try:
+            if dest.exists():
+                dest.unlink()
+            temp_dest.replace(dest)
+        except Exception as exc:
+            if temp_dest.exists():
+                try:
+                    temp_dest.unlink()
+                except Exception:
+                    pass
+            logger.error("Failed to finalize upload %s: %s", upload.filename, exc)
+            _flush_logs()
+            raise HTTPException(status_code=500, detail="Failed to finalize upload") from exc
     return total
 
 
@@ -2982,6 +3072,7 @@ async def run_ffmpeg_with_timeout(
     *,
     progress_parser: Optional[Callable[[str], None]] = None,
     allow_gpu_fallback: bool = True,
+    process_handle: Optional[JobProcessHandle] = None,
 ) -> int:
     """Run FFmpeg asynchronously without blocking the event loop."""
 
@@ -3097,6 +3188,11 @@ async def run_ffmpeg_with_timeout(
                             pass
             return _interpret_return_code(return_code)
         except asyncio.TimeoutError:
+            logger.error(
+                "FFmpeg process timed out after %d seconds for command: %s",
+                FFMPEG_TIMEOUT_SECONDS,
+                " ".join(cmd[:10]),
+            )
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
@@ -3126,11 +3222,11 @@ async def run_ffmpeg_with_timeout(
                     pass
             raise
 
-    async def _run_with_subprocess_fallback(launch_error: Optional[Exception] = None) -> int:
+    async def _run_with_subprocess_fallback(
+        launch_error: Optional[Exception] = None,
+    ) -> int:
         try:
-            proc_sync = await asyncio.to_thread(
-                subprocess.Popen,
-                cmd,
+            popen_kwargs = dict(
                 stdin=subprocess.DEVNULL,
                 stdout=log_handle if hasattr(log_handle, "write") else subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -3139,6 +3235,16 @@ async def run_ffmpeg_with_timeout(
                 errors="ignore",
                 bufsize=1,
             )
+            if os.name != "nt":
+                popen_kwargs["preexec_fn"] = _child_setup
+
+            proc_sync = await asyncio.to_thread(
+                subprocess.Popen,
+                cmd,
+                **popen_kwargs,
+            )
+            if process_handle is not None:
+                process_handle.process = proc_sync
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.error("Failed to launch ffmpeg command %s: %s", cmd, exc)
             _flush_logs()
@@ -3146,76 +3252,94 @@ async def run_ffmpeg_with_timeout(
                 raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from launch_error
             raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from exc
 
-        reader_thread: Optional[threading.Thread] = None
-        if proc_sync.stderr is not None:
+        try:
+            reader_thread: Optional[threading.Thread] = None
+            if proc_sync.stderr is not None:
 
-            def _reader() -> None:
-                try:
-                    for line in proc_sync.stderr:
+                def _reader() -> None:
+                    try:
+                        for line in proc_sync.stderr:
+                            try:
+                                if hasattr(log_handle, "write"):
+                                    log_handle.write(line)
+                                    if hasattr(log_handle, "flush"):
+                                        log_handle.flush()
+                            except Exception:
+                                pass
+                            if progress_parser is not None:
+                                try:
+                                    progress_parser(line)
+                                except Exception as exc:
+                                    logger.debug(
+                                        "Progress parser failed on line: %s - %s",
+                                        line[:100],
+                                        exc,
+                                    )
+                    finally:
                         try:
-                            if hasattr(log_handle, "write"):
-                                log_handle.write(line)
-                                if hasattr(log_handle, "flush"):
-                                    log_handle.flush()
+                            proc_sync.stderr.close()
                         except Exception:
                             pass
-                        if progress_parser is not None:
-                            try:
-                                progress_parser(line)
-                            except Exception as exc:
-                                logger.debug(
-                                    "Progress parser failed on line: %s - %s",
-                                    line[:100],
-                                    exc,
-                                )
-                finally:
-                    try:
-                        proc_sync.stderr.close()
-                    except Exception:
-                        pass
 
-            reader_thread = threading.Thread(target=_reader, daemon=True)
-            reader_thread.start()
+                reader_thread = threading.Thread(target=_reader, daemon=True)
+                reader_thread.start()
 
-        loop = asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
 
-        try:
-            return_code = await loop.run_in_executor(
-                None,
-                lambda: proc_sync.wait(timeout=FFMPEG_TIMEOUT_SECONDS),
-            )
-            return _interpret_return_code(return_code)
-        except subprocess.TimeoutExpired:
-            proc_sync.terminate()
             try:
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: proc_sync.wait(timeout=5)),
-                    timeout=5,
+                return_code = await loop.run_in_executor(
+                    None,
+                    lambda: proc_sync.wait(timeout=FFMPEG_TIMEOUT_SECONDS),
                 )
-            except (asyncio.TimeoutError, subprocess.TimeoutExpired):
-                proc_sync.kill()
+                return _interpret_return_code(return_code)
+            except subprocess.TimeoutExpired:
+                logger.error(
+                    "FFmpeg process timed out after %d seconds for command: %s",
+                    FFMPEG_TIMEOUT_SECONDS,
+                    " ".join(cmd[:10]),
+                )
+                proc_sync.terminate()
                 try:
                     await asyncio.wait_for(
-                        loop.run_in_executor(None, lambda: proc_sync.wait(timeout=1)),
-                        timeout=1,
+                        loop.run_in_executor(None, lambda: proc_sync.wait(timeout=5)),
+                        timeout=5,
                     )
                 except (asyncio.TimeoutError, subprocess.TimeoutExpired):
-                    pass
-            logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
-            _flush_logs()
-            raise HTTPException(status_code=504, detail="Processing timeout")
+                    proc_sync.kill()
+                    try:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, lambda: proc_sync.wait(timeout=1)),
+                            timeout=1,
+                        )
+                    except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+                        pass
+                logger.warning("FFmpeg timed out after %s seconds: %s", FFMPEG_TIMEOUT_SECONDS, cmd)
+                _flush_logs()
+                raise HTTPException(status_code=504, detail="Processing timeout")
+            finally:
+                if reader_thread is not None:
+                    reader_thread.join(timeout=1)
         finally:
-            if reader_thread is not None:
-                reader_thread.join(timeout=1)
+            if process_handle is not None:
+                process_handle.process = None
 
         return _interpret_return_code(0)
+
+    def _child_setup() -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    subprocess_kwargs: Dict[str, Any] = {
+        "stdin": asyncio.subprocess.DEVNULL,
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+    if os.name != "nt":
+        subprocess_kwargs["preexec_fn"] = _child_setup
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            **subprocess_kwargs,
         )
     except AttributeError as attr_error:
         return _interpret_return_code(await _run_with_subprocess_fallback(attr_error))
@@ -3224,7 +3348,13 @@ async def run_ffmpeg_with_timeout(
         _flush_logs()
         raise HTTPException(status_code=500, detail="Failed to start ffmpeg") from exc
     else:
-        return await _run_with_asyncio_process()
+        if process_handle is not None:
+            process_handle.process = proc
+        try:
+            return await _run_with_asyncio_process()
+        finally:
+            if process_handle is not None:
+                process_handle.process = None
 
     return await _run_with_asyncio_process()
 
@@ -3232,14 +3362,22 @@ async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
     suffix = video_path.suffix.lower()
     if suffix not in VIDEO_THUMBNAIL_EXTENSIONS:
         return None
+
     thumb_dir = video_path.parent / THUMBNAIL_DIR_NAME
     try:
         thumb_dir.mkdir(parents=True, exist_ok=True)
+    except FileNotFoundError as exc:
+        logger.debug("Parent directory missing for thumbnail %s: %s", video_path, exc)
+        return None
     except Exception as exc:
         logger.debug("Unable to create thumbnail directory %s: %s", thumb_dir, exc)
         return None
+
     thumb_path = thumb_dir / f"{video_path.stem}.jpg"
     temp_log = WORK_DIR / f"thumb_{video_path.stem}.log"
+
+    logger.info("Starting thumbnail generation for %s", video_path.name)
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -3253,10 +3391,29 @@ async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
         "scale=320:-1",
         str(thumb_path),
     ]
+
+    code: Optional[int] = None
     try:
         with temp_log.open("w", encoding="utf-8", errors="ignore") as log_handle:
-            code = await run_ffmpeg_with_timeout(cmd, log_handle)
+            code = await asyncio.wait_for(
+                run_ffmpeg_with_timeout(
+                    cmd,
+                    log_handle,
+                    allow_gpu_fallback=False,
+                ),
+                timeout=30,
+            )
+        logger.info("Thumbnail generation completed with code %d", code)
+    except asyncio.TimeoutError:
+        logger.warning("Thumbnail generation timed out for %s", video_path)
+        if thumb_path.exists():
+            try:
+                thumb_path.unlink()
+            except Exception:
+                pass
+        return None
     except HTTPException:
+        logger.warning("Thumbnail generation failed for %s", video_path)
         if thumb_path.exists():
             try:
                 thumb_path.unlink()
@@ -3269,6 +3426,7 @@ async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
                 temp_log.unlink()
             except Exception:
                 pass
+
     if code != 0 or not thumb_path.exists():
         if thumb_path.exists():
             try:
@@ -3276,6 +3434,8 @@ async def generate_video_thumbnail(video_path: Path) -> Optional[Path]:
             except Exception as exc:
                 logger.warning("Failed to remove thumbnail %s: %s", thumb_path, exc)
         return None
+
+    logger.info("Thumbnail saved to %s", thumb_path)
     return thumb_path
 
 def cleanup_old_public(days: Optional[float] = None, *, batch_size: Optional[int] = None) -> None:
@@ -3381,16 +3541,10 @@ async def _periodic_cache_cleanup():
         raise
     while True:
         try:
-            cutoff = time.time() - PROBE_CACHE_TTL
-            expired: List[str] = []
             with PROBE_CACHE_LOCK:
-                for key, (_, timestamp) in list(PROBE_CACHE.items()):
-                    if timestamp < cutoff:
-                        expired.append(key)
-                for key in expired:
-                    PROBE_CACHE.pop(key, None)
-            if expired:
-                logger.info("Cleaned %d expired probe cache entries", len(expired))
+                removed = PROBE_CACHE.cleanup_expired()
+            if removed:
+                logger.info("Cleaned %d expired probe cache entries", removed)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -3466,9 +3620,11 @@ async def publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None
         duration_ms=duration_ms,
     )
 
+    logger.info("File published: %s, starting thumbnail generation", name)
     thumbnail_rel: Optional[str] = None
     try:
         thumb_path = await generate_video_thumbnail(dst)
+        logger.info("Thumbnail generation finished for %s", name)
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.debug("Thumbnail generation failed for %s: %s", dst, exc)
     else:
@@ -4855,8 +5011,6 @@ async def settings_login(request: Request):
             if not second_factor_ok:
                 if backup_code:
                     second_factor_ok = UI_AUTH.verify_backup_code(backup_code)
-                elif totp_code:
-                    second_factor_ok = UI_AUTH.verify_backup_code(totp_code)
             if not second_factor_ok:
                 csrf_token = ensure_csrf_token(request)
                 return login_template_response(
@@ -4868,12 +5022,15 @@ async def settings_login(request: Request):
                 )
         token = UI_AUTH.create_session()
         response = RedirectResponse(url=next_path, status_code=303)
+        cookie_is_secure = request.url.scheme == "https"
+        samesite_policy = "strict" if cookie_is_secure else "lax"
         response.set_cookie(
             SESSION_COOKIE_NAME,
             token,
             max_age=SESSION_TTL_SECONDS,
             httponly=True,
-            samesite="lax",
+            samesite=samesite_policy,
+            secure=cookie_is_secure,
         )
         return response
 
@@ -5960,25 +6117,42 @@ def _normalize_media_url(url: str) -> str:
     double_prefix = f"{proxy_base}/{localhost_base}"
     double_proxy = f"{proxy_base}/{proxy_base}"
 
-    while normalized.startswith(double_proxy):
-        normalized = proxy_base + normalized[len(double_proxy) :]
+    def _bounded_replace(value: str, prefix: str, replacement: str, label: str) -> str:
+        max_iterations = 10
+        iterations = 0
+        while value.startswith(prefix):
+            value = replacement + value[len(prefix) :]
+            iterations += 1
+            if iterations >= max_iterations:
+                logger.warning("URL normalization hit max iterations (%s): %s", label, url)
+                break
+        return value
 
-    while normalized.startswith(double_prefix):
-        normalized = proxy_base + normalized[len(double_prefix) :]
+    normalized = _bounded_replace(normalized, double_proxy, proxy_base, "double-proxy")
 
-    if normalized.startswith(double_prefix):
-        normalized = proxy_base + normalized[len(double_prefix) :]
-    elif normalized.startswith(localhost_base):
+    normalized = _bounded_replace(normalized, double_prefix, proxy_base, "proxy-prefix")
+
+    if normalized.startswith(localhost_base):
         normalized = proxy_base + normalized[len(localhost_base) :]
 
     proxy_http_prefix = f"{proxy_base}/http://"
-    while normalized.startswith(proxy_http_prefix):
-        normalized = normalized[len(proxy_base) + 1 :]
+    normalized = _bounded_replace(
+        normalized,
+        proxy_http_prefix,
+        "http://",
+        "proxy-http",
+    )
 
     if normalized.startswith("http://"):
         rest = normalized[len("http://") :]
+        max_repeats = 10
+        repeats = 0
         while rest.startswith("http://"):
             rest = rest[len("http://") :]
+            repeats += 1
+            if repeats >= max_repeats:
+                logger.warning("URL normalization trimmed repeated scheme %s times: %s", repeats, url)
+                break
         normalized = "http://" + rest
 
     parsed = urlparse(normalized)
@@ -6023,16 +6197,28 @@ async def _download_to(
         for attempt in range(max_retries):
             try:
                 req_hdr = dict(base_headers)
-                existing_size = dest.stat().st_size if dest.exists() else 0
+                existing_size = 0
+                had_existing_file = False
+                try:
+                    stat_result = dest.stat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    existing_size = stat_result.st_size
+                    had_existing_file = True
 
-                if not can_resume and dest.exists():
+                if not can_resume and had_existing_file:
                     try:
                         dest.unlink()
+                    except FileNotFoundError:
+                        pass
                     except Exception as cleanup_exc:
                         logger.warning("Failed to reset download %s: %s", dest, cleanup_exc)
                         _flush_logs()
                     existing_size = 0
 
+                downloaded = existing_size
+                wrote_data = False
                 use_resume = can_resume and existing_size > 0
 
                 if use_resume:
@@ -6087,6 +6273,7 @@ async def _download_to(
                                     ) from cleanup_exc
                             mode = "wb"
                             existing_size = 0
+                            downloaded = 0
                             can_resume = False
                         else:
                             logger.error(
@@ -6122,14 +6309,18 @@ async def _download_to(
                         )
                     check_disk_space(dest.parent, required_mb=required_mb)
 
-                    downloaded = existing_size
                     last_log = downloaded
+                    space_check_interval = 64 * 1024 * 1024
+                    last_space_check = downloaded
+                    periodic_required_mb = required_mb
 
                     with dest.open(mode) as f:
                         async for chunk in r.aiter_bytes(chunk_size):
                             if chunk:
+                                chunk_len = len(chunk)
                                 f.write(chunk)
-                                downloaded += len(chunk)
+                                downloaded += chunk_len
+                                wrote_data = True
 
                                 if downloaded - last_log >= 50 * 1024 * 1024:
                                     if total_size:
@@ -6144,6 +6335,32 @@ async def _download_to(
                                         logger.info("Downloaded: %.0fMB", downloaded / 1024 / 1024)
                                     last_log = downloaded
 
+                                if downloaded - last_space_check >= space_check_interval:
+                                    if total_size:
+                                        remaining = total_size - downloaded
+                                        if remaining < 0:
+                                            remaining = 0
+                                        remaining_mb = (remaining + 1024 * 1024 - 1) // (
+                                            1024 * 1024
+                                        )
+                                        new_required = max(
+                                            MIN_FREE_SPACE_MB,
+                                            MIN_FREE_SPACE_MB + remaining_mb,
+                                        )
+                                        periodic_required_mb = max(
+                                            periodic_required_mb,
+                                            new_required,
+                                        )
+                                    else:
+                                        periodic_required_mb = MIN_FREE_SPACE_MB
+                                    try:
+                                        check_disk_space(
+                                            dest.parent, required_mb=periodic_required_mb
+                                        )
+                                    except HTTPException:
+                                        raise
+                                    last_space_check = downloaded
+
                     if total_size and downloaded != total_size:
                         raise Exception(
                             f"Download incomplete: got {downloaded} bytes, expected {total_size}"
@@ -6155,6 +6372,16 @@ async def _download_to(
                     return
 
             except HTTPException:
+                remove_partial = not use_resume or wrote_data
+                if remove_partial and dest.exists():
+                    try:
+                        dest.unlink()
+                    except Exception as cleanup_exc:
+                        logger.warning(
+                            "Failed removing incomplete download %s: %s",
+                            dest,
+                            cleanup_exc,
+                        )
                 raise
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -6326,6 +6553,8 @@ async def compose_from_binaries(
 
 @app.post("/video/concat-from-urls")
 async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
+    if not job.clips:
+        raise HTTPException(status_code=422, detail="At least one video clip is required")
     logger.info(f"Starting concat: {len(job.clips)} clips, {job.width}x{job.height}@{job.fps}fps")
     check_disk_space(WORK_DIR)
 
@@ -6655,55 +6884,40 @@ async def _concat_impl(job: ConcatJob, as_json: bool, force_cpu: bool = False):
         return resp
 
 
-class ConcatAliasJob(BaseModel):
+class ConcatAliasJob(ConcatJob):
     clips: Optional[List[HttpUrl]] = None
     urls: Optional[List[HttpUrl]] = None
-    width: int = 1920
-    height: int = 1080
-    fps: int = 30
 
-    @field_validator("clips", "urls", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def validate_optional_clips(cls, value):
-        if value is None:
-            return value
-        if not value:
-            raise ValueError("Clip list cannot be empty")
-        if isinstance(value, (str, bytes)):
-            raise ValueError("Clips must be provided as a list of URLs")
-        if len(value) > 100:
-            raise ValueError("Too many clips (max 100)")
-        for clip in value:
-            clip_str = str(clip)
-            if not clip_str.startswith(("http://", "https://")):
-                raise ValueError("Only http:// and https:// clip URLs are supported")
-        return value
+    def apply_url_alias(cls, values: Any) -> Any:
+        if isinstance(values, dict):
+            clips = values.get("clips")
+            urls = values.get("urls")
+            if not clips and urls:
+                values = dict(values)
+                values["clips"] = urls
+        return values
 
-    @field_validator("width", "height")
-    @classmethod
-    def validate_dimensions(cls, value: int) -> int:
-        if not (1 <= value <= 7680):
-            raise ValueError(f"Dimension must be 1-7680, got {value}")
-        return value
-
-    @field_validator("fps")
-    @classmethod
-    def validate_fps(cls, value: int) -> int:
-        if not (1 <= value <= 240):
-            raise ValueError(f"FPS must be 1-240, got {value}")
-        return value
+    @model_validator(mode="after")
+    def ensure_urls_reflect_clips(self) -> "ConcatAliasJob":
+        if self.clips and self.urls is None:
+            self.urls = self.clips
+        return self
 
 @app.post("/video/concat")
 async def video_concat_alias(job: ConcatAliasJob, as_json: bool = False):
-    clip_list = job.clips or job.urls
-    if not clip_list:
+    if not job.clips:
         raise HTTPException(status_code=422, detail="Provide 'clips' (preferred) or 'urls' array of video URLs")
-    cj = ConcatJob(clips=clip_list, width=job.width, height=job.height, fps=job.fps)
-    return await video_concat_from_urls(cj, as_json=as_json)
+    return await video_concat_from_urls(job, as_json=as_json)
 
 
 async def _compose_from_urls_impl(
-    job: ComposeFromUrlsJob, progress: Optional[JobProgressReporter] = None
+    job: ComposeFromUrlsJob,
+    progress: Optional[JobProgressReporter] = None,
+    *,
+    process_handle: Optional[JobProcessHandle] = None,
+    job_id: Optional[str] = None,
 ) -> Dict[str, str]:
     check_disk_space(WORK_DIR)
 
@@ -6825,8 +7039,16 @@ async def _compose_from_urls_impl(
             )
         elif progress:
             progress.update(70, "Rendering composition (unknown duration)")
+        if job_id and _job_marked_killed(job_id):
+            raise RuntimeError("job_killed")
+
         with log_path.open("w", encoding="utf-8", errors="ignore") as logf:
-            code = await run_ffmpeg_with_timeout(cmd, logf, progress_parser=parser)
+            code = await run_ffmpeg_with_timeout(
+                cmd,
+                logf,
+                progress_parser=parser,
+                process_handle=process_handle,
+            )
         save_log(log_path, "compose-urls")
         if code != 0 or not out_path.exists():
             logger.error("compose-from-urls failed")
@@ -6976,9 +7198,22 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
     reporter = JobProgressReporter(job_id)
     start = time.perf_counter()
     struct_logger.info("job_started", job_id=job_id, job_type="compose_from_urls")
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
     try:
-        pub = await _compose_from_urls_impl(job, reporter)
+        pub = await _compose_from_urls_impl(
+            job,
+            reporter,
+            process_handle=process_handle,
+            job_id=job_id,
+        )
     except HTTPException as exc:
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
+        if _job_marked_killed(job_id):
+            logger.info("Compose job %s marked as killed during HTTPException", job_id)
+            return
         reporter.update(100, "Composition failed")
         detail = exc.detail if isinstance(exc.detail, (str, dict)) else str(exc.detail)
         struct_logger.error(
@@ -7015,6 +7250,11 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
         )
         return
     except Exception as exc:
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
+        if _job_marked_killed(job_id):
+            logger.info("Compose job %s marked as killed during unexpected failure", job_id)
+            return
         reporter.update(100, "Unexpected failure")
         logger.exception("Async compose job %s failed", job_id)
         struct_logger.error(
@@ -7051,6 +7291,11 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
         )
         return
 
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES.pop(job_id, None)
+    if _job_marked_killed(job_id):
+        logger.info("Compose job %s completed after being killed", job_id)
+        return
     reporter.update(100, "Completed")
     duration_ms = (time.perf_counter() - start) * 1000.0
     with JOBS_LOCK:
@@ -7368,6 +7613,112 @@ async def job_status(request: Request, job_id: str, format: str = "json"):
     if elapsed_seconds is not None:
         payload["elapsed_seconds"] = int(elapsed_seconds)
     return payload
+
+
+def _job_marked_killed(job_id: str) -> bool:
+    with JOBS_LOCK:
+        return JOBS.get(job_id, {}).get("status") == "killed"
+
+
+@app.post("/jobs/{job_id}/kill")
+async def kill_job(request: Request, job_id: str):
+    """Kill a running job and mark it as killed."""
+
+    accept_header = request.headers.get("accept", "")
+    if accept_header.startswith("text/html"):
+        redirect = ensure_dashboard_access(request)
+        if redirect:
+            return redirect
+
+    cleanup_old_jobs()
+
+    with JOBS_LOCK:
+        job_data = JOBS.get(job_id)
+
+    if job_data is None:
+        raise HTTPException(status_code=404, detail="job_not_found")
+
+    status = job_data.get("status")
+    if status not in {"queued", "processing"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot kill job with status '{status}'. Only queued/processing jobs can be killed.",
+        )
+
+    with JOB_PROCESSES_LOCK:
+        process_handle = JOB_PROCESSES.get(job_id)
+
+    process = None
+    if process_handle is not None:
+        process = getattr(process_handle, "process", process_handle)
+    killed = False
+
+    if process is not None:
+        try:
+            if isinstance(process, asyncio.subprocess.Process):
+                if process.returncode is None:
+                    process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                        killed = True
+                    except asyncio.TimeoutError:
+                        process.kill()
+                        try:
+                            await asyncio.wait_for(process.wait(), timeout=1)
+                            killed = True
+                        except asyncio.TimeoutError:
+                            pass
+            else:
+                if getattr(process, "poll", lambda: None)() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                        killed = True
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        try:
+                            process.wait(timeout=1)
+                            killed = True
+                        except subprocess.TimeoutExpired:
+                            pass
+        except Exception as exc:
+            logger.warning("Failed to kill process for job %s: %s", job_id, exc)
+
+    with JOBS_LOCK:
+        existing = JOBS.get(job_id, {})
+        history = list(existing.get("history", []))
+        history.append(
+            {
+                "timestamp": time.time(),
+                "progress": existing.get("progress", 0),
+                "message": "Killed by user",
+            }
+        )
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+
+        JOBS[job_id] = {
+            **existing,
+            "status": "killed",
+            "message": "Killed by user",
+            "updated": time.time(),
+            "history": history,
+        }
+
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES.pop(job_id, None)
+
+    logger.info("Job %s killed by user (process killed: %s)", job_id, killed)
+
+    if accept_header.startswith("text/html"):
+        return RedirectResponse(url="/jobs", status_code=303)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "killed",
+        "process_killed": killed,
+    }
 
 
 def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
@@ -7913,33 +8264,37 @@ def _update_ffmpeg_async_job(
     **extra: Any,
 ) -> None:
     with JOBS_LOCK:
-        existing = JOBS.get(job_id, {})
-        created = existing.get("created", time.time())
-        history = list(existing.get("history", []))
-        if progress is not None or message is not None:
-            history.append(
-                {
-                    "timestamp": time.time(),
-                    "progress": progress if progress is not None else existing.get("progress", 0),
-                    "message": message if message is not None else existing.get("message", ""),
-                }
-            )
-            if len(history) > JOB_HISTORY_LIMIT:
-                history = history[-JOB_HISTORY_LIMIT:]
+        existing = dict(JOBS.get(job_id, {}))
 
-        updated: Dict[str, Any] = {
-            **existing,
-            "created": created,
-            "updated": time.time(),
-            "history": history,
-        }
-        if progress is not None:
-            updated["progress"] = progress
-        if message is not None:
-            updated["message"] = message
-        if status is not None:
-            updated["status"] = status
-        updated.update(extra)
+    timestamp = time.time()
+    created = existing.get("created", timestamp)
+    history = list(existing.get("history", []))
+    if progress is not None or message is not None:
+        history.append(
+            {
+                "timestamp": timestamp,
+                "progress": progress if progress is not None else existing.get("progress", 0),
+                "message": message if message is not None else existing.get("message", ""),
+            }
+        )
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+
+    updated: Dict[str, Any] = {
+        **existing,
+        "created": created,
+        "updated": timestamp,
+        "history": history,
+    }
+    if progress is not None:
+        updated["progress"] = progress
+    if message is not None:
+        updated["message"] = message
+    if status is not None:
+        updated["status"] = status
+    updated.update(extra)
+
+    with JOBS_LOCK:
         JOBS[job_id] = updated
 
 
@@ -7979,6 +8334,10 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
     start = time.perf_counter()
     struct_logger.info("job_started", job_id=job_id, job_type="ffmpeg_job")
+
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
 
     try:
         check_disk_space(WORK_DIR)
@@ -8031,12 +8390,135 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 progress=60,
                 message="Processing with FFmpeg",
             )
-            with log_path.open("w", encoding="utf-8", errors="ignore") as lf:
-                code = await run_ffmpeg_with_timeout(cmd, lf)
+
+            last_update_time = [time.time()]
+            current_progress = [60]
+            last_logged_time = [time.time()]
+
+            def smart_progress_updater(line: str) -> None:
+                """Update progress based on time elapsed and FFmpeg metrics."""
+
+                now = time.time()
+
+                if now - last_update_time[0] >= 3:
+                    if current_progress[0] < 95:
+                        increment = 2 if current_progress[0] < 80 else 1
+                        current_progress[0] = min(95, current_progress[0] + increment)
+
+                    metrics: Dict[str, str] = {}
+                    detail_parts: List[str] = []
+
+                    time_match = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
+                    if time_match:
+                        hours, minutes, seconds = time_match.groups()
+                        total_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+                        metrics["time"] = f"{total_seconds:.1f}s"
+                        detail_parts.append(f"time={total_seconds:.1f}s")
+
+                    fps_match = re.search(r"fps=\s*(\d+\.?\d*)", line)
+                    if fps_match:
+                        metrics["fps"] = fps_match.group(1)
+                        detail_parts.append(f"fps={fps_match.group(1)}")
+
+                    speed_match = re.search(r"speed=\s*(\d+\.?\d*)x", line)
+                    if speed_match:
+                        metrics["speed"] = f"{speed_match.group(1)}x"
+                        detail_parts.append(f"speed={speed_match.group(1)}x")
+
+                    frame_match = re.search(r"frame=\s*(\d+)", line)
+                    if frame_match:
+                        metrics["frame"] = frame_match.group(1)
+
+                    detail = " | ".join(detail_parts) if detail_parts else "Active"
+
+                    _update_ffmpeg_async_job(
+                        job_id,
+                        progress=current_progress[0],
+                        message="Processing with FFmpeg",
+                        detail=detail,
+                        ffmpeg_stats=metrics or None,
+                    )
+                    last_update_time[0] = now
+
+                if now - last_logged_time[0] >= 30:
+                    logger.info(
+                        "Job %s still processing (progress: %d%%, elapsed: %.0fs)",
+                        job_id,
+                        current_progress[0],
+                        now - start,
+                    )
+                    last_logged_time[0] = now
+
+            async def watchdog() -> None:
+                try:
+                    for _ in range(0, FFMPEG_TIMEOUT_SECONDS, 60):
+                        await asyncio.sleep(60)
+                        elapsed = time.time() - start
+                        logger.info(
+                            "Job %s watchdog: %d seconds elapsed, still processing",
+                            job_id,
+                            int(elapsed),
+                        )
+                except asyncio.CancelledError:
+                    pass
+
+            watchdog_task = asyncio.create_task(watchdog())
+
+            logger.info(
+                "Starting FFmpeg for job %s with command: %s",
+                job_id,
+                " ".join(cmd[:15]) + ("..." if len(cmd) > 15 else ""),
+            )
+
+            if _job_marked_killed(job_id):
+                logger.info(
+                    "FFmpeg job %s marked as killed before launching FFmpeg",
+                    job_id,
+                )
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
+                return
+
+            try:
+                with log_path.open(
+                    "w",
+                    encoding="utf-8",
+                    errors="ignore",
+                    buffering=1,
+                ) as lf:
+                    code = await run_ffmpeg_with_timeout(
+                        cmd,
+                        lf,
+                        progress_parser=smart_progress_updater,
+                        process_handle=process_handle,
+                    )
+            finally:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
+
+            logger.info(
+                "FFmpeg completed for job %s with exit code %d (took %.1fs)",
+                job_id,
+                code,
+                time.time() - start,
+            )
 
             save_log(log_path, "ffmpeg-job-async")
 
             if code != 0:
+                if _job_marked_killed(job_id):
+                    logger.info(
+                        "FFmpeg job %s marked as killed after exit code %d",
+                        job_id,
+                        code,
+                    )
+                    return
                 error_text = log_path.read_text(encoding="utf-8", errors="ignore")
                 _update_ffmpeg_async_job(
                     job_id,
@@ -8055,6 +8537,12 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
             missing_outputs = [p for p in output_paths if not p.exists()]
             if missing_outputs:
+                if _job_marked_killed(job_id):
+                    logger.info(
+                        "FFmpeg job %s marked as killed while checking outputs",
+                        job_id,
+                    )
+                    return
                 _update_ffmpeg_async_job(
                     job_id,
                     progress=100,
@@ -8071,6 +8559,10 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 )
                 return
 
+            if _job_marked_killed(job_id):
+                logger.info("FFmpeg job %s marked as killed before publishing outputs", job_id)
+                return
+
             _update_ffmpeg_async_job(
                 job_id,
                 progress=90,
@@ -8084,6 +8576,9 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 logger.info("Published output: %s -> %s", output_path.name, pub["rel"])
 
             duration_ms = (time.perf_counter() - start) * 1000.0
+            if _job_marked_killed(job_id):
+                logger.info("FFmpeg job %s completed after being killed", job_id)
+                return
             _update_ffmpeg_async_job(
                 job_id,
                 progress=100,
@@ -8100,20 +8595,26 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
             )
 
     except Exception as exc:
-        logger.exception("Async FFmpeg job %s failed", job_id)
-        _update_ffmpeg_async_job(
-            job_id,
-            progress=100,
-            message="Failed",
-            status="failed",
-            error=str(exc),
-        )
-        struct_logger.error(
-            "job_failed",
-            job_id=job_id,
-            job_type="ffmpeg_job",
-            error=str(exc),
-        )
+        if _job_marked_killed(job_id):
+            logger.info("FFmpeg job %s stopped after kill: %s", job_id, exc)
+        else:
+            logger.exception("Async FFmpeg job %s failed", job_id)
+            _update_ffmpeg_async_job(
+                job_id,
+                progress=100,
+                message="Failed",
+                status="failed",
+                error=str(exc),
+            )
+            struct_logger.error(
+                "job_failed",
+                job_id=job_id,
+                job_type="ffmpeg_job",
+                error=str(exc),
+            )
+    finally:
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
 
 # ---------- audio endpoints ----------
 
@@ -8397,15 +8898,13 @@ def probe_from_urls(job: ProbeUrlJob):
     }
     cache_key = _probe_cache_key(str(job.url), cache_params)
     cached: Optional[Tuple[dict, float]] = None
-    now = time.time()
     if PROBE_CACHE_TTL > 0:
         with PROBE_CACHE_LOCK:
             cached = PROBE_CACHE.get(cache_key)
     if cached is not None:
-        result, timestamp = cached
-        if now - timestamp < PROBE_CACHE_TTL:
-            logger.info("Probe cache hit for %s", job.url)
-            return result
+        result, _timestamp = cached
+        logger.info("Probe cache hit for %s", job.url)
+        return result
 
     cmd = _ffprobe_cmd_base(
         job.show_format,
@@ -8443,7 +8942,7 @@ def probe_from_urls(job: ProbeUrlJob):
 
     if PROBE_CACHE_TTL > 0:
         with PROBE_CACHE_LOCK:
-            PROBE_CACHE[cache_key] = (result, time.time())
+            PROBE_CACHE.set(cache_key, result)
         logger.info("Probe result cached for %s", job.url)
     return result
 

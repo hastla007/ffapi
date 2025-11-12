@@ -73,7 +73,66 @@
       color: #475569;
       font-size: 14px;
     }
+    .action-buttons {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .kill-btn {
+      padding: 4px 12px;
+      background: #dc3545;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .kill-btn:hover {
+      background: #c82333;
+    }
+    .kill-btn:disabled {
+      background: #6c757d;
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
   </style>
+  <script>
+    async function killJob(jobId, statusSpan) {
+      if (!confirm('Are you sure you want to kill this job? This action cannot be undone.')) {
+        return;
+      }
+
+      const button = event.target;
+      button.disabled = true;
+      button.textContent = 'Killing...';
+
+      try {
+        const response = await fetch(`/jobs/${jobId}/kill`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          }
+        });
+
+        if (response.ok) {
+          statusSpan.textContent = 'killed';
+          statusSpan.className = 'status error';
+          button.textContent = 'Killed';
+          setTimeout(() => window.location.reload(), 1000);
+        } else {
+          const data = await response.json();
+          alert('Failed to kill job: ' + (data.detail || 'Unknown error'));
+          button.disabled = false;
+          button.textContent = 'Kill';
+        }
+      } catch (error) {
+        alert('Error killing job: ' + error.message);
+        button.disabled = false;
+        button.textContent = 'Kill';
+      }
+    }
+  </script>
 {% endblock %}
 
 {% block content %}
@@ -90,7 +149,7 @@
         <th>Status</th>
         <th>Created</th>
         <th>Duration</th>
-        <th>Action</th>
+        <th>Actions</th>
       </tr>
     </thead>
     <tbody>
@@ -98,10 +157,17 @@
         {% for job in jobs %}
           <tr>
             <td><code>{{ job.job_id }}</code></td>
-            <td><span class="status {{ job.status_class }}">{{ job.status }}</span></td>
+            <td><span class="status {{ job.status_class }}" id="status-{{ job.job_id }}">{{ job.status }}</span></td>
             <td>{{ job.created }}</td>
             <td>{{ job.duration }}</td>
-            <td><a href="/jobs/{{ job.job_id }}?format=html" target="_blank">View</a></td>
+            <td>
+              <div class="action-buttons">
+                <a href="/jobs/{{ job.job_id }}?format=html">View</a>
+                {% if job.status in ['queued', 'processing'] %}
+                  <button class="kill-btn" onclick="killJob('{{ job.job_id }}', document.getElementById('status-{{ job.job_id }}'))">Kill</button>
+                {% endif %}
+              </div>
+            </td>
           </tr>
         {% endfor %}
       {% else %}
