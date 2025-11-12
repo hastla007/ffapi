@@ -7689,7 +7689,7 @@ async def compose_from_urls_async(job: ComposeFromUrlsJob):
 
 @app.get("/jobs/{job_id}/log")
 async def job_log(request: Request, job_id: str, format: str = "text"):
-    """Get FFmpeg log for a job."""
+    """Get FFmpeg log for a job with live updates."""
 
     cleanup_old_jobs()
 
@@ -7712,7 +7712,12 @@ async def job_log(request: Request, job_id: str, format: str = "text"):
         if redirect:
             return redirect
 
+        # Get current job status for auto-refresh decision
+        job_status = data.get("status", "unknown")
+        is_active = job_status in ["queued", "processing"]
+
         log_content = log_file.read_text(encoding="utf-8", errors="ignore")
+
         html_content = f"""
         <!doctype html>
         <html>
@@ -7720,19 +7725,404 @@ async def job_log(request: Request, job_id: str, format: str = "text"):
             <meta charset=\"utf-8\" />
             <title>Job {job_id} - FFmpeg Log</title>
             <style>
-                body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
-                .log-container {{ background: #1e1e1e; color: #d4d4d4; padding: 20px; border-radius: 8px; overflow-x: auto; }}
-                pre {{ margin: 0; font-family: 'Courier New', monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; }}
-                .back-link {{ display: inline-block; margin-bottom: 20px; color: #28a745; text-decoration: none; font-weight: 600; }}
-                .back-link:hover {{ text-decoration: underline; }}
+                body {{ 
+                    font-family: system-ui, sans-serif; 
+                    padding: 24px; 
+                    max-width: 1400px; 
+                    margin: 0 auto; 
+                    background: #f8fafc;
+                }}
+                .header {{
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    margin-bottom: 20px;
+                    flex-wrap: wrap;
+                    gap: 12px;
+                }}
+                .back-link {{ 
+                    display: inline-block; 
+                    color: #28a745; 
+                    text-decoration: none; 
+                    font-weight: 600; 
+                }}
+                .back-link:hover {{ 
+                    text-decoration: underline; 
+                }}
+                h2 {{
+                    margin: 0;
+                    color: #1f2937;
+                }}
+                .controls {{
+                    display: flex;
+                    gap: 8px;
+                    align-items: center;
+                    flex-wrap: wrap;
+                }}
+                .btn {{
+                    padding: 8px 16px;
+                    border: none;
+                    border-radius: 6px;
+                    cursor: pointer;
+                    font-size: 14px;
+                    font-weight: 600;
+                    transition: all 0.2s;
+                }}
+                .btn-primary {{
+                    background: #28a745;
+                    color: white;
+                }}
+                .btn-primary:hover {{
+                    background: #1f7a34;
+                }}
+                .btn-secondary {{
+                    background: #6c757d;
+                    color: white;
+                }}
+                .btn-secondary:hover {{
+                    background: #5a6268;
+                }}
+                .btn-danger {{
+                    background: #dc3545;
+                    color: white;
+                }}
+                .btn-danger:hover {{
+                    background: #c82333;
+                }}
+                .status-badge {{
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 6px;
+                    padding: 6px 12px;
+                    border-radius: 999px;
+                    font-size: 13px;
+                    font-weight: 600;
+                }}
+                .status-badge.active {{
+                    background: #d1fae5;
+                    color: #065f46;
+                }}
+                .status-badge.active::before {{
+                    content: '●';
+                    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+                }}
+                .status-badge.inactive {{
+                    background: #e5e7eb;
+                    color: #6b7280;
+                }}
+                @keyframes pulse {{
+                    0%, 100% {{ opacity: 1; }}
+                    50% {{ opacity: 0.5; }}
+                }}
+                .log-info {{
+                    background: white;
+                    padding: 12px 16px;
+                    border-radius: 8px;
+                    margin-bottom: 16px;
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                    flex-wrap: wrap;
+                    gap: 12px;
+                }}
+                .log-stats {{
+                    display: flex;
+                    gap: 24px;
+                    font-size: 14px;
+                    color: #6b7280;
+                }}
+                .log-stats span {{
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                }}
+                .log-stats strong {{
+                    color: #1f2937;
+                }}
+                .log-container {{ 
+                    background: #1e1e1e; 
+                    color: #d4d4d4; 
+                    padding: 20px; 
+                    border-radius: 8px; 
+                    overflow-x: auto;
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                    max-height: 70vh;
+                    overflow-y: auto;
+                    position: relative;
+                }}
+                .log-container.auto-scroll {{
+                    scroll-behavior: smooth;
+                }}
+                pre {{ 
+                    margin: 0; 
+                    font-family: 'Courier New', 'Monaco', monospace; 
+                    font-size: 12px; 
+                    line-height: 1.6; 
+                    white-space: pre-wrap; 
+                    word-wrap: break-word; 
+                }}
+                .log-line {{
+                    padding: 2px 0;
+                }}
+                .log-line:hover {{
+                    background: rgba(255, 255, 255, 0.05);
+                }}
+                .log-line:has(.keyword) {{
+                    color: #4ec9b0;
+                }}
+                .keyword {{
+                    color: #569cd6;
+                    font-weight: 600;
+                }}
+                .value {{
+                    color: #ce9178;
+                }}
+                .error {{
+                    color: #f48771;
+                    font-weight: 600;
+                }}
+                .warning {{
+                    color: #dcdcaa;
+                }}
+                .scroll-bottom-btn {{
+                    position: fixed;
+                    bottom: 30px;
+                    right: 30px;
+                    background: #28a745;
+                    color: white;
+                    border: none;
+                    border-radius: 50%;
+                    width: 48px;
+                    height: 48px;
+                    font-size: 20px;
+                    cursor: pointer;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+                    display: none;
+                    z-index: 1000;
+                    transition: all 0.3s;
+                }}
+                .scroll-bottom-btn:hover {{
+                    background: #1f7a34;
+                    transform: scale(1.1);
+                }}
+                .scroll-bottom-btn.show {{
+                    display: block;
+                }}
+                #updateIndicator {{
+                    position: fixed;
+                    top: 20px;
+                    right: 20px;
+                    background: #28a745;
+                    color: white;
+                    padding: 8px 16px;
+                    border-radius: 6px;
+                    font-size: 13px;
+                    font-weight: 600;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+                    display: none;
+                    z-index: 1000;
+                    animation: slideIn 0.3s ease;
+                }}
+                @keyframes slideIn {{
+                    from {{ transform: translateY(-100%); opacity: 0; }}
+                    to {{ transform: translateY(0); opacity: 1; }}
+                }}
             </style>
         </head>
         <body>
-            <a href="/jobs/{job_id}?format=html" class="back-link">&larr; Back to Job</a>
-            <h2>FFmpeg Log for Job {job_id}</h2>
-            <div class="log-container">
-                <pre>{html.escape(log_content)}</pre>
+            <div class="header">
+                <div>
+                    <a href="/jobs/{job_id}?format=html" class="back-link">&larr; Back to Job</a>
+                    <h2>FFmpeg Log - Job {job_id}</h2>
+                </div>
+                <div class="controls">
+                    <span class="status-badge {'active' if is_active else 'inactive'}" id="autoRefreshBadge">
+                        {'Live Updates' if is_active else 'Job Completed'}
+                    </span>
+                    <button class="btn btn-secondary" id="toggleAutoScroll" onclick="toggleAutoScroll()">
+                        Auto-scroll: <span id="autoScrollStatus">ON</span>
+                    </button>
+                    <button class="btn btn-secondary" onclick="copyLog()">📋 Copy</button>
+                    <button class="btn btn-primary" onclick="downloadLog()">⬇️ Download</button>
+                    {'<button class="btn btn-danger" onclick="clearLog()">🗑️ Clear View</button>' if not is_active else ''}
+                </div>
             </div>
+
+            <div class="log-info">
+                <div class="log-stats">
+                    <span><strong>Lines:</strong> <span id="lineCount">0</span></span>
+                    <span><strong>Size:</strong> <span id="fileSize">0 KB</span></span>
+                    <span><strong>Last updated:</strong> <span id="lastUpdate">Just now</span></span>
+                </div>
+            </div>
+
+            <div class="log-container" id="logContainer">
+                <pre id="logContent">{html.escape(log_content)}</pre>
+            </div>
+
+            <button class="scroll-bottom-btn" id="scrollBottomBtn" onclick="scrollToBottom(true)">
+                ↓
+            </button>
+
+            <div id="updateIndicator">Log updated</div>
+
+            <script>
+                let autoScroll = true;
+                let autoRefresh = {str(is_active).lower()};
+                let refreshInterval = null;
+                let lastLogContent = '';
+                let isUserScrolling = false;
+                let scrollTimeout = null;
+
+                const logContainer = document.getElementById('logContainer');
+                const logContent = document.getElementById('logContent');
+                const scrollBtn = document.getElementById('scrollBottomBtn');
+                const updateIndicator = document.getElementById('updateIndicator');
+
+                // Initialize
+                updateStats();
+                if (autoRefresh) {{
+                    startAutoRefresh();
+                }}
+                scrollToBottom(false);
+
+                // Monitor user scrolling
+                logContainer.addEventListener('scroll', function() {{
+                    const isAtBottom = logContainer.scrollHeight - logContainer.scrollTop <= logContainer.clientHeight + 100;
+                    
+                    if (!isAtBottom) {{
+                        scrollBtn.classList.add('show');
+                        if (autoScroll) {{
+                            autoScroll = false;
+                            updateAutoScrollButton();
+                        }}
+                    }} else {{
+                        scrollBtn.classList.remove('show');
+                    }}
+                    
+                    isUserScrolling = true;
+                    clearTimeout(scrollTimeout);
+                    scrollTimeout = setTimeout(() => {{
+                        isUserScrolling = false;
+                    }}, 1000);
+                }});
+
+                function startAutoRefresh() {{
+                    refreshInterval = setInterval(function() {{
+                        fetch('/jobs/{job_id}/log?format=text')
+                            .then(response => response.text())
+                            .then(data => {{
+                                if (data !== lastLogContent) {{
+                                    lastLogContent = data;
+                                    logContent.textContent = data;
+                                    updateStats();
+                                    
+                                    // Show update indicator
+                                    updateIndicator.style.display = 'block';
+                                    setTimeout(() => {{
+                                        updateIndicator.style.display = 'none';
+                                    }}, 1500);
+                                    
+                                    // Auto-scroll if enabled and user isn't actively scrolling
+                                    if (autoScroll && !isUserScrolling) {{
+                                        scrollToBottom(false);
+                                    }}
+                                }}
+                            }})
+                            .catch(err => console.warn('Failed to refresh log:', err));
+                        
+                        // Check if job is still active
+                        fetch('/jobs/{job_id}?format=json')
+                            .then(response => response.json())
+                            .then(data => {{
+                                const isActive = data.status === 'processing' || data.status === 'queued';
+                                if (!isActive && autoRefresh) {{
+                                    stopAutoRefresh();
+                                    document.getElementById('autoRefreshBadge').textContent = 'Job Completed';
+                                    document.getElementById('autoRefreshBadge').classList.remove('active');
+                                    document.getElementById('autoRefreshBadge').classList.add('inactive');
+                                }}
+                            }})
+                            .catch(err => console.warn('Failed to check job status:', err));
+                    }}, 2000);
+                }}
+
+                function stopAutoRefresh() {{
+                    if (refreshInterval) {{
+                        clearInterval(refreshInterval);
+                        refreshInterval = null;
+                    }}
+                    autoRefresh = false;
+                }}
+
+                function toggleAutoScroll() {{
+                    autoScroll = !autoScroll;
+                    updateAutoScrollButton();
+                    if (autoScroll) {{
+                        scrollToBottom(true);
+                    }}
+                }}
+
+                function updateAutoScrollButton() {{
+                    document.getElementById('autoScrollStatus').textContent = autoScroll ? 'ON' : 'OFF';
+                }}
+
+                function scrollToBottom(smooth) {{
+                    if (smooth) {{
+                        logContainer.scrollTo({{
+                            top: logContainer.scrollHeight,
+                            behavior: 'smooth'
+                        }});
+                    }} else {{
+                        logContainer.scrollTop = logContainer.scrollHeight;
+                    }}
+                }}
+
+                function updateStats() {{
+                    const content = logContent.textContent;
+                    const lines = content.split('\n').length;
+                    const sizeKB = (new Blob([content]).size / 1024).toFixed(2);
+                    
+                    document.getElementById('lineCount').textContent = lines.toLocaleString();
+                    document.getElementById('fileSize').textContent = sizeKB + ' KB';
+                    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+                }}
+
+                function copyLog() {{
+                    navigator.clipboard.writeText(logContent.textContent)
+                        .then(() => {{
+                            const btn = event.target;
+                            const originalText = btn.textContent;
+                            btn.textContent = '✓ Copied!';
+                            btn.style.background = '#28a745';
+                            setTimeout(() => {{
+                                btn.textContent = originalText;
+                                btn.style.background = '';
+                            }}, 2000);
+                        }})
+                        .catch(err => alert('Failed to copy: ' + err));
+                }}
+
+                function downloadLog() {{
+                    const blob = new Blob([logContent.textContent], {{ type: 'text/plain' }});
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'job_{job_id}_ffmpeg.log';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                }}
+
+                function clearLog() {{
+                    if (confirm('This will only clear the display, not the actual log file. Continue?')) {{
+                        logContent.textContent = '';
+                        updateStats();
+                    }}
+                }}
+            </script>
         </body>
         </html>
         """
@@ -8875,7 +9265,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                     )
 
             logger.info("[%s] STEP 3: Building FFmpeg command", job_id)
-            cmd = ["ffmpeg", "-y"]
+            cmd = ["ffmpeg", "-y", "-stats", "-stats_period", "1"]
             for index, input_spec in enumerate(job.task.inputs):
                 input_path = input_paths[index]
                 if input_spec.options:
@@ -8911,6 +9301,9 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
 
                 if "time=" in line or "frame=" in line:
                     logger.debug("[%s] Progress line: %s", job_id, line.strip())
+
+                if "frame=" in line or "time=" in line or "fps=" in line:
+                    logger.info("[%s] FFmpeg progress: %s", job_id, line.strip())
 
                 if now - last_update_time >= 3:
                     if current_progress < 95:
@@ -8950,7 +9343,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                         progress=current_progress,
                         message="Processing with FFmpeg",
                         detail=detail,
-                        ffmpeg_stats=metrics or None,
+                        ffmpeg_stats=metrics if metrics else None,
                     )
                     last_update_time = now
 
