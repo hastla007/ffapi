@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Deque, T
 from urllib.parse import urlencode, quote, parse_qs, urlparse
 from uuid import uuid4
 
+import html
 import re
 import signal
 import threading
@@ -3858,10 +3859,10 @@ async def publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None
     return {"dst": str(dst), "url": url, "rel": rel, "thumbnail": thumbnail_rel}
 
 
-def save_log(log_path: Path, operation: str) -> None:
-    """Save ffmpeg log to persistent logs directory."""
+def save_log(log_path: Path, operation: str) -> Optional[Path]:
+    """Save ffmpeg log to persistent logs directory and return the saved path."""
     if not log_path.exists():
-        return
+        return None
     check_disk_space(LOGS_DIR)
     now = datetime.now(timezone.utc)
     day = now.strftime("%Y%m%d")
@@ -3872,8 +3873,9 @@ def save_log(log_path: Path, operation: str) -> None:
     dst = folder / name
     try:
         shutil.copy2(str(log_path), str(dst))
+        return dst
     except Exception:
-        pass
+        return None
 
 
 # ---------- pages ----------
@@ -7144,7 +7146,7 @@ async def _compose_from_urls_impl(
     *,
     process_handle: Optional[JobProcessHandle] = None,
     job_id: Optional[str] = None,
-) -> Dict[str, str]:
+) -> Tuple[Dict[str, str], Optional[str]]:
     check_disk_space(WORK_DIR)
 
     with TemporaryDirectory(prefix="cfu_", dir=str(WORK_DIR)) as workdir:
@@ -7275,7 +7277,17 @@ async def _compose_from_urls_impl(
                 progress_parser=parser,
                 process_handle=process_handle,
             )
-        save_log(log_path, "compose-urls")
+        saved_log_path = save_log(log_path, "compose-urls")
+        log_rel_path: Optional[str] = None
+        if saved_log_path is not None:
+            try:
+                log_rel_path = str(saved_log_path.relative_to(LOGS_DIR))
+            except ValueError:
+                log_rel_path = str(saved_log_path)
+            except Exception:
+                log_rel_path = str(saved_log_path)
+            if job_id is not None:
+                _update_ffmpeg_async_job(job_id, log_path=log_rel_path)
         if code != 0 or not out_path.exists():
             logger.error("compose-from-urls failed")
             _flush_logs()
@@ -7294,12 +7306,12 @@ async def _compose_from_urls_impl(
         if progress:
             progress.update(95, "Publishing file")
         logger.info("compose-from-urls completed: %s", pub["rel"])
-        return pub
+        return pub, log_rel_path
 
 
 @app.post("/compose/from-urls")
 async def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
-    pub = await _compose_from_urls_impl(job)
+    pub, _ = await _compose_from_urls_impl(job)
     if as_json:
         return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
     resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
@@ -7444,8 +7456,10 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
     webhook_result: Optional[Dict[str, Any]] = None
     webhook_error: Optional[Any] = None
 
+    compose_log_path: Optional[str] = None
+
     try:
-        pub = await _compose_from_urls_impl(
+        pub, compose_log_path = await _compose_from_urls_impl(
             job,
             reporter,
             process_handle=process_handle,
@@ -7628,6 +7642,9 @@ async def _process_compose_from_urls_job(job_id: str, job: ComposeFromUrlsJob) -
                     elif final_status == "finished":
                         updated.pop("status_code", None)
 
+                    if compose_log_path is not None:
+                        updated["log_path"] = compose_log_path
+
                     JOBS[job_id] = updated
                 break
             except Exception as lock_exc:  # pragma: no cover - defensive logging
@@ -7668,6 +7685,64 @@ async def compose_from_urls_async(job: ComposeFromUrlsJob):
     job_copy = job.model_copy(deep=True)
     asyncio.create_task(_process_compose_from_urls_job(job_id, job_copy))
     return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}
+
+
+@app.get("/jobs/{job_id}/log")
+async def job_log(request: Request, job_id: str, format: str = "text"):
+    """Get FFmpeg log for a job."""
+
+    cleanup_old_jobs()
+
+    with JOBS_LOCK:
+        data = JOBS.get(job_id)
+
+    if data is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    log_rel_path = data.get("log_path")
+    if not log_rel_path:
+        raise HTTPException(status_code=404, detail="No log available for this job")
+
+    log_file = LOGS_DIR / log_rel_path
+    if not log_file.exists():
+        raise HTTPException(status_code=404, detail="Log file not found")
+
+    if format == "html":
+        redirect = ensure_dashboard_access(request)
+        if redirect:
+            return redirect
+
+        log_content = log_file.read_text(encoding="utf-8", errors="ignore")
+        html_content = f"""
+        <!doctype html>
+        <html>
+        <head>
+            <meta charset=\"utf-8\" />
+            <title>Job {job_id} - FFmpeg Log</title>
+            <style>
+                body {{ font-family: system-ui, sans-serif; padding: 24px; max-width: 1400px; margin: 0 auto; }}
+                .log-container {{ background: #1e1e1e; color: #d4d4d4; padding: 20px; border-radius: 8px; overflow-x: auto; }}
+                pre {{ margin: 0; font-family: 'Courier New', monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; }}
+                .back-link {{ display: inline-block; margin-bottom: 20px; color: #28a745; text-decoration: none; font-weight: 600; }}
+                .back-link:hover {{ text-decoration: underline; }}
+            </style>
+        </head>
+        <body>
+            <a href="/jobs/{job_id}?format=html" class="back-link">&larr; Back to Job</a>
+            <h2>FFmpeg Log for Job {job_id}</h2>
+            <div class="log-container">
+                <pre>{html.escape(log_content)}</pre>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(html_content)
+
+    return FileResponse(
+        log_file,
+        media_type="text/plain",
+        filename=f"job_{job_id}.log",
+    )
 
 
 @app.get("/jobs", response_class=HTMLResponse)
@@ -7911,6 +7986,7 @@ async def job_status(request: Request, job_id: str, format: str = "json"):
             "error": data.get("error"),
             "history": history_items,
             "ffmpeg_stats": data.get("ffmpeg_stats"),
+            "log_path": data.get("log_path"),
             "csrf_token": csrf_token,
         }
 
@@ -8053,6 +8129,7 @@ def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
     error = context.get("error")
     history = context.get("history", [])
     ffmpeg_stats = context.get("ffmpeg_stats") or {}
+    log_path = context.get("log_path")
 
     status_class = {
         "finished": "success",
@@ -8142,6 +8219,13 @@ def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
         </div>
         """
 
+    log_button_html = ""
+    if log_path:
+        log_button_html = (
+            f"<a href=\"/jobs/{html.escape(job_id)}/log?format=html\" target=\"_blank\" "
+            "class=\"view-log-btn\">View FFmpeg Log</a>"
+        )
+
     auto_refresh = ""
     if status in {"queued", "processing"}:
         auto_refresh = '<meta http-equiv="refresh" content="2">'
@@ -8167,12 +8251,16 @@ def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
             .main-nav a.active {{ background: #28a745; color: #fff; }}
 
             .job-header {{ background: #f8fafc; padding: 20px; border-radius: 8px; margin-bottom: 24px; }}
+            .job-header-top {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 12px; flex-wrap: wrap; }}
             .job-id {{ font-family: monospace; font-size: 18px; color: #1f2937; }}
             .status {{ display: inline-block; padding: 6px 12px; border-radius: 4px; font-weight: 600; text-transform: capitalize; }}
             .status.success {{ background: #e8f5e9; color: #256029; }}
             .status.error {{ background: #fdecea; color: #b3261e; }}
             .status.warning {{ background: #fff3cd; color: #856404; }}
             .status.info {{ background: #e0f2fe; color: #1f7a34; }}
+            .job-header-actions {{ display: flex; gap: 12px; align-items: center; }}
+            .view-log-btn {{ padding: 10px 20px; border-radius: 6px; background: #6c757d; color: white; font-weight: 600; text-decoration: none; display: inline-block; }}
+            .view-log-btn:hover {{ background: #5a6268; }}
 
             .progress-section {{ background: #fff; padding: 20px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
             .progress-bar-container {{ background: #e2e8f0; border-radius: 8px; height: 32px; overflow: hidden; margin: 16px 0; }}
@@ -8206,8 +8294,13 @@ def _job_detail_fallback_html(context: Dict[str, Any]) -> str:
         <a href="/jobs" class="back-link">&larr; Back to Jobs</a>
 
         <div class="job-header">
-            <h1>Job Details</h1>
-            <p class="job-id">{html.escape(job_id)}</p>
+            <div class="job-header-top">
+                <div>
+                    <h1>Job Details</h1>
+                    <p class="job-id">{html.escape(job_id)}</p>
+                </div>
+                <div class="job-header-actions">{log_button_html}</div>
+            </div>
             <span class="status {status_class}">{html.escape(status)}</span>
         </div>
 
@@ -8655,14 +8748,18 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
     with JOB_PROCESSES_LOCK:
         JOB_PROCESSES[job_id] = process_handle
 
+    log_rel_path: Optional[str] = None
+
     def mark_killed(message: str = "Killed", *, progress: Optional[int] = None) -> None:
         current_progress = progress if progress is not None else 100
-        _update_ffmpeg_async_job(
-            job_id,
-            progress=current_progress,
-            message=message,
-            status="killed",
-        )
+        extra: Dict[str, Any] = {
+            "progress": current_progress,
+            "message": message,
+            "status": "killed",
+        }
+        if log_rel_path is not None:
+            extra["log_path"] = log_rel_path
+        _update_ffmpeg_async_job(job_id, **extra)
 
     try:
         check_disk_space(WORK_DIR)
@@ -8918,7 +9015,15 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 time.time() - start,
             )
 
-            save_log(log_path, "ffmpeg-job-async")
+            saved_log_path = save_log(log_path, "ffmpeg-job-async")
+            if saved_log_path is not None:
+                try:
+                    log_rel_path = str(saved_log_path.relative_to(LOGS_DIR))
+                except ValueError:
+                    log_rel_path = str(saved_log_path)
+                except Exception:
+                    log_rel_path = str(saved_log_path)
+                _update_ffmpeg_async_job(job_id, log_path=log_rel_path)
 
             if code != 0:
                 if _job_marked_killed(job_id):
@@ -8930,13 +9035,15 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                     mark_killed("Killed after FFmpeg", progress=current_progress)
                     return
                 error_text = log_path.read_text(encoding="utf-8", errors="ignore")
-                _update_ffmpeg_async_job(
-                    job_id,
-                    progress=100,
-                    message="FFmpeg failed",
-                    status="failed",
-                    error=error_text,
-                )
+                update_kwargs: Dict[str, Any] = {
+                    "progress": 100,
+                    "message": "FFmpeg failed",
+                    "status": "failed",
+                    "error": error_text,
+                }
+                if log_rel_path is not None:
+                    update_kwargs["log_path"] = log_rel_path
+                _update_ffmpeg_async_job(job_id, **update_kwargs)
                 struct_logger.error(
                     "job_failed",
                     job_id=job_id,
@@ -8955,13 +9062,15 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                     )
                     mark_killed("Killed while checking outputs")
                     return
-                _update_ffmpeg_async_job(
-                    job_id,
-                    progress=100,
-                    message="Missing outputs",
-                    status="failed",
-                    error={"missing": [p.name for p in missing_outputs]},
-                )
+                missing_kwargs: Dict[str, Any] = {
+                    "progress": 100,
+                    "message": "Missing outputs",
+                    "status": "failed",
+                    "error": {"missing": [p.name for p in missing_outputs]},
+                }
+                if log_rel_path is not None:
+                    missing_kwargs["log_path"] = log_rel_path
+                _update_ffmpeg_async_job(job_id, **missing_kwargs)
                 struct_logger.error(
                     "job_failed",
                     job_id=job_id,
@@ -9024,14 +9133,16 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                 mark_killed("Killed after publishing outputs")
                 return
             logger.info("[%s] STEP 9: Updating job to finished status", job_id)
-            _update_ffmpeg_async_job(
-                job_id,
-                progress=100,
-                message="Completed",
-                status="finished",
-                result={"outputs": published_outputs},
-                duration_ms=duration_ms,
-            )
+            success_kwargs: Dict[str, Any] = {
+                "progress": 100,
+                "message": "Completed",
+                "status": "finished",
+                "result": {"outputs": published_outputs},
+                "duration_ms": duration_ms,
+            }
+            if log_rel_path is not None:
+                success_kwargs["log_path"] = log_rel_path
+            _update_ffmpeg_async_job(job_id, **success_kwargs)
             logger.info("[%s] STEP 10: Job marked as finished", job_id)
             struct_logger.info(
                 "job_completed",
@@ -9049,14 +9160,16 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
         detail = exc.detail if isinstance(exc.detail, (str, dict)) else str(exc.detail)
         status_code = exc.status_code if hasattr(exc, "status_code") else 500
         logger.error("[%s] Async FFmpeg job failed with HTTP error: %s", job_id, detail)
-        _update_ffmpeg_async_job(
-            job_id,
-            progress=100,
-            message="Failed",
-            status="failed",
-            error=detail,
-            status_code=status_code,
-        )
+        http_error_kwargs: Dict[str, Any] = {
+            "progress": 100,
+            "message": "Failed",
+            "status": "failed",
+            "error": detail,
+            "status_code": status_code,
+        }
+        if log_rel_path is not None:
+            http_error_kwargs["log_path"] = log_rel_path
+        _update_ffmpeg_async_job(job_id, **http_error_kwargs)
         struct_logger.error(
             "job_failed",
             job_id=job_id,
@@ -9073,13 +9186,15 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
             return
 
         logger.exception("[%s] Async FFmpeg job failed", job_id)
-        _update_ffmpeg_async_job(
-            job_id,
-            progress=100,
-            message="Failed",
-            status="failed",
-            error=str(exc),
-        )
+        exception_kwargs: Dict[str, Any] = {
+            "progress": 100,
+            "message": "Failed",
+            "status": "failed",
+            "error": str(exc),
+        }
+        if log_rel_path is not None:
+            exception_kwargs["log_path"] = log_rel_path
+        _update_ffmpeg_async_job(job_id, **exception_kwargs)
         struct_logger.error(
             "job_failed",
             job_id=job_id,

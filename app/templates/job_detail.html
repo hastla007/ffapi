@@ -192,15 +192,23 @@
       background: #e0f2fe;
       color: #1f7a34;
     }
-    .kill-btn {
+    .action-buttons {
+      display: flex;
+      gap: 12px;
+    }
+    .kill-btn, .view-log-btn {
       padding: 10px 20px;
-      background: #dc3545;
-      color: white;
       border: none;
       border-radius: 6px;
       cursor: pointer;
       font-size: 14px;
       font-weight: 600;
+      text-decoration: none;
+      display: inline-block;
+    }
+    .kill-btn {
+      background: #dc3545;
+      color: white;
     }
     .kill-btn:hover {
       background: #c82333;
@@ -209,6 +217,13 @@
       background: #6c757d;
       cursor: not-allowed;
       opacity: 0.6;
+    }
+    .view-log-btn {
+      background: #6c757d;
+      color: white;
+    }
+    .view-log-btn:hover {
+      background: #5a6268;
     }
     .progress-section {
       background: #fff;
@@ -379,12 +394,16 @@
         <h1>Job Details</h1>
         <p class="job-id">{{ job_id }}</p>
       </div>
-      {% if status in ['queued', 'processing'] %}
-        <button id="kill-job-btn" class="kill-btn" onclick="killJob()">Kill Job</button>
-      {% endif %}
+      <div class="action-buttons">
+        {% if log_path %}
+          <a href="/jobs/{{ job_id }}/log?format=html" target="_blank" class="view-log-btn">View FFmpeg Log</a>
+        {% endif %}
+        {% if status in ['queued', 'processing'] %}
+          <button id="kill-job-btn" class="kill-btn" onclick="killJob()">Kill Job</button>
+        {% endif %}
+      </div>
     </div>
     <span class="status {{ 'success' if status == 'finished' else 'error' if status == 'failed' else 'warning' if status == 'processing' else 'info' }}" id="status-badge">{{ status }}</span>
-
   </div>
 
   <div class="progress-section">
