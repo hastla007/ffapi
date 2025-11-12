@@ -8658,7 +8658,7 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
             async def enhanced_watchdog() -> None:
                 """Monitor job health, enforce timeout, and handle kill signals."""
                 check_interval = 10  # Check every 10 seconds
-                last_log_time = start
+                last_log_elapsed = 0.0  # Track last logged elapsed time
 
                 try:
                     while True:
@@ -8727,14 +8727,14 @@ async def _process_ffmpeg_job_async(job_id: str, job: FFmpegJobRequest) -> None:
                             return  # Exit watchdog - timeout will be caught by main flow
 
                         # Periodic progress logging (every 30 seconds)
-                        if elapsed - last_log_time >= 30:
+                        if elapsed - last_log_elapsed >= 30:
                             logger.info(
                                 "[%s] Watchdog: %.0fs elapsed, progress: %d%%, still healthy",
                                 job_id,
                                 elapsed,
                                 current_progress[0],
                             )
-                            last_log_time = elapsed
+                            last_log_elapsed = elapsed
 
                 except asyncio.CancelledError:
                     logger.debug("[%s] Watchdog cancelled normally", job_id)
