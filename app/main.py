@@ -3317,6 +3317,17 @@ async def run_ffmpeg_with_timeout(
         except Exception:
             log_text = ""
 
+        if return_code != 0 and not log_text.strip():
+            try:
+                gpu_enabled = bool(get_gpu_config().get("enabled"))
+            except Exception:
+                gpu_enabled = False
+            if gpu_enabled:
+                logger.warning(
+                    "FFmpeg failed with no output (possible GPU crash), will retry with CPU"
+                )
+                return -999
+
         if log_text and any(pattern in log_text for pattern in GPU_FILTER_ERROR_PATTERNS):
             logger.warning("GPU filter error detected, will retry with CPU filters")
             return -999
@@ -7038,6 +7049,125 @@ async def video_concat_from_urls(job: ConcatJob, as_json: bool = False):
         with JOB_PROCESSES_LOCK:
             JOB_PROCESSES.pop(job_id, None)
 
+
+@app.post("/video/concat-from-urls/async")
+async def video_concat_from_urls_async(job: ConcatJob):
+    """Queue video concatenation as a background job."""
+
+    cleanup_old_jobs()
+    job_id = str(uuid4())
+
+    with JOBS_LOCK:
+        now = time.time()
+        JOBS[job_id] = {
+            "status": "queued",
+            "progress": 0,
+            "message": "Queued",
+            "history": [{"timestamp": now, "progress": 0, "message": "Queued"}],
+            "created": now,
+            "updated": now,
+        }
+
+    job_copy = job.model_copy(deep=True)
+    asyncio.create_task(_process_concat_job_async(job_id, job_copy))
+
+    return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}
+
+
+async def _process_concat_job_async(job_id: str, job: ConcatJob):
+    """Background worker for async concat jobs."""
+
+    async with safe_lock(JOBS_LOCK, timeout=5.0, operation="jobs_start"):
+        existing = JOBS.get(job_id, {})
+        created = existing.get("created", time.time())
+        now = time.time()
+        history = list(existing.get("history", []))
+        history.append({"timestamp": now, "progress": 10, "message": "Job started"})
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+        JOBS[job_id] = {
+            **existing,
+            "status": "processing",
+            "progress": 10,
+            "message": "Job started",
+            "started": now,
+            "created": created,
+            "updated": now,
+            "history": history,
+        }
+
+    with JOB_PROGRESS_LOCK:
+        JOB_PROGRESS.pop(job_id, None)
+
+    reporter = JobProgressReporter(job_id)
+    start_wall = time.time()
+    start_perf = time.perf_counter()
+    struct_logger.info("job_started", job_id=job_id, job_type="concat")
+
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
+
+    try:
+        _result_response, result_payload, log_rel_path = await _concat_impl_with_tracking(
+            job,
+            as_json=True,
+            force_cpu=False,
+            reporter=reporter,
+            job_id=job_id,
+            process_handle=process_handle,
+        )
+
+        duration_ms = (time.perf_counter() - start_perf) * 1000
+        now_ts = time.time()
+        progress_snapshot = _drain_job_progress(job_id)
+
+        history_updates: List[Dict[str, Any]] = []
+        if progress_snapshot is not None:
+            history_updates.extend(progress_snapshot.get("history", []))
+        history_updates.append(
+            {
+                "timestamp": now_ts,
+                "progress": 100,
+                "message": "Completed",
+            }
+        )
+
+        with JOBS_LOCK:
+            existing = JOBS.get(job_id, {})
+            history = list(existing.get("history", []))
+
+        history.extend(history_updates)
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+
+        with JobTransaction(job_id) as tx:
+            tx.set(
+                status="finished",
+                progress=100,
+                message="Completed",
+                updated=now_ts,
+                duration_ms=duration_ms,
+                history=history,
+                result=result_payload,
+                log_path=log_rel_path,
+            )
+
+        struct_logger.info("job_completed", job_id=job_id, job_type="concat", duration_ms=duration_ms)
+
+    except Exception as exc:
+        logger.exception("Async concat job %s failed", job_id)
+        _finalize_sync_job_failure(
+            job_id,
+            start_wall,
+            str(exc),
+            None,
+            failure_message="Failed",
+        )
+        struct_logger.error("job_failed", job_id=job_id, job_type="concat", error=str(exc))
+    finally:
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
 
 async def _concat_impl_with_tracking(
     job: ConcatJob,
