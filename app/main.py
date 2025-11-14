@@ -444,13 +444,20 @@ def _nvenc_supports_modern_presets() -> bool:
     return False
 
 
-def get_video_encoder() -> Tuple[str, List[str]]:
+def get_video_encoder(*, force_cpu: bool = False) -> Tuple[str, List[str]]:
     """
     Get appropriate video encoder and preset args based on GPU availability.
+
+    Args:
+        force_cpu: If True, always return CPU encoder regardless of GPU config
 
     Returns:
         Tuple of (codec_name, extra_args)
     """
+
+    # Force CPU encoding if requested
+    if force_cpu:
+        return ("libx264", ["-preset", "medium"])
 
     gpu_config = get_gpu_config()
 
@@ -556,10 +563,11 @@ def build_encode_args(
     *,
     decoder_args: Optional[List[str]] = None,
     prefer_gpu_filters: bool = True,
+    force_cpu_encoder: bool = False,
 ) -> List[str]:
     """Build complete encoding arguments including filters and codec settings."""
 
-    codec, codec_args = get_video_encoder()
+    codec, codec_args = get_video_encoder(force_cpu=force_cpu_encoder)
     decoder_args = decoder_args or []
 
     # Check environment variable for GPU filters
@@ -7440,6 +7448,7 @@ async def _concat_impl_with_tracking(
                     job.fps,
                     decoder_args=decoder_args,
                     prefer_gpu_filters=not force_cpu,
+                    force_cpu_encoder=force_cpu,
                 )
 
                 cmd = [
@@ -7480,6 +7489,7 @@ async def _concat_impl_with_tracking(
                         job.fps,
                         decoder_args=[],
                         prefer_gpu_filters=False,
+                        force_cpu_encoder=True,
                     )
                     cmd = [
                         "ffmpeg", "-y",
