@@ -3317,6 +3317,17 @@ async def run_ffmpeg_with_timeout(
         except Exception:
             log_text = ""
 
+        if return_code != 0 and not log_text.strip():
+            try:
+                gpu_enabled = bool(get_gpu_config().get("enabled"))
+            except Exception:
+                gpu_enabled = False
+            if gpu_enabled:
+                logger.warning(
+                    "FFmpeg failed with no output (possible GPU crash), will retry with CPU"
+                )
+                return -999
+
         if log_text and any(pattern in log_text for pattern in GPU_FILTER_ERROR_PATTERNS):
             logger.warning("GPU filter error detected, will retry with CPU filters")
             return -999
