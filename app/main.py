@@ -7177,6 +7177,216 @@ async def _process_concat_job_async(job_id: str, job: ConcatJob):
         with JOB_PROCESSES_LOCK:
             JOB_PROCESSES.pop(job_id, None)
 
+
+async def _process_rendi_job_async(job_id: str, job: RendiJob) -> None:
+    """Background worker for async rendi jobs."""
+
+    async with safe_lock(JOBS_LOCK, timeout=5.0, operation="jobs_start"):
+        existing = JOBS.get(job_id, {})
+        created = existing.get("created", time.time())
+        now = time.time()
+        history = list(existing.get("history", []))
+        history.append({"timestamp": now, "progress": 10, "message": "Job started"})
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+        JOBS[job_id] = {
+            **existing,
+            "status": "processing",
+            "progress": 10,
+            "message": "Job started",
+            "started": now,
+            "created": created,
+            "updated": now,
+            "history": history,
+        }
+
+    with JOB_PROGRESS_LOCK:
+        JOB_PROGRESS.pop(job_id, None)
+
+    reporter = JobProgressReporter(job_id)
+    start_wall = time.time()
+    start_perf = time.perf_counter()
+    struct_logger.info("job_started", job_id=job_id, job_type="rendi_command")
+
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
+
+    log_rel_path: Optional[str] = None
+    published: Dict[str, str] = {}
+    result_payload: Optional[Dict[str, Any]] = None
+
+    def _record_log_path(saved: Optional[Path]) -> None:
+        nonlocal log_rel_path
+        if saved is None:
+            return
+        try:
+            log_rel_path = str(saved.relative_to(LOGS_DIR))
+        except Exception:
+            log_rel_path = str(saved)
+
+    try:
+        check_disk_space(WORK_DIR)
+        reporter.update(10, "Preparing workspace")
+
+        with TemporaryDirectory(prefix="rendi_", dir=str(WORK_DIR)) as workdir:
+            work = Path(workdir)
+            resolved: Dict[str, str] = {}
+
+            reporter.update(20, "Downloading input files")
+            total_inputs = max(len(job.input_files), 1)
+            for idx, (key, url) in enumerate(job.input_files.items()):
+                progress = 20 + int(((idx + 1) / total_inputs) * 30)
+                reporter.update(progress, f"Downloading input {idx + 1}/{total_inputs}")
+                p = work / f"{key}"
+                await _download_to(str(url), p, None)
+                resolved[key] = str(p)
+
+            out_paths: Dict[str, Path] = {key: work / name for key, name in job.output_files.items()}
+
+            reporter.update(50, "Building FFmpeg command")
+            cmd_text = job.ffmpeg_command
+            for k, p in resolved.items():
+                cmd_text = cmd_text.replace("{{" + k + "}}", p)
+            for k, p in out_paths.items():
+                cmd_text = cmd_text.replace("{{" + k + "}}", str(p))
+
+            cmd_lower = cmd_text.lower()
+            dangerous_patterns = ["-f lavfi", "-i /dev/", "-i file:", "-i concat:"]
+            for pattern in dangerous_patterns:
+                if pattern in cmd_lower:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error": "forbidden_pattern", "pattern": pattern},
+                    )
+
+            if REQUIRE_DURATION_LIMIT and "-t" not in cmd_lower and "-frames" not in cmd_lower:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "missing_limit", "detail": "Command must include -t or -frames"},
+                )
+
+            try:
+                args = shlex.split(cmd_text)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "invalid_command", "msg": str(exc)},
+                ) from exc
+
+            log = work / "ffmpeg.log"
+            run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args
+
+            reporter.update(60, "Executing FFmpeg")
+            with log.open("w", encoding="utf-8", errors="ignore") as lf:
+                code = await run_ffmpeg_with_timeout(
+                    run_args,
+                    lf,
+                    process_handle=process_handle,
+                )
+
+            _record_log_path(save_log(log, "rendi-command-async"))
+
+            if code != 0:
+                logger.error("run-ffmpeg-command async failed")
+                _flush_logs()
+                log_text = ""
+                if log.exists():
+                    try:
+                        log_text = log.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        log_text = ""
+                detail: Dict[str, Any] = {"error": "ffmpeg_failed", "cmd": run_args, "log": log_text}
+                if log_rel_path:
+                    detail["log_path"] = log_rel_path
+                raise HTTPException(status_code=500, detail=detail)
+
+            reporter.update(80, "Publishing outputs")
+            for key, path_obj in out_paths.items():
+                if path_obj.exists():
+                    pub = await publish_file(path_obj, Path(path_obj).suffix or ".bin")
+                    published[key] = pub["url"]
+
+            if not published:
+                log_text = ""
+                if log.exists():
+                    try:
+                        log_text = log.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        log_text = ""
+                detail = {"error": "no_outputs_found", "log": log_text}
+                if log_rel_path:
+                    detail["log_path"] = log_rel_path
+                raise HTTPException(status_code=500, detail=detail)
+
+            reporter.update(95, "Complete")
+            result_payload = {"outputs": dict(published)}
+
+            duration_ms = (time.perf_counter() - start_perf) * 1000
+            now_ts = time.time()
+            progress_snapshot = _drain_job_progress(job_id)
+
+            history_updates: List[Dict[str, Any]] = []
+            if progress_snapshot is not None:
+                history_updates.extend(progress_snapshot.get("history", []))
+            history_updates.append(
+                {
+                    "timestamp": now_ts,
+                    "progress": 100,
+                    "message": "Completed",
+                }
+            )
+
+            with JOBS_LOCK:
+                existing = JOBS.get(job_id, {})
+                history = list(existing.get("history", []))
+
+            history.extend(history_updates)
+            if len(history) > JOB_HISTORY_LIMIT:
+                history = history[-JOB_HISTORY_LIMIT:]
+
+            update_payload: Dict[str, Any] = {
+                "status": "finished",
+                "progress": 100,
+                "message": "Completed",
+                "updated": now_ts,
+                "duration_ms": duration_ms,
+                "history": history,
+                "error": None,
+                "result": result_payload,
+            }
+            if log_rel_path is not None:
+                update_payload["log_path"] = log_rel_path
+
+            with JobTransaction(job_id) as tx:
+                tx.set(**update_payload)
+
+            struct_logger.info(
+                "job_completed",
+                job_id=job_id,
+                job_type="rendi_command",
+                duration_ms=duration_ms,
+            )
+
+    except Exception as exc:
+        logger.exception("Async rendi job %s failed", job_id)
+        _finalize_sync_job_failure(
+            job_id,
+            start_wall,
+            str(exc),
+            log_rel_path,
+            failure_message="Failed",
+        )
+        struct_logger.error(
+            "job_failed",
+            job_id=job_id,
+            job_type="rendi_command",
+            error=str(exc),
+        )
+    finally:
+        with JOB_PROCESSES_LOCK:
+            JOB_PROCESSES.pop(job_id, None)
+
 async def _concat_impl_with_tracking(
     job: ConcatJob,
     as_json: bool,
@@ -9566,6 +9776,30 @@ async def run_rendi(job: RendiJob):
     finally:
         with JOB_PROCESSES_LOCK:
             JOB_PROCESSES.pop(job_id, None)
+
+
+@app.post("/v1/run-ffmpeg-command/async")
+async def run_rendi_async(job: RendiJob):
+    """Queue FFmpeg command for background processing."""
+
+    cleanup_old_jobs()
+    job_id = str(uuid4())
+
+    with JOBS_LOCK:
+        now = time.time()
+        JOBS[job_id] = {
+            "status": "queued",
+            "progress": 0,
+            "message": "Queued",
+            "history": [{"timestamp": now, "progress": 0, "message": "Queued"}],
+            "created": now,
+            "updated": now,
+        }
+
+    job_copy = job.model_copy(deep=True)
+    asyncio.create_task(_process_rendi_job_async(job_id, job_copy))
+
+    return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}
 
 
 @app.post("/v2/run-ffmpeg-job")
