@@ -6852,54 +6852,166 @@ async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as
         raise HTTPException(status_code=400, detail="Only PNG/JPEG are supported.")
     if not (1 <= duration <= 3600):
         raise HTTPException(status_code=400, detail="duration must be 1..3600 seconds")
-    check_disk_space(WORK_DIR)
-    with TemporaryDirectory(prefix="loop_", dir=str(WORK_DIR)) as workdir:
-        work = Path(workdir)
-        in_path = work / ("input.png" if file.content_type == "image/png" else "input.jpg")
-        out_path = work / "output.mp4"
 
-        await stream_upload_to_path(file, in_path)
+    # Create job tracking
+    cleanup_old_jobs()
+    job_id = str(uuid4())
+    start_time = time.time()
 
-        codec, codec_args = get_video_encoder()
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "processing",
+            "progress": 0,
+            "message": "Starting image to MP4 conversion",
+            "history": [
+                {
+                    "timestamp": start_time,
+                    "progress": 0,
+                    "message": "Starting",
+                }
+            ],
+            "created": start_time,
+            "updated": start_time,
+            "started": start_time,
+        }
 
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-loop",
-            "1",
-            "-t",
-            str(duration),
-            "-i",
-            str(in_path),
-            "-c:v",
-            codec,
-        ] + codec_args
+    reporter = JobProgressReporter(job_id)
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
 
-        if codec == "libx264":
-            cmd += ["-tune", "stillimage"]
+    log_rel_path: Optional[str] = None
 
-        cmd += [
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            str(out_path),
-        ]
-        log = work / "ffmpeg.log"
-        with log.open("w", encoding="utf-8", errors="ignore") as lf:
-            code = await run_ffmpeg_with_timeout(cmd, lf)
-        save_log(log, "image-to-mp4")
-        if code != 0 or not out_path.exists():
-            logger.error(f"image-to-mp4-loop failed for {file.filename}")
-            _flush_logs()
-            return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
-        pub = await publish_file(out_path, ".mp4", duration_ms=duration * 1000)
-        logger.info(f"image-to-mp4-loop completed: {pub['rel']}")
-        if as_json:
-            return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
-        resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
-        resp.headers["X-File-URL"] = pub["url"]
-        return resp
+    try:
+        check_disk_space(WORK_DIR)
+        reporter.update(10, "Preparing workspace")
+
+        with TemporaryDirectory(prefix="loop_", dir=str(WORK_DIR)) as workdir:
+            work = Path(workdir)
+            in_path = work / ("input.png" if file.content_type == "image/png" else "input.jpg")
+            out_path = work / "output.mp4"
+
+            reporter.update(20, "Uploading image")
+            await stream_upload_to_path(file, in_path)
+
+            codec, codec_args = get_video_encoder()
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-loop",
+                "1",
+                "-t",
+                str(duration),
+                "-i",
+                str(in_path),
+                "-c:v",
+                codec,
+            ] + codec_args
+
+            if codec == "libx264":
+                cmd += ["-tune", "stillimage"]
+
+            cmd += [
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(out_path),
+            ]
+
+            log = work / "ffmpeg.log"
+            reporter.update(30, "Converting image to video")
+
+            # Create progress parser for FFmpeg live stats
+            parser = FFmpegProgressParser(duration, reporter, "Converting image to video")
+
+            with log.open("w", encoding="utf-8", errors="ignore") as lf:
+                code = await run_ffmpeg_with_timeout(cmd, lf, progress_parser=parser, process_handle=process_handle)
+
+            saved_log_path = save_log(log, "image-to-mp4")
+            if saved_log_path:
+                try:
+                    log_rel_path = str(saved_log_path.relative_to(LOGS_DIR))
+                except ValueError:
+                    log_rel_path = str(saved_log_path)
+
+            if code != 0 or not out_path.exists():
+                logger.error(f"image-to-mp4-loop failed for {file.filename}")
+                _flush_logs()
+
+                # Update job as failed
+                duration_ms = (time.time() - start_time) * 1000
+                with JobTransaction(job_id) as tx:
+                    tx.set(
+                        status="failed",
+                        progress=0,
+                        message="FFmpeg failed",
+                        updated=time.time(),
+                        duration_ms=duration_ms,
+                        log_path=log_rel_path,
+                    )
+
+                return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "job_id": job_id, "log": log.read_text()})
+
+            reporter.update(90, "Publishing file")
+            pub = await publish_file(out_path, ".mp4", duration_ms=duration * 1000)
+            logger.info(f"image-to-mp4-loop completed: {pub['rel']}")
+
+            # Update job as finished
+            duration_ms = (time.time() - start_time) * 1000
+            now_ts = time.time()
+            progress_snapshot = _drain_job_progress(job_id)
+            history_updates: List[Dict[str, Any]] = []
+            if progress_snapshot is not None:
+                history_updates.extend(progress_snapshot.get("history", []))
+            history_updates.append(
+                {
+                    "timestamp": now_ts,
+                    "progress": 100,
+                    "message": "Completed",
+                }
+            )
+
+            with JOBS_LOCK:
+                existing = JOBS.get(job_id, {})
+                history = list(existing.get("history", []))
+            history.extend(history_updates)
+            if len(history) > JOB_HISTORY_LIMIT:
+                history = history[-JOB_HISTORY_LIMIT:]
+
+            with JobTransaction(job_id) as tx:
+                tx.set(
+                    status="finished",
+                    progress=100,
+                    message="Completed",
+                    updated=now_ts,
+                    duration_ms=duration_ms,
+                    history=history,
+                    result={"file_url": pub["url"], "path": pub["dst"]},
+                    log_path=log_rel_path,
+                )
+
+            if as_json:
+                return {"ok": True, "file_url": pub["url"], "path": pub["dst"], "job_id": job_id, "job_status_url": f"/jobs/{job_id}"}
+
+            resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
+            resp.headers["X-File-URL"] = pub["url"]
+            resp.headers["X-Job-ID"] = job_id
+            resp.headers["X-Job-Status-URL"] = f"/jobs/{job_id}"
+            return resp
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _finalize_sync_job_failure(
+            job_id,
+            start_time,
+            str(exc),
+            log_rel_path,
+            failure_message="Failed",
+        )
+        raise
 
 
 @app.post("/compose/from-binaries")
@@ -6920,70 +7032,184 @@ async def compose_from_binaries(
         ensure_upload_type(audio, "audio/", "audio")
     if bgm:
         ensure_upload_type(bgm, "audio/", "bgm")
-    check_disk_space(WORK_DIR)
-    with TemporaryDirectory(prefix="compose_", dir=str(WORK_DIR)) as workdir:
-        work = Path(workdir)
-        v_path = work / "video.mp4"
-        a_path = work / "audio"
-        b_path = work / "bgm"
-        out_path = work / "output.mp4"
 
-        await stream_upload_to_path(video, v_path)
+    # Create job tracking
+    cleanup_old_jobs()
+    job_id = str(uuid4())
+    start_time = time.time()
 
-        has_audio = False
-        has_bgm = False
-        if audio:
-            await stream_upload_to_path(audio, a_path)
-            has_audio = True
-        if bgm:
-            await stream_upload_to_path(bgm, b_path)
-            has_bgm = True
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "processing",
+            "progress": 0,
+            "message": "Starting compose from binaries",
+            "history": [
+                {
+                    "timestamp": start_time,
+                    "progress": 0,
+                    "message": "Starting",
+                }
+            ],
+            "created": start_time,
+            "updated": start_time,
+            "started": start_time,
+        }
 
-        inputs = ["-i", str(v_path)]
-        if has_audio:
-            inputs += ["-i", str(a_path)]
-        if has_bgm:
-            inputs += ["-i", str(b_path)]
+    reporter = JobProgressReporter(job_id)
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
 
-        maps = ["-map", "0:v:0"]
-        decoder_args = get_video_decoder(v_path)
-        cmd = ["ffmpeg", "-y"] + decoder_args + inputs
+    log_rel_path: Optional[str] = None
 
-        if duration_ms is not None:
-            dur_s = f"{duration_ms/1000:.3f}"
-            cmd += ["-t", dur_s]
+    try:
+        check_disk_space(WORK_DIR)
+        reporter.update(10, "Preparing workspace")
 
-        encode_args = build_encode_args(width, height, fps, decoder_args=decoder_args)
-        cmd += encode_args
-        if has_audio and has_bgm:
-            af = f"[1:a]anull[a1];[2:a]volume={bgm_volume}[a2];[a1][a2]amix=inputs=2:normalize=0:duration=shortest[aout]"
-            cmd += ["-filter_complex", af, "-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
-            maps += ["-map", "[aout]"]
-        elif has_audio:
-            maps += ["-map", "1:a:0"]
-            cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
-        elif has_bgm:
-            cmd += ["-filter_complex", f"[1:a]volume={bgm_volume}[aout]"]
-            maps += ["-map", "[aout]"]
-            cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
-        cmd += maps + [str(out_path)]
+        with TemporaryDirectory(prefix="compose_", dir=str(WORK_DIR)) as workdir:
+            work = Path(workdir)
+            v_path = work / "video.mp4"
+            a_path = work / "audio"
+            b_path = work / "bgm"
+            out_path = work / "output.mp4"
 
-        log = work / "ffmpeg.log"
-        with log.open("w", encoding="utf-8", errors="ignore") as lf:
-            code = await run_ffmpeg_with_timeout(cmd, lf)
-        save_log(log, "compose-binaries")
-        if code != 0 or not out_path.exists():
-            logger.error("compose-from-binaries failed")
-            _flush_logs()
-            return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "cmd": cmd, "log": log.read_text()})
+            reporter.update(15, "Uploading video file")
+            await stream_upload_to_path(video, v_path)
 
-        pub = await publish_file(out_path, ".mp4", duration_ms=duration_ms)
-        logger.info(f"compose-from-binaries completed: {pub['rel']}")
-        if as_json:
-            return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
-        resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
-        resp.headers["X-File-URL"] = pub["url"]
-        return resp
+            has_audio = False
+            has_bgm = False
+            if audio:
+                reporter.update(25, "Uploading audio file")
+                await stream_upload_to_path(audio, a_path)
+                has_audio = True
+            if bgm:
+                reporter.update(35, "Uploading background music")
+                await stream_upload_to_path(bgm, b_path)
+                has_bgm = True
+
+            inputs = ["-i", str(v_path)]
+            if has_audio:
+                inputs += ["-i", str(a_path)]
+            if has_bgm:
+                inputs += ["-i", str(b_path)]
+
+            maps = ["-map", "0:v:0"]
+            decoder_args = get_video_decoder(v_path)
+            cmd = ["ffmpeg", "-y"] + decoder_args + inputs
+
+            if duration_ms is not None:
+                dur_s = f"{duration_ms/1000:.3f}"
+                cmd += ["-t", dur_s]
+
+            encode_args = build_encode_args(width, height, fps, decoder_args=decoder_args)
+            cmd += encode_args
+            if has_audio and has_bgm:
+                af = f"[1:a]anull[a1];[2:a]volume={bgm_volume}[a2];[a1][a2]amix=inputs=2:normalize=0:duration=shortest[aout]"
+                cmd += ["-filter_complex", af, "-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
+                maps += ["-map", "[aout]"]
+            elif has_audio:
+                maps += ["-map", "1:a:0"]
+                cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
+            elif has_bgm:
+                cmd += ["-filter_complex", f"[1:a]volume={bgm_volume}[aout]"]
+                maps += ["-map", "[aout]"]
+                cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
+            cmd += maps + [str(out_path)]
+
+            log = work / "ffmpeg.log"
+            reporter.update(45, "Composing video")
+
+            # Create progress parser for FFmpeg live stats if duration is known
+            parser: Optional[FFmpegProgressParser] = None
+            if duration_ms is not None:
+                parser = FFmpegProgressParser(duration_ms / 1000.0, reporter, "Composing video")
+
+            with log.open("w", encoding="utf-8", errors="ignore") as lf:
+                code = await run_ffmpeg_with_timeout(cmd, lf, progress_parser=parser, process_handle=process_handle)
+
+            saved_log_path = save_log(log, "compose-binaries")
+            if saved_log_path:
+                try:
+                    log_rel_path = str(saved_log_path.relative_to(LOGS_DIR))
+                except ValueError:
+                    log_rel_path = str(saved_log_path)
+
+            if code != 0 or not out_path.exists():
+                logger.error("compose-from-binaries failed")
+                _flush_logs()
+
+                # Update job as failed
+                duration_s = (time.time() - start_time) * 1000
+                with JobTransaction(job_id) as tx:
+                    tx.set(
+                        status="failed",
+                        progress=0,
+                        message="FFmpeg failed",
+                        updated=time.time(),
+                        duration_ms=duration_s,
+                        log_path=log_rel_path,
+                    )
+
+                return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "job_id": job_id, "cmd": cmd, "log": log.read_text()})
+
+            reporter.update(90, "Publishing file")
+            pub = await publish_file(out_path, ".mp4", duration_ms=duration_ms)
+            logger.info(f"compose-from-binaries completed: {pub['rel']}")
+
+            # Update job as finished
+            duration_s = (time.time() - start_time) * 1000
+            now_ts = time.time()
+            progress_snapshot = _drain_job_progress(job_id)
+            history_updates: List[Dict[str, Any]] = []
+            if progress_snapshot is not None:
+                history_updates.extend(progress_snapshot.get("history", []))
+            history_updates.append(
+                {
+                    "timestamp": now_ts,
+                    "progress": 100,
+                    "message": "Completed",
+                }
+            )
+
+            with JOBS_LOCK:
+                existing = JOBS.get(job_id, {})
+                history = list(existing.get("history", []))
+            history.extend(history_updates)
+            if len(history) > JOB_HISTORY_LIMIT:
+                history = history[-JOB_HISTORY_LIMIT:]
+
+            with JobTransaction(job_id) as tx:
+                tx.set(
+                    status="finished",
+                    progress=100,
+                    message="Completed",
+                    updated=now_ts,
+                    duration_ms=duration_s,
+                    history=history,
+                    result={"file_url": pub["url"], "path": pub["dst"]},
+                    log_path=log_rel_path,
+                )
+
+            if as_json:
+                return {"ok": True, "file_url": pub["url"], "path": pub["dst"], "job_id": job_id, "job_status_url": f"/jobs/{job_id}"}
+
+            resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
+            resp.headers["X-File-URL"] = pub["url"]
+            resp.headers["X-Job-ID"] = job_id
+            resp.headers["X-Job-Status-URL"] = f"/jobs/{job_id}"
+            return resp
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _finalize_sync_job_failure(
+            job_id,
+            start_time,
+            str(exc),
+            log_rel_path,
+            failure_message="Failed",
+        )
+        raise
 
 
 @app.post("/video/concat-from-urls")
@@ -8120,12 +8346,93 @@ async def _compose_from_urls_impl(
 
 @app.post("/compose/from-urls")
 async def compose_from_urls(job: ComposeFromUrlsJob, as_json: bool = False):
-    pub, _ = await _compose_from_urls_impl(job)
-    if as_json:
-        return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
-    resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
-    resp.headers["X-File-URL"] = pub["url"]
-    return resp
+    # Create job tracking
+    cleanup_old_jobs()
+    job_id = str(uuid4())
+    start_time = time.time()
+
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "processing",
+            "progress": 0,
+            "message": "Starting compose from URLs",
+            "history": [
+                {
+                    "timestamp": start_time,
+                    "progress": 0,
+                    "message": "Starting",
+                }
+            ],
+            "created": start_time,
+            "updated": start_time,
+            "started": start_time,
+        }
+
+    reporter = JobProgressReporter(job_id)
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
+
+    log_rel_path: Optional[str] = None
+
+    try:
+        pub, log_path = await _compose_from_urls_impl(job, progress=reporter, process_handle=process_handle, job_id=job_id)
+        log_rel_path = log_path
+
+        # Update job as finished
+        duration_ms = (time.time() - start_time) * 1000
+        now_ts = time.time()
+        progress_snapshot = _drain_job_progress(job_id)
+        history_updates: List[Dict[str, Any]] = []
+        if progress_snapshot is not None:
+            history_updates.extend(progress_snapshot.get("history", []))
+        history_updates.append(
+            {
+                "timestamp": now_ts,
+                "progress": 100,
+                "message": "Completed",
+            }
+        )
+
+        with JOBS_LOCK:
+            existing = JOBS.get(job_id, {})
+            history = list(existing.get("history", []))
+        history.extend(history_updates)
+        if len(history) > JOB_HISTORY_LIMIT:
+            history = history[-JOB_HISTORY_LIMIT:]
+
+        with JobTransaction(job_id) as tx:
+            tx.set(
+                status="finished",
+                progress=100,
+                message="Completed",
+                updated=now_ts,
+                duration_ms=duration_ms,
+                history=history,
+                result={"file_url": pub["url"], "path": pub["dst"]},
+                log_path=log_rel_path,
+            )
+
+        if as_json:
+            return {"ok": True, "file_url": pub["url"], "path": pub["dst"], "job_id": job_id, "job_status_url": f"/jobs/{job_id}"}
+
+        resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
+        resp.headers["X-File-URL"] = pub["url"]
+        resp.headers["X-Job-ID"] = job_id
+        resp.headers["X-Job-Status-URL"] = f"/jobs/{job_id}"
+        return resp
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _finalize_sync_job_failure(
+            job_id,
+            start_time,
+            str(exc),
+            log_rel_path,
+            failure_message="Failed",
+        )
+        raise
 
 
 async def _notify_webhook_with_retry(
@@ -9574,89 +9881,215 @@ async def compose_from_tracks(job: TracksComposeJob, as_json: bool = False):
     if max_dur <= 0:
         raise HTTPException(status_code=400, detail="At least one keyframe must include a duration")
 
-    check_disk_space(WORK_DIR)
-    with TemporaryDirectory(prefix="tracks_", dir=str(WORK_DIR)) as workdir:
-        work = Path(workdir)
-        video_paths: List[Path] = []
-        for index, url in enumerate(video_urls):
-            v_path = work / f"video_{index:03d}.mp4"
-            await _download_to(url, v_path, None)
-            video_paths.append(v_path)
+    # Create job tracking
+    cleanup_old_jobs()
+    job_id = str(uuid4())
+    start_time = time.time()
 
-        if len(video_paths) == 1:
-            v_in = video_paths[0]
-        else:
-            concat_list = work / "videos.txt"
-            with concat_list.open("w", encoding="utf-8") as handle:
-                for path in video_paths:
-                    handle.write(f"file '{_escape_ffmpeg_concat_path(path)}'\n")
-            v_in = work / "video_concat.mp4"
-            concat_log = work / "ffmpeg_concat.log"
-            concat_cmd = [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(concat_list),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-pix_fmt",
-                "yuv420p",
-                "-an",
-                str(v_in),
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "processing",
+            "progress": 0,
+            "message": "Starting compose from tracks",
+            "history": [
+                {
+                    "timestamp": start_time,
+                    "progress": 0,
+                    "message": "Starting",
+                }
+            ],
+            "created": start_time,
+            "updated": start_time,
+            "started": start_time,
+        }
+
+    reporter = JobProgressReporter(job_id)
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
+
+    log_rel_path: Optional[str] = None
+
+    try:
+        check_disk_space(WORK_DIR)
+        reporter.update(5, "Preparing workspace")
+
+        with TemporaryDirectory(prefix="tracks_", dir=str(WORK_DIR)) as workdir:
+            work = Path(workdir)
+            video_paths: List[Path] = []
+
+            reporter.update(10, f"Downloading {len(video_urls)} video(s)")
+            for index, url in enumerate(video_urls):
+                v_path = work / f"video_{index:03d}.mp4"
+                await _download_to(url, v_path, None)
+                video_paths.append(v_path)
+
+            if len(video_paths) == 1:
+                v_in = video_paths[0]
+            else:
+                reporter.update(25, "Concatenating videos")
+                concat_list = work / "videos.txt"
+                with concat_list.open("w", encoding="utf-8") as handle:
+                    for path in video_paths:
+                        handle.write(f"file '{_escape_ffmpeg_concat_path(path)}'\n")
+                v_in = work / "video_concat.mp4"
+                concat_log = work / "ffmpeg_concat.log"
+                concat_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(concat_list),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "medium",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-an",
+                    str(v_in),
+                ]
+                with concat_log.open("w", encoding="utf-8", errors="ignore") as lf:
+                    concat_code = await run_ffmpeg_with_timeout(concat_cmd, lf, process_handle=process_handle)
+                save_log(concat_log, "compose-tracks-concat")
+                if concat_code != 0 or not v_in.exists():
+                    logger.error("compose-from-tracks concat failed")
+                    _flush_logs()
+
+                    # Update job as failed
+                    duration_ms = (time.time() - start_time) * 1000
+                    with JobTransaction(job_id) as tx:
+                        tx.set(
+                            status="failed",
+                            progress=0,
+                            message="Failed to combine video tracks",
+                            updated=time.time(),
+                            duration_ms=duration_ms,
+                        )
+
+                    raise HTTPException(status_code=500, detail={"error": "concat_failed", "job_id": job_id, "message": "Failed to combine video tracks"})
+
+            a_ins: List[Path] = []
+            if audio_urls:
+                reporter.update(40, f"Downloading {len(audio_urls)} audio track(s)")
+                for i, url in enumerate(audio_urls):
+                    p = work / f"aud_{i:03d}.bin"
+                    await _download_to(url, p, None)
+                    a_ins.append(p)
+
+            dur_s = f"{max_dur/1000:.3f}"
+            inputs = ["-i", str(v_in)]
+            for p in a_ins:
+                inputs += ["-i", str(p)]
+            maps = ["-map", "0:v:0"]
+            cmd = ["ffmpeg", "-y"] + inputs + [
+                "-t", dur_s,
+                "-vf", f"scale={job.width}:{job.height},fps={job.fps}",
+                "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
             ]
-            with concat_log.open("w", encoding="utf-8", errors="ignore") as lf:
-                concat_code = await run_ffmpeg_with_timeout(concat_cmd, lf)
-            save_log(concat_log, "compose-tracks-concat")
-            if concat_code != 0 or not v_in.exists():
-                logger.error("compose-from-tracks concat failed")
+            if a_ins:
+                labels = "".join([f"[{i+1}:a]" for i in range(len(a_ins))])
+                af = f"{labels}amix=inputs={len(a_ins)}:normalize=0:duration=shortest[aout]"
+                cmd += ["-filter_complex", af, "-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
+                maps += ["-map", "[aout]"]
+            cmd += maps + [str(work / "output.mp4")]
+
+            log = work / "ffmpeg.log"
+            reporter.update(55, "Composing final video")
+
+            # Create progress parser for FFmpeg live stats
+            parser = FFmpegProgressParser(max_dur / 1000.0, reporter, "Composing final video")
+
+            with log.open("w", encoding="utf-8", errors="ignore") as lf:
+                code = await run_ffmpeg_with_timeout(cmd, lf, progress_parser=parser, process_handle=process_handle)
+
+            saved_log_path = save_log(log, "compose-tracks")
+            if saved_log_path:
+                try:
+                    log_rel_path = str(saved_log_path.relative_to(LOGS_DIR))
+                except ValueError:
+                    log_rel_path = str(saved_log_path)
+
+            out_path = work / "output.mp4"
+            if code != 0 or not out_path.exists():
+                logger.error("compose-from-tracks failed")
                 _flush_logs()
-                raise HTTPException(status_code=500, detail="Failed to combine video tracks")
-        a_ins: List[Path] = []
-        for i, url in enumerate(audio_urls):
-            p = work / f"aud_{i:03d}.bin"
-            await _download_to(url, p, None)
-            a_ins.append(p)
 
-        dur_s = f"{max_dur/1000:.3f}"
-        inputs = ["-i", str(v_in)]
-        for p in a_ins:
-            inputs += ["-i", str(p)]
-        maps = ["-map", "0:v:0"]
-        cmd = ["ffmpeg", "-y"] + inputs + [
-            "-t", dur_s,
-            "-vf", f"scale={job.width}:{job.height},fps={job.fps}",
-            "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-        ]
-        if a_ins:
-            labels = "".join([f"[{i+1}:a]" for i in range(len(a_ins))])
-            af = f"{labels}amix=inputs={len(a_ins)}:normalize=0:duration=shortest[aout]"
-            cmd += ["-filter_complex", af, "-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
-            maps += ["-map", "[aout]"]
-        cmd += maps + [str(work / "output.mp4")]
+                # Update job as failed
+                duration_ms = (time.time() - start_time) * 1000
+                with JobTransaction(job_id) as tx:
+                    tx.set(
+                        status="failed",
+                        progress=0,
+                        message="FFmpeg failed",
+                        updated=time.time(),
+                        duration_ms=duration_ms,
+                        log_path=log_rel_path,
+                    )
 
-        log = work / "ffmpeg.log"
-        with log.open("w", encoding="utf-8", errors="ignore") as lf:
-            code = await run_ffmpeg_with_timeout(cmd, lf)
-        save_log(log, "compose-tracks")
-        out_path = work / "output.mp4"
-        if code != 0 or not out_path.exists():
-            logger.error("compose-from-tracks failed")
-            _flush_logs()
-            return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "log": log.read_text()})
+                return JSONResponse(status_code=500, content={"error": "ffmpeg_failed", "job_id": job_id, "log": log.read_text()})
 
-        pub = await publish_file(out_path, ".mp4")
-        if as_json:
-            return {"ok": True, "file_url": pub["url"], "path": pub["dst"]}
-        resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
-        resp.headers["X-File-URL"] = pub["url"]
-        return resp
+            reporter.update(90, "Publishing file")
+            pub = await publish_file(out_path, ".mp4")
+
+            # Update job as finished
+            duration_ms = (time.time() - start_time) * 1000
+            now_ts = time.time()
+            progress_snapshot = _drain_job_progress(job_id)
+            history_updates: List[Dict[str, Any]] = []
+            if progress_snapshot is not None:
+                history_updates.extend(progress_snapshot.get("history", []))
+            history_updates.append(
+                {
+                    "timestamp": now_ts,
+                    "progress": 100,
+                    "message": "Completed",
+                }
+            )
+
+            with JOBS_LOCK:
+                existing = JOBS.get(job_id, {})
+                history = list(existing.get("history", []))
+            history.extend(history_updates)
+            if len(history) > JOB_HISTORY_LIMIT:
+                history = history[-JOB_HISTORY_LIMIT:]
+
+            with JobTransaction(job_id) as tx:
+                tx.set(
+                    status="finished",
+                    progress=100,
+                    message="Completed",
+                    updated=now_ts,
+                    duration_ms=duration_ms,
+                    history=history,
+                    result={"file_url": pub["url"], "path": pub["dst"]},
+                    log_path=log_rel_path,
+                )
+
+            if as_json:
+                return {"ok": True, "file_url": pub["url"], "path": pub["dst"], "job_id": job_id, "job_status_url": f"/jobs/{job_id}"}
+
+            resp = FileResponse(pub["dst"], media_type="video/mp4", filename=os.path.basename(pub["dst"]))
+            resp.headers["X-File-URL"] = pub["url"]
+            resp.headers["X-Job-ID"] = job_id
+            resp.headers["X-Job-Status-URL"] = f"/jobs/{job_id}"
+            return resp
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _finalize_sync_job_failure(
+            job_id,
+            start_time,
+            str(exc),
+            log_rel_path,
+            failure_message="Failed",
+        )
+        raise
 
 
 @app.post("/v1/run-ffmpeg-command")
@@ -9949,124 +10382,244 @@ async def run_ffmpeg_job(job: FFmpegJobRequest, as_json: bool = False):
         len(job.task.inputs),
         len(job.task.outputs),
     )
-    check_disk_space(WORK_DIR)
 
-    with TemporaryDirectory(prefix="ffmpeg_job_", dir=str(WORK_DIR)) as workdir:
-        work = Path(workdir)
+    # Create job tracking
+    cleanup_old_jobs()
+    job_id = str(uuid4())
+    start_time = time.time()
 
-        # Download all input files
-        input_paths: List[Path] = []
-        for i, input_spec in enumerate(job.task.inputs):
-            input_url = _normalize_media_url(str(input_spec.file_path))
-            ext = Path(urlparse(input_url).path).suffix or ".bin"
-            input_path = work / f"input_{i:03d}{ext}"
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "processing",
+            "progress": 0,
+            "message": "Starting FFmpeg job",
+            "history": [
+                {
+                    "timestamp": start_time,
+                    "progress": 0,
+                    "message": "Starting",
+                }
+            ],
+            "created": start_time,
+            "updated": start_time,
+            "started": start_time,
+        }
 
-            logger.info(
-                "Downloading input %d/%d: %s",
-                i + 1,
-                len(job.task.inputs),
-                input_url,
+    reporter = JobProgressReporter(job_id)
+    process_handle = JobProcessHandle()
+    with JOB_PROCESSES_LOCK:
+        JOB_PROCESSES[job_id] = process_handle
+
+    log_rel_path: Optional[str] = None
+
+    try:
+        check_disk_space(WORK_DIR)
+        reporter.update(5, "Preparing workspace")
+
+        with TemporaryDirectory(prefix="ffmpeg_job_", dir=str(WORK_DIR)) as workdir:
+            work = Path(workdir)
+
+            # Download all input files
+            input_paths: List[Path] = []
+            total_inputs = len(job.task.inputs)
+            for i, input_spec in enumerate(job.task.inputs):
+                input_url = _normalize_media_url(str(input_spec.file_path))
+                ext = Path(urlparse(input_url).path).suffix or ".bin"
+                input_path = work / f"input_{i:03d}{ext}"
+
+                progress = 10 + int((i / total_inputs) * 30)
+                reporter.update(progress, f"Downloading input {i + 1}/{total_inputs}")
+                logger.info(
+                    "Downloading input %d/%d: %s",
+                    i + 1,
+                    len(job.task.inputs),
+                    input_url,
+                )
+                await _download_to(input_url, input_path, job.headers)
+                input_paths.append(input_path)
+
+            # Build FFmpeg command
+            cmd = ["ffmpeg", "-y"]
+
+            # Add all inputs with per-input options
+            for index, input_spec in enumerate(job.task.inputs):
+                input_path = input_paths[index]
+                if input_spec.options:
+                    cmd += input_spec.options
+                cmd += ["-i", str(input_path)]
+
+            # Add filter_complex
+            cmd += ["-filter_complex", job.task.filter_complex]
+
+            # Process outputs
+            output_paths: List[Path] = []
+            for output_spec in job.task.outputs:
+                output_path = work / output_spec.file
+                output_paths.append(output_path)
+
+                # Add output options (which should include -map directives)
+                for map_arg in output_spec.maps:
+                    cmd += ["-map", map_arg]
+                cmd += output_spec.options
+
+                # Add output file path
+                cmd += [str(output_path)]
+
+            # Execute FFmpeg
+            log_path = work / "ffmpeg.log"
+            reporter.update(45, "Executing FFmpeg")
+            logger.info("Executing FFmpeg command: %s", " ".join(cmd))
+
+            with log_path.open("w", encoding="utf-8", errors="ignore") as lf:
+                code = await run_ffmpeg_with_timeout(cmd, lf, process_handle=process_handle)
+
+            saved_log_path = save_log(log_path, "ffmpeg-job")
+            if saved_log_path:
+                try:
+                    log_rel_path = str(saved_log_path.relative_to(LOGS_DIR))
+                except ValueError:
+                    log_rel_path = str(saved_log_path)
+
+            if code != 0:
+                logger.error("FFmpeg job failed with exit code %d", code)
+                _flush_logs()
+
+                # Update job as failed
+                duration_ms = (time.time() - start_time) * 1000
+                with JobTransaction(job_id) as tx:
+                    tx.set(
+                        status="failed",
+                        progress=0,
+                        message="FFmpeg failed",
+                        updated=time.time(),
+                        duration_ms=duration_ms,
+                        log_path=log_rel_path,
+                    )
+
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": "ffmpeg_failed",
+                        "job_id": job_id,
+                        "exit_code": code,
+                        "cmd": cmd,
+                        "log": log_path.read_text(encoding="utf-8", errors="ignore"),
+                    },
+                )
+
+            # Check that all outputs were created
+            missing_outputs = [p for p in output_paths if not p.exists()]
+            if missing_outputs:
+                logger.error("FFmpeg succeeded but outputs are missing: %s", missing_outputs)
+                _flush_logs()
+
+                # Update job as failed
+                duration_ms = (time.time() - start_time) * 1000
+                with JobTransaction(job_id) as tx:
+                    tx.set(
+                        status="failed",
+                        progress=0,
+                        message="Missing outputs",
+                        updated=time.time(),
+                        duration_ms=duration_ms,
+                        log_path=log_rel_path,
+                    )
+
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": "missing_outputs",
+                        "job_id": job_id,
+                        "missing": [str(p.name) for p in missing_outputs],
+                        "log": log_path.read_text(encoding="utf-8", errors="ignore"),
+                    },
+                )
+
+            # Publish all outputs
+            reporter.update(85, "Publishing outputs")
+            published_urls: Dict[str, str] = {}
+            published_details: Dict[str, Dict[str, str]] = {}
+            for output_path in output_paths:
+                pub = await publish_file(output_path, output_path.suffix or ".bin")
+                published_urls[output_path.name] = pub["url"]
+                published_details[output_path.name] = pub
+                logger.info("Published output: %s -> %s", output_path.name, pub["rel"])
+
+            # Update job as finished
+            duration_ms = (time.time() - start_time) * 1000
+            now_ts = time.time()
+            progress_snapshot = _drain_job_progress(job_id)
+            history_updates: List[Dict[str, Any]] = []
+            if progress_snapshot is not None:
+                history_updates.extend(progress_snapshot.get("history", []))
+            history_updates.append(
+                {
+                    "timestamp": now_ts,
+                    "progress": 100,
+                    "message": "Completed",
+                }
             )
-            await _download_to(input_url, input_path, job.headers)
-            input_paths.append(input_path)
 
-        # Build FFmpeg command
-        cmd = ["ffmpeg", "-y"]
+            with JOBS_LOCK:
+                existing = JOBS.get(job_id, {})
+                history = list(existing.get("history", []))
+            history.extend(history_updates)
+            if len(history) > JOB_HISTORY_LIMIT:
+                history = history[-JOB_HISTORY_LIMIT:]
 
-        # Add all inputs with per-input options
-        for index, input_spec in enumerate(job.task.inputs):
-            input_path = input_paths[index]
-            if input_spec.options:
-                cmd += input_spec.options
-            cmd += ["-i", str(input_path)]
+            with JobTransaction(job_id) as tx:
+                tx.set(
+                    status="finished",
+                    progress=100,
+                    message="Completed",
+                    updated=now_ts,
+                    duration_ms=duration_ms,
+                    history=history,
+                    result={"outputs": published_urls},
+                    log_path=log_rel_path,
+                )
 
-        # Add filter_complex
-        cmd += ["-filter_complex", job.task.filter_complex]
+            if as_json:
+                return {
+                    "ok": True,
+                    "outputs": published_urls,
+                    "job_id": job_id,
+                    "job_status_url": f"/jobs/{job_id}",
+                }
 
-        # Process outputs
-        output_paths: List[Path] = []
-        for output_spec in job.task.outputs:
-            output_path = work / output_spec.file
-            output_paths.append(output_path)
+            # Return the first output as a file response
+            first_output_name = output_paths[0].name
+            first_pub = published_details[first_output_name]
+            first_path = Path(first_pub["dst"])
 
-            # Add output options (which should include -map directives)
-            for map_arg in output_spec.maps:
-                cmd += ["-map", map_arg]
-            cmd += output_spec.options
-
-            # Add output file path
-            cmd += [str(output_path)]
-
-        # Execute FFmpeg
-        log_path = work / "ffmpeg.log"
-        logger.info("Executing FFmpeg command: %s", " ".join(cmd))
-
-        with log_path.open("w", encoding="utf-8", errors="ignore") as lf:
-            code = await run_ffmpeg_with_timeout(cmd, lf)
-
-        save_log(log_path, "ffmpeg-job")
-
-        if code != 0:
-            logger.error("FFmpeg job failed with exit code %d", code)
-            _flush_logs()
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "error": "ffmpeg_failed",
-                    "exit_code": code,
-                    "cmd": cmd,
-                    "log": log_path.read_text(encoding="utf-8", errors="ignore"),
-                },
+            resp = FileResponse(
+                first_pub["dst"],
+                media_type="video/mp4" if first_path.suffix == ".mp4" else "application/octet-stream",
+                filename=first_output_name,
             )
+            resp.headers["X-File-URL"] = first_pub["url"]
+            resp.headers["X-Job-ID"] = job_id
+            resp.headers["X-Job-Status-URL"] = f"/jobs/{job_id}"
 
-        # Check that all outputs were created
-        missing_outputs = [p for p in output_paths if not p.exists()]
-        if missing_outputs:
-            logger.error("FFmpeg succeeded but outputs are missing: %s", missing_outputs)
-            _flush_logs()
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "error": "missing_outputs",
-                    "missing": [str(p.name) for p in missing_outputs],
-                    "log": log_path.read_text(encoding="utf-8", errors="ignore"),
-                },
-            )
+            # Include other outputs in headers
+            if len(published_urls) > 1:
+                resp.headers["X-Additional-Outputs"] = json.dumps(
+                    {k: v for k, v in published_urls.items() if k != first_output_name}
+                )
 
-        # Publish all outputs
-        published_urls: Dict[str, str] = {}
-        published_details: Dict[str, Dict[str, str]] = {}
-        for output_path in output_paths:
-            pub = await publish_file(output_path, output_path.suffix or ".bin")
-            published_urls[output_path.name] = pub["url"]
-            published_details[output_path.name] = pub
-            logger.info("Published output: %s -> %s", output_path.name, pub["rel"])
+            return resp
 
-        if as_json:
-            return {
-                "ok": True,
-                "outputs": published_urls,
-            }
-
-        # Return the first output as a file response
-        first_output_name = output_paths[0].name
-        first_pub = published_details[first_output_name]
-        first_path = Path(first_pub["dst"])
-
-        resp = FileResponse(
-            first_pub["dst"],
-            media_type="video/mp4" if first_path.suffix == ".mp4" else "application/octet-stream",
-            filename=first_output_name,
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _finalize_sync_job_failure(
+            job_id,
+            start_time,
+            str(exc),
+            log_rel_path,
+            failure_message="Failed",
         )
-        resp.headers["X-File-URL"] = first_pub["url"]
-
-        # Include other outputs in headers
-        if len(published_urls) > 1:
-            resp.headers["X-Additional-Outputs"] = json.dumps(
-                {k: v for k, v in published_urls.items() if k != first_output_name}
-            )
-
-        return resp
+        raise
 
 
 def _update_ffmpeg_async_job(
