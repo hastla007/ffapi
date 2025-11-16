@@ -438,6 +438,7 @@ def patched_app(app_module, monkeypatch, tmp_path):
     app_module.METRICS.reset()
     app_module.RATE_LIMITER.reset()
     app_module.LOGIN_RATE_LIMITER.reset()
+    app_module.PROBE_RATE_LIMITER.reset()
     app_module.UI_AUTH.reset()
     app_module.API_KEYS.reset()
     app_module.API_WHITELIST.reset()
@@ -2581,13 +2582,26 @@ def test_run_ffmpeg_with_timeout_handles_timeout(app_module, monkeypatch):
     assert wait_calls == [app_module.FFMPEG_TIMEOUT_SECONDS, 5, 1]
 
 
-def test_probe_from_urls_returns_json(patched_app):
+def test_probe_from_urls_returns_json(patched_app, monkeypatch):
+    # Mock rate limit check for direct function calls
+    monkeypatch.setattr(patched_app, "_check_probe_rate_limit", lambda r: None)
+
     job = patched_app.ProbeUrlJob(url="https://example.com/video.mp4", show_streams=True, count_frames=True)
-    result = patched_app.probe_from_urls(job)
+
+    # Create a mock request object
+    class MockRequest:
+        class Client:
+            host = "testclient"
+        client = Client()
+
+    result = patched_app.probe_from_urls(job, MockRequest())
     assert result["format"]["format_name"] == "fake"
 
 
 def test_probe_from_urls_uses_cache(monkeypatch, patched_app):
+    # Mock rate limit check for direct function calls
+    monkeypatch.setattr(patched_app, "_check_probe_rate_limit", lambda r: None)
+
     calls = []
 
     def fake_run(cmd, *args, **kwargs):
@@ -2598,9 +2612,15 @@ def test_probe_from_urls_uses_cache(monkeypatch, patched_app):
     monkeypatch.setattr(patched_app.subprocess, "run", fake_run)
     patched_app.PROBE_CACHE.clear()
 
+    # Create a mock request object
+    class MockRequest:
+        class Client:
+            host = "testclient"
+        client = Client()
+
     job = patched_app.ProbeUrlJob(url="https://example.com/video.mp4", show_streams=True)
-    first = patched_app.probe_from_urls(job)
-    second = patched_app.probe_from_urls(job)
+    first = patched_app.probe_from_urls(job, MockRequest())
+    second = patched_app.probe_from_urls(job, MockRequest())
 
     assert first == second
     assert len(calls) == 1
@@ -2628,6 +2648,9 @@ def test_probe_public_returns_json(patched_app):
 
 
 def test_probe_endpoints_use_timeout(patched_app, monkeypatch):
+    # Mock rate limit check for direct function calls
+    monkeypatch.setattr(patched_app, "_check_probe_rate_limit", lambda r: None)
+
     captured: List[int | None] = []
 
     def fake_run(cmd, *args, **kwargs):
@@ -2637,8 +2660,14 @@ def test_probe_endpoints_use_timeout(patched_app, monkeypatch):
 
     monkeypatch.setattr(patched_app.subprocess, "run", fake_run)
 
+    # Create a mock request object
+    class MockRequest:
+        class Client:
+            host = "testclient"
+        client = Client()
+
     job = patched_app.ProbeUrlJob(url="https://example.com/video.mp4")
-    patched_app.probe_from_urls(job)
+    patched_app.probe_from_urls(job, MockRequest())
 
     upload = UploadFile(file=io.BytesIO(b"binary"), filename="upload.mp4", headers=Headers({"content-type": "video/mp4"}))
     asyncio.run(patched_app.probe_from_binary(upload, show_format=True, show_streams=True))
