@@ -126,7 +126,34 @@ try:  # pragma: no cover - optional dependency for QR generation
 except ModuleNotFoundError:  # pragma: no cover - environments without qrcode
     qrcode = None  # type: ignore[assignment]
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app):
+    """Lifespan event handler for FastAPI application startup and shutdown."""
+    # Startup
+    logger.info("FastAPI server is ready to accept requests")
+    log_gpu_status()
+    try:
+        cleanup_old_public()
+    except Exception as exc:
+        logger.warning("Initial public cleanup failed: %s", exc)
+    if PUBLIC_CLEANUP_INTERVAL_SECONDS > 0:
+        asyncio.create_task(_periodic_public_cleanup())
+        asyncio.create_task(_periodic_jobs_cleanup())
+    asyncio.create_task(_periodic_session_cleanup())
+    asyncio.create_task(_periodic_rate_limiter_cleanup())
+    asyncio.create_task(_periodic_stuck_job_cleanup())
+    if PROBE_CACHE_TTL > 0:
+        asyncio.create_task(_periodic_cache_cleanup())
+    _flush_logs()
+
+    yield
+
+    # Shutdown (cleanup if needed)
+    logger.info("FastAPI server is shutting down")
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class RateLimiter:
@@ -1403,7 +1430,7 @@ def login_template_response(
         "default_username": DEFAULT_UI_USERNAME,
         "default_password": DEFAULT_UI_PASSWORD,
     }
-    return templates.TemplateResponse("login.html", context, status_code=status_code)
+    return templates.TemplateResponse(request, "login.html", context, status_code=status_code)
 
 
 def settings_template_response(
@@ -2117,7 +2144,7 @@ def settings_template_response(
         },
     }
 
-    return templates.TemplateResponse("settings.html", context, status_code=status_code)
+    return templates.TemplateResponse(request, "settings.html", context, status_code=status_code)
 
 
 def api_keys_template_response(
@@ -2349,7 +2376,7 @@ def api_keys_template_response(
         "csrf_field": csrf_field,
     }
     return templates.TemplateResponse(
-        "api_keys.html", context, status_code=status_code
+        request, "api_keys.html", context, status_code=status_code
     )
 
 
@@ -2957,26 +2984,6 @@ logger.info(f"RETENTION_DAYS: {RETENTION_DAYS}")
 logger.info(f"PUBLIC_BASE_URL: {PUBLIC_BASE_URL or 'Not set'}")
 logger.info("="*60)
 
-# Startup event to log when server is ready
-@app.on_event("startup")
-async def startup_event():
-    logger.info("FastAPI server is ready to accept requests")
-    log_gpu_status()
-    try:
-        cleanup_old_public()
-    except Exception as exc:
-        logger.warning("Initial public cleanup failed: %s", exc)
-    if PUBLIC_CLEANUP_INTERVAL_SECONDS > 0:
-        asyncio.create_task(_periodic_public_cleanup())
-        asyncio.create_task(_periodic_jobs_cleanup())
-    asyncio.create_task(_periodic_session_cleanup())
-    asyncio.create_task(_periodic_rate_limiter_cleanup())
-    asyncio.create_task(_periodic_stuck_job_cleanup())
-    if PROBE_CACHE_TTL > 0:
-        asyncio.create_task(_periodic_cache_cleanup())
-    _flush_logs()
-
-
 def _rand(n=8):
     import random, string
     return "".join(random.choices(string.digits, k=n))
@@ -3130,18 +3137,24 @@ def ffmpeg_snapshot() -> Dict[str, Optional[str]]:
 
 
 def safe_path_check(base: Path, rel: str) -> Path:
+    # Resolve base path first to handle symlinks
+    base = base.resolve()
     try:
         target = (base / rel).resolve()
     except Exception as exc:
         logger.warning("Invalid path provided for %s: %s", base, rel)
         _flush_logs()
         raise HTTPException(status_code=400, detail="Invalid path") from exc
-    if target == base:
-        return target
-    if base not in target.parents:
+
+    # Use relative_to() which raises ValueError if target is not under base
+    # This is more secure than checking parents as it handles all edge cases
+    try:
+        target.relative_to(base)
+    except ValueError:
         logger.warning("Blocked path traversal attempt: %s -> %s", rel, target)
         _flush_logs()
         raise HTTPException(status_code=403, detail="Access denied")
+
     return target
 
 
@@ -4093,7 +4106,7 @@ def downloads(
             "pagination": pagination,
             "clear_url": clear_url,
         }
-        return templates.TemplateResponse("downloads.html", context)
+        return templates.TemplateResponse(request, "downloads.html", context)
 
     rows: List[str] = []
     for item in current_entries:
@@ -4283,7 +4296,7 @@ def logs(request: Request, page: int = Query(1, ge=1), page_size: int = Query(25
             "total_items": total_items,
             "pagination": pagination,
         }
-        return templates.TemplateResponse("logs.html", context)
+        return templates.TemplateResponse(request, "logs.html", context)
 
     rows: List[str] = []
     for item in display_entries:
@@ -4439,7 +4452,7 @@ def ffmpeg_info(request: Request, auto_refresh: int = 0):
             "refresh_status": refresh_status,
             "current_time": current_time,
         }
-        return templates.TemplateResponse("ffmpeg.html", context)
+        return templates.TemplateResponse(request, "ffmpeg.html", context)
 
     version_output_safe = html.escape(version_output)
     app_logs_safe = html.escape(app_logs)
@@ -4548,7 +4561,7 @@ def documentation(request: Request):
     """Display API documentation."""
     
     # API Endpoints Documentation
-    api_docs = """
+    api_docs = r"""
 <h4>UI & Info</h4>
 <div class="endpoint">
   <div class="method get">GET</div>
@@ -5276,7 +5289,7 @@ def documentation(request: Request):
         "retention_days": retention_days,
         "api_docs": api_docs,
     }
-    return templates.TemplateResponse("documentation.html", context)
+    return templates.TemplateResponse(request, "documentation.html", context)
 
 
 @app.get("/settings", response_class=HTMLResponse)
@@ -5462,6 +5475,7 @@ async def settings_toggle_auth(request: Request):
     form = await request.form()
     raw_value = form.get("require_login")
     authed = is_authenticated(request)
+    # Only require auth if it's currently enabled (allows enabling auth when disabled)
     if UI_AUTH.require_login and not authed:
         response = RedirectResponse(
             url=f"/settings?{urlencode({'error': 'Authentication required to change settings'})}",
@@ -5982,7 +5996,7 @@ def metrics_dashboard(request: Request):
             "recent_summary": recent_summary,
             "recent_percent": recent_percent,
         }
-        return templates.TemplateResponse("metrics.html", context)
+        return templates.TemplateResponse(request, "metrics.html", context)
 
     endpoints_html = []
     for row in endpoint_rows:
@@ -6346,7 +6360,7 @@ class ComposeFromUrlsJob(BaseModel):
                 raise ValueError("duration_ms must be 1-3600000")
         return value
 
-    @field_validator("video_url", "audio_url", "bgm_url", "webhook_url", mode="before")
+    @field_validator("video_url", "audio_url", "bgm_url", mode="before")
     @classmethod
     def validate_url_scheme(cls, value):
         if value is None:
@@ -6354,6 +6368,56 @@ class ComposeFromUrlsJob(BaseModel):
         value_str = str(value)
         if not value_str.startswith(("http://", "https://")):
             raise ValueError("Only http:// and https:// URLs are supported")
+        return value
+
+    @field_validator("webhook_url", mode="before")
+    @classmethod
+    def validate_webhook_url_ssrf(cls, value):
+        """Validate webhook URL to prevent SSRF attacks."""
+        if value is None:
+            return value
+
+        value_str = str(value)
+
+        # Check scheme first
+        if not value_str.startswith(("http://", "https://")):
+            raise ValueError("Webhook URL must use http:// or https://")
+
+        # Parse URL to check components
+        try:
+            parsed = urlparse(value_str.lower())
+        except Exception:
+            raise ValueError("Invalid webhook URL format")
+
+        # Extract hostname/IP
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("Webhook URL must have a valid hostname")
+
+        # Block private/internal IP addresses to prevent SSRF
+        try:
+            # Try to parse as IP address
+            ip = ipaddress.ip_address(hostname)
+
+            # Block private, loopback, link-local, and multicast addresses
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+                raise ValueError(
+                    "Webhook URL cannot target private, loopback, or internal IP addresses"
+                )
+
+            # Specifically block cloud metadata service
+            if str(ip) == "169.254.169.254":
+                raise ValueError("Webhook URL cannot target cloud metadata services")
+
+        except ValueError as ve:
+            # If it's our security error, re-raise it
+            if "cannot target" in str(ve):
+                raise
+            # Otherwise, it's not an IP address (it's a hostname), which is OK
+            # Note: Hostnames could still resolve to private IPs, but preventing
+            # that requires DNS lookups which are slow and unreliable
+            pass
+
         return value
 
     @field_validator("webhook_headers", mode="before")
@@ -6423,13 +6487,39 @@ class TracksComposeJob(BaseModel):
 
 
 # ---------- helpers ----------
+# NOTE: Only forward safe, non-sensitive headers to external URLs
+# DO NOT include authentication headers (cookie, authorization, API keys)
+# as this would leak credentials to third-party services (SECURITY RISK)
 ALLOWED_FORWARD_HEADERS_LOWER = {
-    "cookie", "authorization", "x-n8n-api-key", "ngrok-skip-browser-warning"
+    "ngrok-skip-browser-warning",  # Safe: Just skips browser warning page
+    "user-agent",  # Safe: Client identification
+    "accept",  # Safe: Content negotiation
+    "accept-language",  # Safe: Language preference
 }
 
 
 def _escape_ffmpeg_concat_path(path: Path) -> str:
-    return path.as_posix().replace("'", "'\\''")
+    """Escape path for FFmpeg concat demuxer file directive.
+
+    The concat demuxer parses lines like: file 'path'
+    We need to escape:
+    - Single quotes (used to delimit the path)
+    - Newlines (could inject new directives)
+    - Other special chars that could break parsing
+    """
+    # Convert to POSIX path
+    path_str = path.as_posix()
+
+    # Check for dangerous characters that could inject directives
+    if '\n' in path_str or '\r' in path_str:
+        raise ValueError(f"Path contains newline characters: {path_str}")
+
+    # FFmpeg concat format uses single quotes, so escape them
+    # The correct escaping is to replace ' with '\''
+    # But we also need to ensure no injection is possible
+    escaped = path_str.replace("'", "'\\''")
+
+    return escaped
 
 
 def _probe_cache_key(url: str, params: Dict[str, Any]) -> str:
@@ -8934,7 +9024,7 @@ def jobs_history(
             "filters": filters_data,
             "pagination_text": pagination_text,
         }
-        return templates.TemplateResponse("jobs.html", context)
+        return templates.TemplateResponse(request, "jobs.html", context)
 
     rows: List[str] = []
     for job in job_rows:
@@ -9101,7 +9191,7 @@ async def job_status(request: Request, job_id: str, format: str = "json"):
         }
 
         if templates is not None:
-            return templates.TemplateResponse("job_detail.html", context)
+            return templates.TemplateResponse(request, "job_detail.html", context)
 
         return HTMLResponse(_job_detail_fallback_html(context))
 
@@ -9636,25 +9726,54 @@ async def run_rendi(job: RendiJob):
             for k, p in out_paths.items():
                 cmd_text = cmd_text.replace("{{" + k + "}}", str(p))
 
-            cmd_lower = cmd_text.lower()
-            dangerous_patterns = ["-f lavfi", "-i /dev/", "-i file:", "-i concat:"]
-            for pattern in dangerous_patterns:
-                if pattern in cmd_lower:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={"error": "forbidden_pattern", "pattern": pattern},
-                    )
-
-            if REQUIRE_DURATION_LIMIT and "-t" not in cmd_lower and "-frames" not in cmd_lower:
-                raise HTTPException(
-                    status_code=400,
-                    detail={"error": "missing_limit", "detail": "Command must include -t or -frames"},
-                )
-
+            # Parse command first to get actual arguments
             try:
                 args = shlex.split(cmd_text)
             except Exception as exc:
                 raise HTTPException(status_code=400, detail={"error": "invalid_command", "msg": str(exc)}) from exc
+
+            # Validate arguments - check for dangerous patterns in actual parsed args
+            # This is more secure than string matching on the full command
+            for i, arg in enumerate(args):
+                arg_lower = arg.lower()
+
+                # Block dangerous input formats
+                if arg_lower == "-f" and i + 1 < len(args):
+                    next_arg_lower = args[i + 1].lower()
+                    if next_arg_lower in ("lavfi", "libavfilter"):
+                        raise HTTPException(
+                            status_code=400,
+                            detail={"error": "forbidden_pattern", "pattern": f"-f {args[i + 1]}"},
+                        )
+
+                # Block dangerous input sources
+                if arg_lower == "-i" and i + 1 < len(args):
+                    input_value = args[i + 1].lower()
+                    dangerous_inputs = ["/dev/", "file:", "concat:", "pipe:", "tcp:", "udp:", "rtp:", "rtsp:"]
+                    for dangerous in dangerous_inputs:
+                        if input_value.startswith(dangerous):
+                            raise HTTPException(
+                                status_code=400,
+                                detail={"error": "forbidden_pattern", "pattern": f"-i {dangerous}*"},
+                            )
+
+                # Block filter_complex from untrusted sources (can be used for arbitrary file access)
+                if arg_lower in ("-filter_complex", "-filter_complex_script"):
+                    # This is allowed but we log it for monitoring
+                    logger.warning("Custom filter_complex in FFmpeg command: %s", arg)
+
+            # Check for duration limit if required
+            has_limit = False
+            for i, arg in enumerate(args):
+                if arg.lower() in ("-t", "-frames", "-to"):
+                    has_limit = True
+                    break
+
+            if REQUIRE_DURATION_LIMIT and not has_limit:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "missing_limit", "detail": "Command must include -t, -frames, or -to"},
+                )
 
             log = work / "ffmpeg.log"
             run_args = ["ffmpeg"] + args if args and args[0] != "ffmpeg" else args

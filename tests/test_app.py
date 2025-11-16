@@ -417,6 +417,9 @@ def patched_app(app_module, monkeypatch, tmp_path):
         def wait(self, timeout=None):
             return self.returncode
 
+        def poll(self):
+            return self.returncode
+
         def kill(self):
             self.returncode = -9
 
@@ -2557,6 +2560,9 @@ def test_run_ffmpeg_with_timeout_handles_timeout(app_module, monkeypatch):
         def kill(self):
             nonlocal killed
             killed = True
+
+        def poll(self):
+            return None  # Still running
 
     def slow_popen(cmd, stdout=None, stderr=None, **kwargs):
         return SlowProc(cmd, stdout=stdout, stderr=stderr, **kwargs)
