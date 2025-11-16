@@ -1490,6 +1490,8 @@ def test_download_to_scales_timeout_and_disk_check(app_module, monkeypatch, tmp_
         path.mkdir(parents=True, exist_ok=True)
         disk_checks.append(required_mb)
 
+    # Temporarily increase size limit to allow 70MB download for this test
+    monkeypatch.setattr(app_module, "MAX_FILE_SIZE_BYTES", 100 * 1024 * 1024)
     monkeypatch.setattr(app_module, "check_disk_space", fake_check_disk_space)
     client = StubAsyncClient(
         head_responses=[StubHeadResponse(length=total_bytes)],
@@ -2329,6 +2331,7 @@ def test_compose_from_tracks_concats_multiple_videos(patched_app, monkeypatch):
         *,
         progress_parser=None,
         allow_gpu_fallback: bool = True,
+        process_handle=None,
     ) -> int:
         commands.append(list(cmd))
         output_path = None
