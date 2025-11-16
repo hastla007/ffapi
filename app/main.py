@@ -284,6 +284,14 @@ REQUIRE_DURATION_LIMIT = settings.REQUIRE_DURATION_LIMIT
 RATE_LIMITER = RateLimiter(settings.RATE_LIMIT_REQUESTS_PER_MINUTE)
 LOGIN_RATE_LIMITER = RateLimiter(5)
 
+# Allowed file extensions for publish_file
+ALLOWED_EXTENSIONS = {
+    '.mp4', '.webm', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.m4v',  # Video
+    '.mp3', '.wav', '.aac', '.flac', '.ogg', '.m4a', '.wma',  # Audio
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff',  # Image
+    '.bin', '.dat', '.tmp',  # Binary/generic
+}
+
 _FFMPEG_VERSION_CACHE: Optional[Dict[str, Optional[str]]] = None
 
 JOBS: Dict[str, Dict[str, object]] = {}
@@ -3938,6 +3946,8 @@ async def publish_file(src: Path, ext: str, *, duration_ms: Optional[int] = None
        Uses shutil.move to be cross-device safe (works across Docker volumes/Windows)."""
     if not ext or not re.fullmatch(r"\.[A-Za-z0-9]+", ext):
         raise ValueError(f"Invalid file extension: {ext}")
+    if ext.lower() not in ALLOWED_EXTENSIONS:
+        raise ValueError(f"Extension not allowed: {ext}. Allowed extensions: {', '.join(sorted(ALLOWED_EXTENSIONS))}")
     check_disk_space(PUBLIC_DIR)
     now = datetime.now(timezone.utc)
     day = now.strftime("%Y%m%d")
@@ -6733,6 +6743,13 @@ async def _download_to(
                     else:
                         total_size = 0
 
+                    # Enforce file size limit on downloads to prevent bypassing upload limits
+                    if total_size > MAX_FILE_SIZE_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Remote file too large: {total_size / 1024 / 1024:.1f}MB exceeds limit of {MAX_FILE_SIZE_MB}MB",
+                        )
+
                     required_mb = MIN_FREE_SPACE_MB
                     if total_size:
                         remaining = total_size - existing_size
@@ -6849,7 +6866,7 @@ async def _download_to(
 async def image_to_mp4_loop(file: UploadFile = File(...), duration: int = 30, as_json: bool = False):
     logger.info(f"Starting image-to-mp4-loop: {file.filename}, duration={duration}s")
     if file.content_type not in {"image/png", "image/jpeg"}:
-        raise HTTPException(status_code=400, detail="Only PNG/JPEG are supported.")
+        raise HTTPException(status_code=415, detail="Only PNG/JPEG are supported.")
     if not (1 <= duration <= 3600):
         raise HTTPException(status_code=400, detail="duration must be 1..3600 seconds")
 
