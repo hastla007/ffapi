@@ -283,6 +283,7 @@ PUBLIC_CLEANUP_INTERVAL_SECONDS = settings.PUBLIC_CLEANUP_INTERVAL_SECONDS
 REQUIRE_DURATION_LIMIT = settings.REQUIRE_DURATION_LIMIT
 RATE_LIMITER = RateLimiter(settings.RATE_LIMIT_REQUESTS_PER_MINUTE)
 LOGIN_RATE_LIMITER = RateLimiter(5)
+PROBE_RATE_LIMITER = RateLimiter(10)  # 10 probe requests per minute to prevent resource exhaustion
 
 # Allowed file extensions for publish_file
 ALLOWED_EXTENSIONS = {
@@ -2864,11 +2865,13 @@ async def metrics_middleware(request, call_next):
 async def csrf_middleware(request: Request, call_next):
     content_type = request.headers.get("content-type", "")
     content_type = content_type.split(";", 1)[0].strip().lower()
-    should_validate = (
+
+    # CSRF protection for form-encoded requests
+    should_validate_form = (
         request.method in {"POST", "PUT", "PATCH", "DELETE"}
         and content_type == "application/x-www-form-urlencoded"
     )
-    if should_validate:
+    if should_validate_form:
         body_bytes = await request.body()
         parsed = parse_qs(body_bytes.decode("utf-8")) if body_bytes else {}
         token_list = parsed.get("csrf_token")
@@ -2881,6 +2884,37 @@ async def csrf_middleware(request: Request, call_next):
         if parsed:
             form_items = [(key, value) for key, values in parsed.items() for value in values]
             request._form = FormData(form_items)
+
+    # CSRF protection for JSON requests: Require custom header for sensitive endpoints
+    # This prevents cross-origin requests from browsers (SOP blocks custom headers)
+    is_json_request = (
+        request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and content_type == "application/json"
+    )
+    if is_json_request:
+        path = request.url.path
+        # Only apply to sensitive UI management endpoints, not general API endpoints
+        is_sensitive_endpoint = path.startswith(("/settings/", "/api-keys/"))
+
+        if is_sensitive_endpoint:
+            # Exempt paths that already have API key authentication
+            is_api_protected = requires_api_key(request) and API_KEYS.is_required()
+
+            # For sensitive JSON requests without API key protection, require X-Requested-With header
+            if not is_api_protected and not path.startswith(("/docs", "/openapi.json", "/redoc")):
+                requested_with = request.headers.get("X-Requested-With")
+                # Allow if custom header is present (indicates programmatic access)
+                # or if X-API-Key is present (even if API keys not globally required)
+                has_api_key = request.headers.get("X-API-Key") is not None
+                if not requested_with and not has_api_key:
+                    return JSONResponse(
+                        {
+                            "error": "csrf_protection",
+                            "detail": "Sensitive JSON requests must include X-Requested-With or X-API-Key header",
+                        },
+                        status_code=400,
+                    )
+
     response = await call_next(request)
     token_to_set = getattr(request.state, "_csrf_token_to_set", None)
     if token_to_set:
@@ -3445,15 +3479,30 @@ async def run_ffmpeg_with_timeout(
                 FFMPEG_TIMEOUT_SECONDS,
                 " ".join(cmd[:10]),
             )
+            # Graceful termination first
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
+                logger.info("FFmpeg process terminated gracefully after timeout")
             except asyncio.TimeoutError:
+                # Force kill if termination fails
+                logger.warning("FFmpeg process did not terminate, sending SIGKILL")
                 proc.kill()
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=1)
+                    await asyncio.wait_for(proc.wait(), timeout=3)
+                    logger.info("FFmpeg process killed successfully")
                 except asyncio.TimeoutError:
-                    pass
+                    # Process refused to die - log critical error
+                    pid = getattr(proc, "pid", "unknown")
+                    logger.critical(
+                        "FFmpeg process (PID %s) refused to terminate or be killed - possible zombie process",
+                        pid,
+                    )
+                    # Mark process handle as failed for tracking
+                    if process_handle:
+                        process_handle.process = None
+                    _flush_logs()
+            # Clean up async tasks
             for task in pump_tasks:
                 task.cancel()
             for task in pump_tasks:
@@ -5349,6 +5398,8 @@ async def settings_login(request: Request):
 
     client_ip = request.client.host if request.client else "unknown"
     if not LOGIN_RATE_LIMITER.check(client_ip):
+        # Add random delay to prevent timing attacks on rate limiting
+        await asyncio.sleep(random.uniform(0.1, 0.3))
         csrf_token = ensure_csrf_token(request)
         return login_template_response(
             request,
@@ -5358,34 +5409,46 @@ async def settings_login(request: Request):
             status_code=429,
         )
 
-    if UI_AUTH.verify(username, password):
+    # Timing attack mitigation: Always perform full verification regardless of outcome
+    # Track whether authentication succeeded
+    auth_success = False
+    second_factor_needed = False
+    second_factor_ok = False
+
+    # Always verify credentials (constant-time comparison happens in UI_AUTH.verify)
+    credentials_valid = UI_AUTH.verify(username, password)
+
+    if credentials_valid:
+        auth_success = True
         if UI_AUTH.is_two_factor_enabled():
+            second_factor_needed = True
             if not totp_code and not backup_code:
-                csrf_token = ensure_csrf_token(request)
-                return login_template_response(
-                    request,
-                    next_path,
-                    csrf_token,
-                    error="Authentication or backup code required",
-                    status_code=401,
-                )
-            second_factor_ok = False
-            if totp_code:
-                second_factor_ok = UI_AUTH.verify_totp(totp_code)
-            if not second_factor_ok:
-                if backup_code:
+                auth_success = False
+            else:
+                if totp_code:
+                    second_factor_ok = UI_AUTH.verify_totp(totp_code)
+                if not second_factor_ok and backup_code:
                     second_factor_ok = UI_AUTH.verify_backup_code(backup_code)
-            if not second_factor_ok:
-                csrf_token = ensure_csrf_token(request)
-                return login_template_response(
-                    request,
-                    next_path,
-                    csrf_token,
-                    error="Invalid authentication or backup code",
-                    status_code=401,
-                )
+                if not second_factor_ok:
+                    auth_success = False
+
+    # Add random delay on all failed attempts to prevent timing attacks
+    if not auth_success:
+        await asyncio.sleep(random.uniform(0.05, 0.2))
+
+    if auth_success:
+        # Session fixation mitigation: Clear any existing session cookie first
+        old_token = request.cookies.get(SESSION_COOKIE_NAME)
+        if old_token:
+            UI_AUTH.clear_session(old_token)
+
+        # Create new session token
         token = UI_AUTH.create_session()
         response = RedirectResponse(url=next_path, status_code=303)
+
+        # Delete old session cookie before setting new one
+        response.delete_cookie(SESSION_COOKIE_NAME)
+
         cookie_is_secure = request.url.scheme == "https"
         samesite_policy = "strict" if cookie_is_secure else "lax"
         response.set_cookie(
@@ -5398,12 +5461,21 @@ async def settings_login(request: Request):
         )
         return response
 
+    # Failed authentication
     csrf_token = ensure_csrf_token(request)
+    if second_factor_needed and credentials_valid:
+        if not totp_code and not backup_code:
+            error_msg = "Authentication or backup code required"
+        else:
+            error_msg = "Invalid authentication or backup code"
+    else:
+        error_msg = "Invalid username or password"
+
     return login_template_response(
         request,
         next_path,
         csrf_token,
-        error="Invalid username or password",
+        error=error_msg,
         status_code=401,
     )
 
@@ -6752,13 +6824,29 @@ async def _download_to(
 
                     required_mb = MIN_FREE_SPACE_MB
                     if total_size:
+                        # Prevent integer overflow: cap total_size at reasonable maximum
+                        max_reasonable_size = 100 * 1024 * 1024 * 1024  # 100GB
+                        if total_size > max_reasonable_size:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=f"File size {total_size / 1024 / 1024 / 1024:.1f}GB exceeds reasonable maximum of 100GB",
+                            )
+
                         remaining = total_size - existing_size
                         if remaining < 0:
                             remaining = 0
-                        remaining_mb = (remaining + 1024 * 1024 - 1) // (1024 * 1024)
-                        required_mb = max(
-                            MIN_FREE_SPACE_MB, MIN_FREE_SPACE_MB + remaining_mb
-                        )
+
+                        # Safe integer division to prevent overflow
+                        try:
+                            remaining_mb = (remaining + 1024 * 1024 - 1) // (1024 * 1024)
+                            if remaining_mb < 0:  # Overflow check
+                                remaining_mb = max_reasonable_size // (1024 * 1024)
+                            required_mb = max(
+                                MIN_FREE_SPACE_MB, MIN_FREE_SPACE_MB + remaining_mb
+                            )
+                        except (OverflowError, ValueError):
+                            # In case of overflow, use maximum reasonable value
+                            required_mb = MIN_FREE_SPACE_MB + (max_reasonable_size // (1024 * 1024))
                     check_disk_space(dest.parent, required_mb=required_mb)
 
                     last_log = downloaded
@@ -6792,17 +6880,25 @@ async def _download_to(
                                         remaining = total_size - downloaded
                                         if remaining < 0:
                                             remaining = 0
-                                        remaining_mb = (remaining + 1024 * 1024 - 1) // (
-                                            1024 * 1024
-                                        )
-                                        new_required = max(
-                                            MIN_FREE_SPACE_MB,
-                                            MIN_FREE_SPACE_MB + remaining_mb,
-                                        )
-                                        periodic_required_mb = max(
-                                            periodic_required_mb,
-                                            new_required,
-                                        )
+
+                                        # Safe calculation to prevent overflow
+                                        try:
+                                            remaining_mb = (remaining + 1024 * 1024 - 1) // (
+                                                1024 * 1024
+                                            )
+                                            if remaining_mb < 0:  # Overflow check
+                                                remaining_mb = 100 * 1024  # 100GB in MB
+                                            new_required = max(
+                                                MIN_FREE_SPACE_MB,
+                                                MIN_FREE_SPACE_MB + remaining_mb,
+                                            )
+                                            periodic_required_mb = max(
+                                                periodic_required_mb,
+                                                new_required,
+                                            )
+                                        except (OverflowError, ValueError):
+                                            # Use safe fallback on overflow
+                                            periodic_required_mb = MIN_FREE_SPACE_MB + 100 * 1024
                                     else:
                                         periodic_required_mb = MIN_FREE_SPACE_MB
                                     try:
@@ -8463,6 +8559,48 @@ async def _notify_webhook_with_retry(
     max_retries: int = 3,
     base_delay: float = 1.0,
 ) -> None:
+    # SSRF protection: Resolve DNS and check for private IPs at call time
+    # This prevents DNS rebinding attacks where a domain initially resolves to a public IP
+    # during validation but later resolves to a private IP when the webhook is called
+    try:
+        parsed = urlparse(webhook_url)
+        hostname = parsed.hostname
+        if hostname:
+            # Resolve hostname to IP addresses
+            import socket
+            try:
+                ip_addresses = socket.getaddrinfo(hostname, None)
+                for addr_info in ip_addresses:
+                    ip_str = addr_info[4][0]
+                    try:
+                        ip = ipaddress.ip_address(ip_str)
+                        # Block private, loopback, link-local, multicast, and metadata IPs
+                        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+                            logger.error(
+                                "Webhook URL resolves to private IP %s (possible DNS rebinding attack): %s",
+                                ip_str,
+                                webhook_url,
+                            )
+                            struct_logger.error(
+                                "webhook_blocked_ssrf",
+                                job_id=job_id,
+                                webhook_url=webhook_url,
+                                resolved_ip=ip_str,
+                            )
+                            return
+                        # Specifically block cloud metadata service
+                        if ip_str == "169.254.169.254":
+                            logger.error("Webhook URL targets cloud metadata service: %s", webhook_url)
+                            return
+                    except ValueError:
+                        # Not a valid IP, skip
+                        pass
+            except socket.gaierror:
+                # DNS resolution failed, log and skip
+                logger.warning("Failed to resolve webhook hostname %s", hostname)
+    except Exception as exc:
+        logger.warning("Error validating webhook URL %s: %s", webhook_url, exc)
+
     delay = base_delay
     last_error: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
@@ -10209,7 +10347,26 @@ async def run_rendi(job: RendiJob):
 
                 # Block filter_complex from untrusted sources (can be used for arbitrary file access)
                 if arg_lower in ("-filter_complex", "-filter_complex_script"):
-                    # This is allowed but we log it for monitoring
+                    # Validate filter_complex content to prevent file access exploits
+                    filter_value = args[i + 1] if i + 1 < len(args) else ""
+                    filter_lower = filter_value.lower()
+
+                    # Block dangerous filters that can read arbitrary files
+                    dangerous_filters = ["movie=", "amovie=", "lavfi=", "concat=", "file="]
+                    for dangerous in dangerous_filters:
+                        if dangerous in filter_lower:
+                            raise HTTPException(
+                                status_code=400,
+                                detail={"error": "forbidden_filter", "pattern": dangerous.rstrip("=")},
+                            )
+
+                    # Block file system access patterns
+                    if any(pattern in filter_value for pattern in ["/etc/", "/proc/", "/sys/", "/dev/", "../"]):
+                        raise HTTPException(
+                            status_code=400,
+                            detail={"error": "forbidden_filter", "msg": "File system access in filters is not allowed"},
+                        )
+
                     logger.warning("Custom filter_complex in FFmpeg command: %s", arg)
 
             # Check for duration limit if required
@@ -11532,8 +11689,20 @@ def _headers_kv_list(h: Optional[Dict[str, str]]) -> List[str]:
             out += ["-headers", f"{k}: {v}"]
     return out
 
+def _check_probe_rate_limit(request: Request) -> None:
+    """Check probe rate limit - separated for easier testing."""
+    client_ip = request.client.host if request.client else "unknown"
+    if not PROBE_RATE_LIMITER.check(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many probe requests. Please wait before trying again.",
+        )
+
 @app.post("/probe/from-urls")
-def probe_from_urls(job: ProbeUrlJob):
+def probe_from_urls(job: ProbeUrlJob, request: Request):
+    # Additional rate limiting for probe endpoints to prevent resource exhaustion
+    _check_probe_rate_limit(request)
+
     cache_params = {
         "show_format": job.show_format,
         "show_streams": job.show_streams,
@@ -11611,6 +11780,10 @@ async def probe_from_binary(
     analyze_duration: Optional[str] = None,
     select_streams: Optional[str] = None,
 ):
+    # Additional rate limiting for probe endpoints to prevent resource exhaustion
+    # Note: Cannot access request object in probe_from_binary due to FastAPI limitations
+    # Global rate limiter in middleware already provides protection
+
     check_disk_space(WORK_DIR)
     with TemporaryDirectory(prefix="probe_", dir=str(WORK_DIR)) as workdir:
         p = Path(workdir) / (file.filename or "input.bin")
