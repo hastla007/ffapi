@@ -801,6 +801,10 @@ def _load_csrf_config() -> CsrfSettings:
 
 
 csrf_protect = CsrfProtect()
+
+# WARNING: Change these default credentials in production!
+# These defaults are insecure and should only be used for initial setup.
+# Use the settings page to change the password after first login.
 DEFAULT_UI_USERNAME = "admin"
 DEFAULT_UI_PASSWORD = "admin123"
 
@@ -2452,6 +2456,7 @@ def _drain_job_progress(job_id: str) -> Optional[Dict[str, Any]]:
 def _merge_job_progress(job_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     """Best-effort merge of cached progress data into a job record."""
 
+    # Keep lock during entire merge operation to prevent race conditions
     with JOB_PROGRESS_LOCK:
         snapshot = JOB_PROGRESS.get(job_id)
         if snapshot is None:
@@ -3027,8 +3032,11 @@ logger.info(f"PUBLIC_BASE_URL: {PUBLIC_BASE_URL or 'Not set'}")
 logger.info("="*60)
 
 def _rand(n=8):
-    import random, string
-    return "".join(random.choices(string.digits, k=n))
+    """Generate cryptographically secure random string of digits."""
+    # Use secrets for cryptographically secure random generation
+    # instead of random which is predictable
+    import string
+    return "".join(secrets.choice(string.digits) for _ in range(n))
 
 
 def _flush_logs():
@@ -5570,6 +5578,24 @@ async def settings_toggle_auth(request: Request):
     if raw_value is not None:
         enable = str(raw_value).lower() in {"true", "1", "on", "yes"}
     UI_AUTH.set_require_login(enable)
+
+    # Security warning if enabling auth with default password
+    if enable and UI_AUTH.username == DEFAULT_UI_USERNAME:
+        with UI_AUTH._lock:
+            # Check if password is still the default (check hash)
+            default_hash = UI_AUTH._hash(DEFAULT_UI_PASSWORD)
+            current_hash = UI_AUTH._password_hash
+            # Compare the hash type and value (accounting for bcrypt randomness)
+            if "bcrypt$" in current_hash and "bcrypt$" in default_hash:
+                # For bcrypt, we need to verify the password
+                try:
+                    if bcrypt and bcrypt.checkpw(DEFAULT_UI_PASSWORD.encode('utf-8'), current_hash.split('$', 1)[1].encode('utf-8')):
+                        logger.warning("SECURITY WARNING: Dashboard authentication enabled with default password! Change the password immediately in settings.")
+                except Exception:
+                    pass
+            elif current_hash == f"sha256${hashlib.sha256(DEFAULT_UI_PASSWORD.encode('utf-8')).hexdigest()}":
+                logger.warning("SECURITY WARNING: Dashboard authentication enabled with default password! Change the password immediately in settings.")
+
     message = (
         "Dashboard login requirement enabled"
         if enable
@@ -6330,6 +6356,38 @@ class FFmpegInput(BaseModel):
             raise ValueError("Only http:// and https:// URLs are supported")
         return value
 
+    @field_validator("options")
+    @classmethod
+    def validate_options(cls, value):
+        """Validate FFmpeg input options to prevent command injection."""
+        if not value:
+            return value
+
+        # Check for dangerous patterns in options
+        for i, opt in enumerate(value):
+            opt_lower = opt.lower()
+
+            # Block attempts to add additional inputs
+            if opt_lower == "-i":
+                raise ValueError("Cannot use -i flag in input options")
+
+            # Block dangerous input formats
+            if opt_lower == "-f" and i + 1 < len(value):
+                next_val = value[i + 1].lower()
+                if next_val in ("lavfi", "libavfilter", "concat"):
+                    raise ValueError(f"Forbidden input format: -f {value[i + 1]}")
+
+            # Block file system access
+            if any(pattern in opt for pattern in ["/etc/", "/proc/", "/sys/", "/dev/", "../"]):
+                raise ValueError("File system access in options is not allowed")
+
+            # Block dangerous protocols
+            dangerous_protocols = ["file:", "concat:", "pipe:", "tcp:", "udp:", "rtp:", "rtsp:"]
+            if any(proto in opt_lower for proto in dangerous_protocols):
+                raise ValueError(f"Forbidden protocol in option: {opt}")
+
+        return value
+
 
 class FFmpegOutput(BaseModel):
     file: str
@@ -6347,6 +6405,53 @@ class FFmpegOutput(BaseModel):
         if not re.search(r"\.[A-Za-z0-9]+$", cleaned):
             raise ValueError("file name must include a file extension")
         return cleaned
+
+    @field_validator("options")
+    @classmethod
+    def validate_options(cls, value):
+        """Validate FFmpeg output options to prevent command injection."""
+        if not value:
+            return value
+
+        # Check for dangerous patterns in output options
+        for i, opt in enumerate(value):
+            opt_lower = opt.lower()
+
+            # Block attempts to add additional inputs or outputs
+            if opt_lower in ("-i", "-o"):
+                raise ValueError(f"Cannot use {opt} flag in output options")
+
+            # Block dangerous input formats
+            if opt_lower == "-f" and i + 1 < len(value):
+                next_val = value[i + 1].lower()
+                if next_val in ("lavfi", "libavfilter", "concat"):
+                    raise ValueError(f"Forbidden output format: -f {value[i + 1]}")
+
+            # Block file system access
+            if any(pattern in opt for pattern in ["/etc/", "/proc/", "/sys/", "/dev/", "../"]):
+                raise ValueError("File system access in options is not allowed")
+
+            # Block dangerous protocols
+            dangerous_protocols = ["file:", "concat:", "pipe:", "tcp:", "udp:", "rtp:", "rtsp:"]
+            if any(proto in opt_lower for proto in dangerous_protocols):
+                raise ValueError(f"Forbidden protocol in option: {opt}")
+
+        return value
+
+    @field_validator("maps")
+    @classmethod
+    def validate_maps(cls, value):
+        """Validate map arguments."""
+        if not value:
+            return value
+
+        for map_arg in value:
+            # Maps should be stream specifiers like "[v]", "0:a", "[aout]", etc.
+            # Block attempts at file system access
+            if any(pattern in map_arg for pattern in ["/etc/", "/proc/", "/sys/", "../", "file:"]):
+                raise ValueError(f"Invalid map argument: {map_arg}")
+
+        return value
 
 
 class FFmpegTask(BaseModel):
@@ -6475,6 +6580,10 @@ class ComposeFromUrlsJob(BaseModel):
         hostname = parsed.hostname
         if not hostname:
             raise ValueError("Webhook URL must have a valid hostname")
+
+        # Block localhost as hostname
+        if hostname == "localhost":
+            raise ValueError("Webhook URL cannot target localhost")
 
         # Block private/internal IP addresses to prevent SSRF
         try:

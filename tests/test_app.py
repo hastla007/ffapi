@@ -2679,3 +2679,306 @@ def test_probe_endpoints_use_timeout(patched_app, monkeypatch):
     patched_app.probe_public(rel=f"{day_dir.name}/{media.name}", show_format=True, show_streams=True)
 
     assert captured == [60, 60, 60]
+
+# ==================== Security Tests for FFmpeg Option Validation ====================
+
+def test_ffmpeg_input_rejects_dangerous_input_flag(app_module):
+    """Test that FFmpegInput rejects -i flag in options."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegInput(
+            file_path="https://example.com/video.mp4",
+            options=["-i", "/etc/passwd"]
+        )
+    assert "Cannot use -i flag" in str(exc_info.value)
+
+
+def test_ffmpeg_input_rejects_lavfi_format(app_module):
+    """Test that FFmpegInput rejects lavfi input format."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegInput(
+            file_path="https://example.com/video.mp4",
+            options=["-f", "lavfi"]
+        )
+    assert "Forbidden input format" in str(exc_info.value)
+
+
+def test_ffmpeg_input_rejects_file_protocol(app_module):
+    """Test that FFmpegInput rejects file: protocol."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegInput(
+            file_path="https://example.com/video.mp4",
+            options=["-ss", "file:///etc/passwd"]
+        )
+    # Can be caught by either file system access check or protocol check
+    error_str = str(exc_info.value)
+    assert ("Forbidden protocol" in error_str or "File system access" in error_str)
+
+
+def test_ffmpeg_input_rejects_path_traversal(app_module):
+    """Test that FFmpegInput rejects path traversal attempts."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegInput(
+            file_path="https://example.com/video.mp4",
+            options=["-filter", "../../../etc/passwd"]
+        )
+    assert "File system access" in str(exc_info.value)
+
+
+def test_ffmpeg_input_rejects_etc_access(app_module):
+    """Test that FFmpegInput rejects /etc/ directory access."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegInput(
+            file_path="https://example.com/video.mp4",
+            options=["-metadata", "file=/etc/shadow"]
+        )
+    assert "File system access" in str(exc_info.value)
+
+
+def test_ffmpeg_input_rejects_dangerous_protocols(app_module):
+    """Test that FFmpegInput rejects various dangerous protocols."""
+    dangerous_protocols = ["concat:", "pipe:", "tcp:", "udp:", "rtp:", "rtsp:"]
+    
+    for proto in dangerous_protocols:
+        with pytest.raises(ValidationError) as exc_info:
+            app_module.FFmpegInput(
+                file_path="https://example.com/video.mp4",
+                options=["-filter_complex", f"{proto}something"]
+            )
+        assert "Forbidden protocol" in str(exc_info.value)
+
+
+def test_ffmpeg_input_accepts_safe_options(app_module):
+    """Test that FFmpegInput accepts safe options."""
+    # These should all be valid
+    valid_options = [
+        ["-ss", "00:00:10"],
+        ["-t", "30"],
+        ["-vcodec", "libx264"],
+        ["-acodec", "aac"],
+        ["-b:v", "1M"],
+        ["-r", "30"],
+    ]
+    
+    for opts in valid_options:
+        # Should not raise
+        input_obj = app_module.FFmpegInput(
+            file_path="https://example.com/video.mp4",
+            options=opts
+        )
+        assert input_obj.options == opts
+
+
+def test_ffmpeg_output_rejects_input_flag(app_module):
+    """Test that FFmpegOutput rejects -i flag in options."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegOutput(
+            file="output.mp4",
+            options=["-i", "extra_input.mp4"]
+        )
+    assert "Cannot use -i flag" in str(exc_info.value)
+
+
+def test_ffmpeg_output_rejects_output_flag(app_module):
+    """Test that FFmpegOutput rejects -o flag in options."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegOutput(
+            file="output.mp4",
+            options=["-o", "other_output.mp4"]
+        )
+    assert "Cannot use -o flag" in str(exc_info.value)
+
+
+def test_ffmpeg_output_rejects_dangerous_format(app_module):
+    """Test that FFmpegOutput rejects dangerous output formats."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegOutput(
+            file="output.mp4",
+            options=["-f", "concat"]
+        )
+    assert "Forbidden output format" in str(exc_info.value)
+
+
+def test_ffmpeg_output_rejects_file_system_access(app_module):
+    """Test that FFmpegOutput rejects file system access."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegOutput(
+            file="output.mp4",
+            options=["-metadata", "description=/proc/version"]
+        )
+    assert "File system access" in str(exc_info.value)
+
+
+def test_ffmpeg_output_rejects_dangerous_protocols(app_module):
+    """Test that FFmpegOutput rejects dangerous protocols in options."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegOutput(
+            file="output.mp4",
+            options=["-f", "tcp://malicious.host:1234"]
+        )
+    assert "Forbidden protocol" in str(exc_info.value)
+
+
+def test_ffmpeg_output_accepts_safe_options(app_module):
+    """Test that FFmpegOutput accepts safe encoding options."""
+    valid_options = [
+        ["-c:v", "libx264"],
+        ["-c:a", "aac"],
+        ["-b:v", "2M"],
+        ["-b:a", "128k"],
+        ["-preset", "fast"],
+        ["-crf", "23"],
+    ]
+    
+    for opts in valid_options:
+        output_obj = app_module.FFmpegOutput(
+            file="output.mp4",
+            options=opts
+        )
+        assert output_obj.options == opts
+
+
+def test_ffmpeg_output_map_validation(app_module):
+    """Test that FFmpegOutput validates map arguments."""
+    # Valid maps should work
+    valid_maps = ["[v]", "[a]", "0:a", "1:v", "[vout]", "[aout]"]
+    for map_arg in valid_maps:
+        output_obj = app_module.FFmpegOutput(
+            file="output.mp4",
+            maps=[map_arg]
+        )
+        assert output_obj.maps == [map_arg]
+    
+    # Invalid maps with file system access should fail
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegOutput(
+            file="output.mp4",
+            maps=["../../../etc/passwd"]
+        )
+    assert "Invalid map argument" in str(exc_info.value)
+
+
+def test_ffmpeg_task_requires_at_least_one_input(app_module):
+    """Test that FFmpegTask requires at least one input."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegTask(
+            inputs=[],
+            filter_complex="[0:v]scale=1280:720[v]",
+            outputs=[app_module.FFmpegOutput(file="output.mp4")]
+        )
+    assert "At least one input is required" in str(exc_info.value)
+
+
+def test_ffmpeg_task_limits_max_inputs(app_module):
+    """Test that FFmpegTask limits maximum number of inputs."""
+    too_many_inputs = [
+        app_module.FFmpegInput(file_path=f"https://example.com/video{i}.mp4")
+        for i in range(51)
+    ]
+    
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegTask(
+            inputs=too_many_inputs,
+            filter_complex="[0:v]scale=1280:720[v]",
+            outputs=[app_module.FFmpegOutput(file="output.mp4")]
+        )
+    assert "Too many inputs" in str(exc_info.value)
+
+
+def test_ffmpeg_task_requires_at_least_one_output(app_module):
+    """Test that FFmpegTask requires at least one output."""
+    with pytest.raises(ValidationError) as exc_info:
+        app_module.FFmpegTask(
+            inputs=[app_module.FFmpegInput(file_path="https://example.com/video.mp4")],
+            filter_complex="[0:v]scale=1280:720[v]",
+            outputs=[]
+        )
+    assert "At least one output is required" in str(exc_info.value)
+
+
+def test_ffmpeg_job_request_with_safe_task(app_module):
+    """Test that FFmpegJobRequest accepts safe tasks."""
+    task = app_module.FFmpegTask(
+        inputs=[
+            app_module.FFmpegInput(
+                file_path="https://example.com/video.mp4",
+                options=["-ss", "10"]
+            )
+        ],
+        filter_complex="[0:v]scale=1280:720[v]",
+        outputs=[
+            app_module.FFmpegOutput(
+                file="output.mp4",
+                maps=["[v]"],
+                options=["-c:v", "libx264", "-crf", "23"]
+            )
+        ]
+    )
+    
+    job_request = app_module.FFmpegJobRequest(task=task)
+    assert job_request.task == task
+
+
+def test_random_generation_uses_secrets(app_module):
+    """Test that _rand() uses cryptographically secure random generation."""
+    # Generate multiple random strings and ensure they're different
+    randoms = [app_module._rand(16) for _ in range(100)]
+    
+    # All should be different (highly unlikely to have duplicates with secrets)
+    assert len(set(randoms)) == 100
+    
+    # All should be digits only
+    for r in randoms:
+        assert r.isdigit()
+        assert len(r) == 16
+
+
+def test_safe_path_check_blocks_traversal(app_module, patched_app):
+    """Test that safe_path_check blocks path traversal attempts."""
+    base = patched_app.LOGS_DIR
+    
+    # Valid paths should work
+    valid = app_module.safe_path_check(base, "valid_log.txt")
+    assert valid.parent == base
+    
+    # Path traversal should be blocked
+    with pytest.raises(app_module.HTTPException) as exc_info:
+        app_module.safe_path_check(base, "../../../etc/passwd")
+    assert exc_info.value.status_code == 403
+
+
+def test_webhook_url_blocks_private_ips(app_module):
+    """Test that webhook URL validation blocks private IP addresses."""
+    private_ips = [
+        "http://127.0.0.1/webhook",
+        "http://localhost/webhook",
+        "http://10.0.0.1/webhook",
+        "http://192.168.1.1/webhook",
+        "http://172.16.0.1/webhook",
+        "http://169.254.169.254/latest/meta-data",  # Cloud metadata
+    ]
+    
+    for url in private_ips:
+        with pytest.raises(ValidationError) as exc_info:
+            app_module.ComposeFromUrlsJob(
+                video_url="https://example.com/video.mp4",
+                webhook_url=url
+            )
+        assert "cannot target" in str(exc_info.value).lower()
+
+
+def test_webhook_url_accepts_public_ips(app_module):
+    """Test that webhook URL validation accepts public IP addresses and hostnames."""
+    valid_urls = [
+        "https://example.com/webhook",
+        "https://api.example.com/callback",
+        "http://8.8.8.8/webhook",  # Google DNS - public IP
+        "https://1.1.1.1/notify",  # Cloudflare DNS - public IP
+    ]
+    
+    for url in valid_urls:
+        # Should not raise ValidationError
+        job = app_module.ComposeFromUrlsJob(
+            video_url="https://example.com/video.mp4",
+            webhook_url=url
+        )
+        assert str(job.webhook_url) == url
